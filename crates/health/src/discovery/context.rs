@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use prometheus::{Histogram, HistogramOpts};
@@ -29,11 +30,13 @@ use crate::config::{
     Config, Configurable, DiscoveryConfig, FirmwareCollectorConfig as FirmwareCollectorOptions,
     LeakDetectorCollectorConfig as LeakDetectorCollectorOptions,
     LogsCollectorConfig as LogsCollectorOptions, MetricsCollectorConfig as MetricsCollectorOptions,
+    MtlsProfileConfig, NmxcCollectorConfig as NmxcCollectorOptions,
     NmxtCollectorConfig as NmxtCollectorOptions, NvueCollectorConfig as NvueCollectorOptions,
     SensorCollectorConfig as SensorCollectorOptions,
 };
 use crate::limiter::RateLimiter;
 use crate::metrics::{MetricsManager, operation_duration_buckets_seconds};
+use crate::tls::MtlsHttpClientProvider;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) enum CollectorKind {
@@ -44,12 +47,13 @@ pub(super) enum CollectorKind {
     Firmware,
     LeakDetector,
     Nmxt,
+    Nmxc,
     NvueRest,
     NvueGnmi,
 }
 
 impl CollectorKind {
-    pub(super) const ALL: [CollectorKind; 9] = [
+    pub(super) const ALL: [CollectorKind; 10] = [
         CollectorKind::Discovery,
         CollectorKind::Sensor,
         CollectorKind::Metrics,
@@ -57,6 +61,7 @@ impl CollectorKind {
         CollectorKind::Firmware,
         CollectorKind::LeakDetector,
         CollectorKind::Nmxt,
+        CollectorKind::Nmxc,
         CollectorKind::NvueRest,
         CollectorKind::NvueGnmi,
     ];
@@ -74,6 +79,7 @@ impl CollectorKind {
                 "Stopping leak detector collector for removed BMC endpoint"
             }
             CollectorKind::Nmxt => "Stopping NMX-T collector for removed BMC endpoint",
+            CollectorKind::Nmxc => "Stopping NMX-C streaming collector for removed switch endpoint",
             CollectorKind::NvueRest => "Stopping NVUE REST collector for removed BMC endpoint",
             CollectorKind::NvueGnmi => {
                 "Stopping NVUE gNMI streaming collector for removed switch endpoint"
@@ -90,6 +96,7 @@ pub(super) struct CollectorState {
     leak_detector: HashMap<Cow<'static, str>, Collector>,
     logs: HashMap<Cow<'static, str>, Collector>,
     nmxt: HashMap<Cow<'static, str>, Collector>,
+    nmxc: HashMap<Cow<'static, str>, Collector>,
     nvue_rest: HashMap<Cow<'static, str>, Collector>,
     nvue_gnmi: HashMap<Cow<'static, str>, Collector>,
     inventories: HashMap<Cow<'static, str>, SharedInventory<BmcClient>>,
@@ -105,6 +112,7 @@ impl CollectorState {
             leak_detector: HashMap::new(),
             logs: HashMap::new(),
             nmxt: HashMap::new(),
+            nmxc: HashMap::new(),
             nvue_rest: HashMap::new(),
             nvue_gnmi: HashMap::new(),
             inventories: HashMap::new(),
@@ -120,6 +128,7 @@ impl CollectorState {
             CollectorKind::Firmware => &self.firmware,
             CollectorKind::LeakDetector => &self.leak_detector,
             CollectorKind::Nmxt => &self.nmxt,
+            CollectorKind::Nmxc => &self.nmxc,
             CollectorKind::NvueRest => &self.nvue_rest,
             CollectorKind::NvueGnmi => &self.nvue_gnmi,
         }
@@ -137,6 +146,7 @@ impl CollectorState {
             CollectorKind::Firmware => &mut self.firmware,
             CollectorKind::LeakDetector => &mut self.leak_detector,
             CollectorKind::Nmxt => &mut self.nmxt,
+            CollectorKind::Nmxc => &mut self.nmxc,
             CollectorKind::NvueRest => &mut self.nvue_rest,
             CollectorKind::NvueGnmi => &mut self.nvue_gnmi,
         }
@@ -186,6 +196,7 @@ impl CollectorState {
             .chain(self.firmware.keys())
             .chain(self.leak_detector.keys())
             .chain(self.nmxt.keys())
+            .chain(self.nmxc.keys())
             .chain(self.nvue_rest.keys())
             .chain(self.nvue_gnmi.keys())
             .filter(|key| !active_keys.contains(*key))
@@ -221,8 +232,17 @@ pub struct DiscoveryLoopContext {
     pub(crate) firmware_config: Configurable<FirmwareCollectorOptions>,
     pub(crate) leak_detector_config: Configurable<LeakDetectorCollectorOptions>,
     pub(crate) nmxt_config: Configurable<NmxtCollectorOptions>,
+    pub(crate) nmxc_config: Configurable<NmxcCollectorOptions>,
     pub(crate) nvue_config: Configurable<NvueCollectorOptions>,
+    pub(crate) tls_config: Option<MtlsProfileConfig>,
+    pub(crate) tls_http_client_provider: Option<MtlsHttpClientProvider>,
+
+    /// Whether any enabled sink consumes `CollectorEvent::Log` payloads.
+    pub(crate) log_event_sink_enabled: bool,
     pub(crate) log_downgrade_registry: Arc<LogDowngradeRegistry>,
+
+    /// Whether log collectors should attach diagnostic payload carriers.
+    pub(crate) logs_include_diagnostics: bool,
 }
 
 impl DiscoveryLoopContext {
@@ -230,6 +250,15 @@ impl DiscoveryLoopContext {
         limiter: Arc<dyn RateLimiter>,
         metrics_manager: Arc<MetricsManager>,
         config: Arc<Config>,
+    ) -> Result<Self, HealthError> {
+        Self::new_with_tls_config(limiter, metrics_manager, config, None)
+    }
+
+    pub(crate) fn new_with_tls_config(
+        limiter: Arc<dyn RateLimiter>,
+        metrics_manager: Arc<MetricsManager>,
+        config: Arc<Config>,
+        tls_config: Option<MtlsProfileConfig>,
     ) -> Result<Self, HealthError> {
         let registry = metrics_manager.global_registry();
 
@@ -253,6 +282,17 @@ impl DiscoveryLoopContext {
         )?;
         registry.register(Box::new(discovery_endpoint_fetch_histogram.clone()))?;
 
+        let tls_config = tls_config.or_else(|| config.tls.switch.clone());
+
+        // Periodic HTTP switch collectors share one provider because
+        // `[tls.switch]` is a single profile. The shortest enabled HTTP poll
+        // interval bounds cert reload staleness without rebuilding a client per
+        // switch target.
+        let tls_http_client_provider = tls_config.clone().and_then(|tls_config| {
+            switch_http_reload_interval(&config)
+                .map(|reload_interval| MtlsHttpClientProvider::new(tls_config, reload_interval))
+        });
+
         Ok(Self {
             collectors: CollectorState::new(),
             discovery_iteration_histogram,
@@ -266,10 +306,36 @@ impl DiscoveryLoopContext {
             firmware_config: config.collectors.firmware.clone(),
             leak_detector_config: config.collectors.leak_detector.clone(),
             nmxt_config: config.collectors.nmxt.clone(),
+            nmxc_config: config.collectors.nmxc.clone(),
             nvue_config: config.collectors.nvue.clone(),
+            tls_config,
+            tls_http_client_provider,
+            log_event_sink_enabled: config.sinks.includes_log_events(),
             log_downgrade_registry: Arc::new(LogDowngradeRegistry::new()),
+            logs_include_diagnostics: config.sinks.includes_log_diagnostics(),
         })
     }
+}
+
+/// Returns the cadence at which periodic HTTP switch collectors reload mTLS material.
+fn switch_http_reload_interval(config: &Config) -> Option<Duration> {
+    let mut reload_interval = None;
+
+    if let Configurable::Enabled(nmxt_config) = &config.collectors.nmxt {
+        reload_interval = Some(nmxt_config.scrape_interval);
+    }
+
+    if let Configurable::Enabled(nvue_config) = &config.collectors.nvue
+        && let Configurable::Enabled(rest_config) = &nvue_config.rest
+    {
+        reload_interval = Some(
+            reload_interval
+                .map(|existing: Duration| existing.min(rest_config.poll_interval))
+                .unwrap_or(rest_config.poll_interval),
+        );
+    }
+
+    reload_interval
 }
 
 #[cfg(test)]
@@ -279,6 +345,7 @@ mod tests {
 
     use super::*;
     use crate::collectors::Collector;
+    use crate::config::MtlsProfileConfig;
 
     fn noop_collector() -> Collector {
         Collector::spawn_task(|_| async {})
@@ -303,5 +370,33 @@ mod tests {
 
         assert!(removed.contains(&Cow::Borrowed("removed-gNMI-endpoint")));
         assert!(!removed.contains(&Cow::Borrowed("active-rest-endpoint")));
+    }
+
+    #[test]
+    fn context_carries_tls_switch_config() {
+        let mut config = Config::default();
+
+        let tls_config = MtlsProfileConfig {
+            ca_cert_path: "/switch/ca.crt".into(),
+            client_cert_path: "/switch/tls.crt".into(),
+            client_key_path: "/switch/tls.key".into(),
+            tls_server_name: Some("switches.example.forge".to_string()),
+        };
+
+        config.tls.switch = Some(tls_config.clone());
+
+        let context = DiscoveryLoopContext::new(
+            Arc::new(crate::limiter::NoopLimiter),
+            Arc::new(MetricsManager::new("tls_context").expect("metrics manager")),
+            Arc::new(config),
+        )
+        .expect("context should initialize");
+
+        let actual_tls_config = context
+            .tls_config
+            .as_ref()
+            .expect("[tls.switch] config should be present");
+
+        assert_eq!(actual_tls_config, &tls_config);
     }
 }

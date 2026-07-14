@@ -516,12 +516,50 @@ pub(crate) async fn admin_force_delete_machine(
                         }
 
                         if machine.bios_password_set_time.is_some() {
-                            if let Err(e) = api
-                                .redfish_pool
-                                .clear_host_uefi_password(client.as_ref())
-                                .await
-                            {
-                                tracing::warn!(%machine_id, error = %e, "Failed to clear host UEFI password while force deleting machine");
+                            // Resolve the credential the device currently carries to
+                            // authenticate the clear (table-driven). Best effort: if it
+                            // cannot be resolved, skip the clear rather than aborting the
+                            // force-delete.
+                            let clear_credentials = match api.txn_begin().await {
+                                Ok(mut txn) => {
+                                    let credentials =
+                                        crate::handlers::uefi::host_uefi_clear_credentials(
+                                            &mut txn,
+                                            api.redfish_pool.credential_reader(),
+                                            bmc_mac_address,
+                                        )
+                                        .await;
+                                    let _ = txn.commit().await;
+                                    credentials.ok()
+                                }
+                                Err(_) => None,
+                            };
+                            if let Some(clear_credentials) = clear_credentials {
+                                match api
+                                    .redfish_pool
+                                    .clear_host_uefi_password(client.as_ref(), clear_credentials)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        // The UEFI password was reset on the device, so the host no
+                                        // longer carries the site-wide UEFI value: drop the host_uefi
+                                        // convergence marker (keyed by the host BMC MAC, mirroring where
+                                        // it is recorded when the password is set). Best-effort like the
+                                        // clear itself -- the machine row is being deleted anyway, so a
+                                        // surviving marker would be neutralized by the rotation engine's
+                                        // live-device join regardless.
+                                        if let Err(e) =
+                                            forget_host_uefi_convergence(api, bmc_mac_address).await
+                                        {
+                                            tracing::warn!(%machine_id, error = %e, "Cleared host UEFI password but failed to delete its credential-rotation marker");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%machine_id, error = %e, "Failed to clear host UEFI password while force deleting machine");
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(%machine_id, "Could not resolve host UEFI credentials to clear while force deleting machine; skipping clear");
                             }
 
                             // TODO (spyda): have libredfish return whether the client needs to reboot the host after clearing the host uefi password
@@ -580,6 +618,43 @@ pub(crate) async fn admin_force_delete_machine(
     let mut txn = api.txn_begin().await?;
     let mut machines_to_clear_credentials = Vec::new();
 
+    // Advisory-lock the admin segments before any row locks so the deletion
+    // follows the allocator lock order -- segment advisory lock first, then
+    // machine interface/address rows (the convention
+    // `reconcile_admin_addresses_for_host` documents). This serializes the
+    // deletion against the allocator, reconcile, and discovery transactions
+    // that hold those locks while they touch interface rows, so the two
+    // sides can't hold segment locks and interface rows in opposite orders.
+    // All admin segments, rather than a set computed from this machine's
+    // interfaces: the snapshots predate the BMC work above, and they omit
+    // BMC-typed interfaces that `force_cleanup` still row-locks.
+    db::machine_interface::lock_all_admin_segments(&mut txn).await?;
+
+    // Clean up the explored tables next, in site-explorer's write order
+    // (`explored_managed_hosts`, then `explored_endpoints`, then interface
+    // rows), so this delete and a concurrent exploration pass can't hold the
+    // same tables in opposite orders.
+    if let Some(machine) = &host_machine
+        && let Some(addr) = machine.bmc_info.ip
+    {
+        tracing::info!("Cleaning up explored endpoint at {addr} {}", machine.id);
+
+        // If this delete waited out a concurrent exploration rewrite, its
+        // statement snapshot can miss the row that rewrite re-inserted; the
+        // leftover clears on the next exploration pass, which rebuilds the
+        // table from the (now deleted) explored endpoints.
+        db::explored_managed_host::delete_by_host_bmc_addr(&mut txn, addr).await?;
+
+        db::explored_endpoints::delete(&mut txn, addr).await?;
+    }
+    for dpu_machine in dpu_machines.iter() {
+        if let Some(addr) = dpu_machine.bmc_info.ip {
+            tracing::info!("Cleaning up explored endpoint at {addr} {}", dpu_machine.id);
+
+            db::explored_endpoints::delete(&mut txn, addr).await?;
+        }
+    }
+
     if let Some(machine) = &host_machine {
         if request.delete_bmc_interfaces
             && let Some(bmc_ip) = machine.bmc_info.ip
@@ -602,14 +677,6 @@ pub(crate) async fn admin_force_delete_machine(
                 db::machine_interface::delete(&interface.id, &mut txn).await?;
             }
             response.host_interfaces_deleted = true;
-        }
-
-        if let Some(addr) = machine.bmc_info.ip {
-            tracing::info!("Cleaning up explored endpoint at {addr} {}", machine.id);
-
-            db::explored_endpoints::delete(&mut txn, addr).await?;
-
-            db::explored_managed_host::delete_by_host_bmc_addr(&mut txn, addr).await?;
         }
 
         if request.delete_bmc_credentials {
@@ -689,12 +756,6 @@ pub(crate) async fn admin_force_delete_machine(
             response.dpu_interfaces_deleted = true;
         }
 
-        if let Some(addr) = dpu_machine.bmc_info.ip {
-            tracing::info!("Cleaning up explored endpoint at {addr} {}", dpu_machine.id);
-
-            db::explored_endpoints::delete(&mut txn, addr).await?;
-        }
-
         if request.delete_bmc_credentials {
             machines_to_clear_credentials.push(dpu_machine);
         }
@@ -738,7 +799,7 @@ fn snapshot_map_to_rpc_machines(
     };
 
     for (machine_id, snapshot) in snapshots.into_iter() {
-        if let Some(rpc_machine) = snapshot.rpc_machine_state(
+        if let Some(rpc_machine) = snapshot.into_rpc_machine_state(
             match machine_id.machine_type().is_dpu() {
                 true => Some(&machine_id),
                 false => None,
@@ -764,6 +825,24 @@ async fn clear_bmc_credentials(api: &Api, machine: &Machine) -> Result<(), Carbi
         crate::handlers::credential::delete_bmc_root_credentials_by_mac(api, mac_address).await?;
     }
 
+    Ok(())
+}
+
+/// Deletes the `host_uefi` credential-rotation convergence marker for a host,
+/// keyed by its BMC MAC. Called after force-delete resets the host UEFI password
+/// on the device, where the host no longer carries the site-wide UEFI value.
+async fn forget_host_uefi_convergence(
+    api: &Api,
+    bmc_mac_address: mac_address::MacAddress,
+) -> Result<(), CarbideError> {
+    let mut txn = api.txn_begin().await?;
+    db::credential_rotation::delete_device_converged(
+        &mut txn,
+        bmc_mac_address,
+        db::credential_rotation::CredentialRotationType::HostUefi,
+    )
+    .await?;
+    txn.commit().await?;
     Ok(())
 }
 

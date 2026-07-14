@@ -37,8 +37,8 @@
 #                          preloaded, or use existing imagePullSecrets.
 #   REGISTRY_PULL_USERNAME Username for generated pull secrets.
 #                          Default: $oauthtoken
-#   NICO_SITE_UUID          Stable REST site UUID. Used only when REST is
-#                          deployed. Default is a dev placeholder.
+#   NICO_SITE_UUID          REST site UUID. Used only when REST is deployed.
+#                          If unset, setup resolves it: prior install ConfigMap, existing site by name, else mints and seeds the site record.
 #   NICO_MANAGE_DEFAULT_STORAGE_CLASS
 #                          Whether setup annotates local-path as the default
 #                          StorageClass. Default: true.
@@ -59,7 +59,7 @@
 #   ./setup.sh -y                       # skip all prompts, deploy everything automatically
 #   ./setup.sh --skip-core              # skip Phase 6 NICo Core (print command, deploy manually)
 #   ./setup.sh --skip-rest              # skip Phase 7 NICo REST entirely (no repo needed)
-#   ./setup.sh --skip-flow              # skip Phase 7i NICo Flow (REST still installs)
+#   ./setup.sh --skip-flow              # skip Phase 7h NICo Flow (REST still installs)
 #                                       #   pair with helm-prereqs/values.yaml::flow.enabled=false
 #                                       #   to skip Flow prereqs (DBs / ESO / vault tokens) too
 #   ./setup.sh --skip-core --skip-rest  # fully non-interactive infra-only run
@@ -381,6 +381,36 @@ until kubectl get postgresql nico-pg-cluster -n postgres \
 done
 echo "nico-pg-cluster is Running"
 
+# Install pg_trgm on nico_rest (needed by the nico-rest-db GIN index migration).
+# Zalando's preparedDatabases conflicts with the databases section, so we install
+# the extension directly after the cluster is ready. Idempotent: IF NOT EXISTS.
+# Wait up to 120s for the Zalando operator to create the nico_rest database.
+_pg_trgm_installed=false
+for _pg_i in $(seq 1 24); do
+    _PG_PRIMARY="$(kubectl get pods -n postgres -l application=spilo \
+        -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.spilo-role}{"\n"}{end}' \
+        2>/dev/null | awk '$2=="master"{print $1}' | head -1)"
+    if [[ -z "${_PG_PRIMARY}" ]]; then
+        echo "  pg_trgm: no Patroni primary yet (${_pg_i}/24) — retrying in 5s..."
+        sleep 5
+        continue
+    fi
+    if kubectl exec -n postgres "${_PG_PRIMARY}" -- \
+        su postgres -c "psql -d nico_rest -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'" \
+        2>/dev/null; then
+        echo "pg_trgm ready"
+        _pg_trgm_installed=true
+        break
+    fi
+    echo "  pg_trgm: nico_rest not yet created by operator (${_pg_i}/24) — retrying in 5s..."
+    sleep 5
+done
+if [[ "${_pg_trgm_installed}" == "false" ]]; then
+    echo "  pg_trgm: nico_rest unavailable after 120s."
+    echo "    → If rest.enabled=false in nico-prereqs, the nico_rest database is not created — this is expected."
+    echo "    → If rest.enabled=true, the nico-rest-db migration will fail on the GIN index step."
+fi
+
 echo "Waiting for DB credentials to be synced by ESO..."
 until kubectl get secret nico-system.nico.nico-pg-cluster.credentials \
     -n nico-system &>/dev/null; do
@@ -435,7 +465,7 @@ else
         -f "${_CORE_VALUES_ARG}"
         --set-string "global.image.repository=${NICO_IMAGE_REGISTRY}/nvmetal-carbide"
         --set-string "global.image.tag=${NICO_CORE_IMAGE_TAG}"
-        --timeout 300s --wait
+        --timeout 600s --wait
     )
     _NICO_CORE_CMD_DISPLAY=""
     for _arg in "${NICO_CORE_CMD[@]}"; do
@@ -522,6 +552,8 @@ fi
 #      7e. Temporal namespace + TLS certs (issued by the NICo REST CA issuer)
 #      7f. Temporal helm chart
 #      7g. NICo REST helm chart (API, cert-manager, workflow, site-manager)
+#      7h. NICo Flow (Flow, PSM, NSM)
+#      7i. NICo REST site-agent
 # ---------------------------------------------------------------------------
 echo ""
 _SETUP_PHASE="[7/7] NICo REST"
@@ -629,22 +661,129 @@ _TEMPORAL_TLS="--tls-cert-path /var/secrets/temporal/certs/server-interservice/t
     --tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
     --tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
     --tls-server-name interservice.server.temporal.local"
-kubectl exec -n temporal deploy/temporal-admintools -- \
-    sh -c "temporal operator namespace create -n cloud --retention 72h --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>/dev/null || true
-kubectl exec -n temporal deploy/temporal-admintools -- \
-    sh -c "temporal operator namespace create -n site --retention 72h --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>/dev/null || true
+_wait_for_temporal() {
+    local _output=""
+
+    echo "Waiting for Temporal frontend and admin tools..."
+    kubectl rollout status deploy/temporal-frontend -n temporal --timeout=120s
+    kubectl rollout status deploy/temporal-admintools -n temporal --timeout=120s
+
+    for _i in $(seq 1 24); do
+        if _output="$(kubectl exec -n temporal deploy/temporal-admintools -- \
+            sh -c "temporal operator namespace list --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>&1)"; then
+            echo "Temporal frontend ready"
+            return
+        fi
+        echo "  Waiting for Temporal API (${_i}/24)..."
+        sleep 5
+    done
+
+    echo "ERROR: Temporal frontend is not ready for namespace operations" >&2
+    echo "${_output}" >&2
+    exit 1
+}
+
+_create_temporal_namespace() {
+    local _namespace="$1"
+    local _output
+
+    if _output="$(kubectl exec -n temporal deploy/temporal-admintools -- \
+        sh -c "temporal operator namespace create -n \"\$1\" --retention 72h --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" \
+        sh "${_namespace}" 2>&1)"; then
+        echo "Temporal namespace ${_namespace} ready"
+        return
+    fi
+
+    if printf "%s" "${_output}" | grep -qi "already exists"; then
+        echo "Temporal namespace ${_namespace} already exists"
+        return
+    fi
+
+    echo "ERROR: failed to create Temporal namespace ${_namespace}" >&2
+    echo "${_output}" >&2
+    exit 1
+}
+
+_verify_temporal_namespaces() {
+    local _output
+    local _missing=()
+    local _namespace
+
+    if ! _output="$(kubectl exec -n temporal deploy/temporal-admintools -- \
+        sh -c "temporal operator namespace list --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>&1)"; then
+        echo "ERROR: failed to list Temporal namespaces" >&2
+        echo "${_output}" >&2
+        exit 1
+    fi
+
+    for _namespace in "$@"; do
+        if ! printf "%s" "${_output}" | grep -Eq "(^|[^[:alnum:]_-])${_namespace}([^[:alnum:]_-]|$)"; then
+            _missing+=("${_namespace}")
+        fi
+    done
+
+    if [[ ${#_missing[@]} -gt 0 ]]; then
+        echo "ERROR: missing Temporal namespace(s): ${_missing[*]}" >&2
+        echo "${_output}" >&2
+        exit 1
+    fi
+
+    echo "Verified Temporal namespaces: $*"
+}
+
+_wait_for_temporal
+_create_temporal_namespace cloud
+_create_temporal_namespace site
 # flow Temporal namespace — required by NICo Flow workers; pod panics on startup if absent.
-kubectl exec -n temporal deploy/temporal-admintools -- \
-    sh -c "temporal operator namespace create -n flow --retention 72h --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>/dev/null || true
+_create_temporal_namespace flow
+_verify_temporal_namespaces cloud site flow
 echo "Temporal namespaces ready"
 
 _SETUP_PHASE="[7g/7] NICo REST helm chart"
 # --- 7g. NICo REST helm chart -------------------------------------------------
+# Wait for ESO to sync the Zalando-generated REST DB credentials into nico-rest.
+# nico-rest-db-eso ClusterExternalSecret creates nico-rest-pg-creds once the
+# nico-rest namespace (created in 7a) is visible to ESO. The nico-rest-db
+# pre-install hook will fail immediately if the secret is missing.
+echo "Waiting for REST DB credentials to be synced by ESO (nico-rest-pg-creds in nico-rest)..."
+for _rdc_i in $(seq 1 24); do
+    if kubectl get secret nico-rest-pg-creds -n nico-rest &>/dev/null; then
+        break
+    fi
+    if [[ "${_rdc_i}" -eq 24 ]]; then
+        echo "ERROR: nico-rest-pg-creds not synced after 120s." >&2
+        echo "  Check: kubectl describe clusterexternalsecret nico-rest-db-eso" >&2
+        echo "  Ensure the nico-rest namespace exists and rest.enabled=true in nico-prereqs." >&2
+        exit 1
+    fi
+    echo "  nico-rest-pg-creds not yet synced (${_rdc_i}/24) — retrying in 5s..."
+    sleep 5
+done
+echo "REST DB credentials ready"
+
+# Write credentials to a temp file rather than --set so they are not visible
+# in process arguments and are not subject to Helm's --set special-char escaping.
+_NICO_REST_CREDS_FILE="$(mktemp)"
+chmod 600 "${_NICO_REST_CREDS_FILE}"
+printf 'nico-rest-common:\n  secrets:\n    dbCreds:\n      username: "%s"\n      password: "%s"\n' \
+    "$(kubectl get secret nico-rest-pg-creds -n nico-rest -o jsonpath='{.data.username}' | base64 -d)" \
+    "$(kubectl get secret nico-rest-pg-creds -n nico-rest -o jsonpath='{.data.password}' | base64 -d)" \
+    > "${_NICO_REST_CREDS_FILE}"
+# The workflow workers missed the nico-pg-cluster consolidation (#3081): the
+# subchart defaults still point at the legacy postgres.postgres/nico database
+# (zero tables), so every DB activity fails with SQLSTATE 42P01 (relation
+# "site" does not exist) and no site can ever leave Pending. Align the worker
+# DB target with nico-rest-api at install time (password comes from the
+# db-creds Secret the nico-rest-common hook creates from the values above).
+printf 'nico-rest-workflow:\n  secrets:\n    dbCreds: "db-creds"\n  config:\n    db:\n      host: "nico-pg-cluster.postgres.svc.cluster.local"\n      name: "nico_rest"\n      user: "nico-rest.nico"\n' \
+    >> "${_NICO_REST_CREDS_FILE}"
+
 NICO_HELM_CHART="${NICO_REST_HELM_DIR}/nico-rest"
 NICO_REST_CMD=(
     helm upgrade --install nico-rest "${NICO_HELM_CHART}"
     --namespace nico-rest
     -f "${SCRIPT_DIR}/values/nico-rest.yaml"
+    -f "${_NICO_REST_CREDS_FILE}"
     --set global.image.repository="${NICO_IMAGE_REGISTRY}"
     --set global.image.tag="${NICO_REST_IMAGE_TAG}"
     --timeout 600s --wait
@@ -683,15 +822,155 @@ else
 fi
 if [[ "${_nico_reply:-Y}" =~ ^[Yy]$ ]]; then
     "${NICO_REST_CMD[@]}"
+    rm -f "${_NICO_REST_CREDS_FILE}"
 else
+    rm -f "${_NICO_REST_CREDS_FILE}"
     echo "Skipped NICo REST. Re-run with -y or answer Y to deploy."
     echo ""
     echo "=== Setup complete (NICo REST skipped) ==="
     exit 0
 fi
 
-# --- 7h. NICo REST site-agent -------------------------------------------------
+# --- 7h. NICo Flow ------------------------------------------------------------
+# Flow is the rack lifecycle orchestrator (formerly RLA). Single pod with three
+# containers — flow (50051), psm (50052), nsm (50053).  Runs in its own `flow`
+# namespace.
+#
+# Runs BEFORE the site-agent (7i) so that flow.flow.svc.cluster.local:50051
+# exists when the site-agent starts and attempts its Flow gRPC connection.
+#
+# Prerequisites already in place by this point:
+#   - flow/psm/nsm databases on nico-pg-cluster (helm-prereqs postgresql.yaml)
+#   - flow.nico/psm.nico/nsm.nico DB credentials synced via ESO into the flow
+#     namespace by the flow-db-eso / psm-db-eso / nsm-db-eso ClusterExternalSecrets
+#   - psm-vault-token and nsm-vault-token Secrets in the flow namespace
+#     (provisioned by the flow-vault-tokens post-install hook)
+#   - Temporal `flow` namespace (created in phase 7f above)
+#   - nico-rest-ca-issuer ClusterIssuer (installed by phase 7b — issues the
+#     temporal-client-certs)
+#   - vault-nico-issuer ClusterIssuer (issues the SPIFFE cert)
+#
+# Same pre-apply-cert dance as the site-agent: render the Certificate(s) ahead
+# of the helm install so cert-manager has time to issue them and the pod doesn't
+# hit a FailedMount race on the spiffe / temporal-client-certs secrets.
+if "${SKIP_FLOW}"; then
+    echo "=== [7h/7] NICo Flow — skipped (--skip-flow) ==="
+else
+    _SETUP_PHASE="[7h/7] NICo Flow"
+    echo "=== [7h/7] NICo Flow ==="
+
+    NICO_FLOW_CHART="${SCRIPT_DIR}/../helm/charts/nico-flow"
+    NICO_FLOW_NAMESPACE="flow"
+
+    NICO_FLOW_ARGS=(
+        --namespace "${NICO_FLOW_NAMESPACE}"
+        --create-namespace
+        --set "global.image.repository=${NICO_IMAGE_REGISTRY}"
+        ## Flow (nico-flow / nico-psm / nico-nsm) ships on the same image release
+        ## line as NICo REST — they're built and tagged together — so reuse
+        ## NICO_REST_IMAGE_TAG, not NICO_CORE_IMAGE_TAG (which is carbide-api).
+        --set "global.image.tag=${NICO_REST_IMAGE_TAG}"
+    )
+
+    # Render the dockerconfigjson for the chart-managed image-pull-secret. Same
+    # pattern as the NICo REST common chart — keep the registry credential on
+    # the helm command line so the chart template can install it as a
+    # pre-install hook (pod can't pull from nvcr.io otherwise).
+    if [[ -n "${REGISTRY_PULL_SECRET:-}" ]]; then
+        _flow_registry_server="${NICO_IMAGE_REGISTRY%%/*}"
+        _flow_docker_cfg="$(printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
+            "${_flow_registry_server}" \
+            "${REGISTRY_PULL_USERNAME:-\$oauthtoken}" \
+            "${REGISTRY_PULL_SECRET}" | base64 | tr -d '\n')"
+        NICO_FLOW_ARGS+=(
+            --set "global.imagePullSecrets[0].name=image-pull-secret"
+            --set "imagePullSecret.dockerconfigjson=${_flow_docker_cfg}"
+        )
+    fi
+
+    # Pre-apply Certificates so cert-manager can issue secrets before the pod schedules.
+    echo "Pre-applying flow Certificates (SPIFFE + Temporal client)..."
+    helm template flow "${NICO_FLOW_CHART}" \
+        "${NICO_FLOW_ARGS[@]}" \
+        --show-only templates/namespace.yaml | kubectl apply -f -
+    helm template flow "${NICO_FLOW_CHART}" \
+        "${NICO_FLOW_ARGS[@]}" \
+        --show-only templates/certificate.yaml | kubectl apply -f -
+    kubectl annotate certificate/flow-certificate -n "${NICO_FLOW_NAMESPACE}" \
+        "meta.helm.sh/release-name=flow" \
+        "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
+    kubectl annotate certificate/temporal-client-certs -n "${NICO_FLOW_NAMESPACE}" \
+        "meta.helm.sh/release-name=flow" \
+        "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
+    kubectl label certificate/flow-certificate -n "${NICO_FLOW_NAMESPACE}" \
+        "app.kubernetes.io/managed-by=Helm" --overwrite
+    kubectl label certificate/temporal-client-certs -n "${NICO_FLOW_NAMESPACE}" \
+        "app.kubernetes.io/managed-by=Helm" --overwrite
+
+    # Annotate/label the namespace itself — the flow-vault-tokens-job (nico-prereqs
+    # helm hook) creates this namespace ahead of the flow release. Without Helm
+    # ownership metadata, helm install refuses to adopt it.
+    kubectl annotate namespace "${NICO_FLOW_NAMESPACE}" \
+        "meta.helm.sh/release-name=flow" \
+        "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
+    kubectl label namespace "${NICO_FLOW_NAMESPACE}" \
+        "app.kubernetes.io/managed-by=Helm" --overwrite
+
+    echo "Waiting for cert-manager to issue flow-certificate..."
+    kubectl wait --for=condition=Ready certificate/flow-certificate \
+        -n "${NICO_FLOW_NAMESPACE}" --timeout=120s
+    echo "Waiting for cert-manager to issue temporal-client-certs..."
+    kubectl wait --for=condition=Ready certificate/temporal-client-certs \
+        -n "${NICO_FLOW_NAMESPACE}" --timeout=120s
+
+    # Wait for the psm/nsm vault tokens and DB credential ESO syncs to land
+    # (provisioned by helm-prereqs hooks; may still be in flight if nico-prereqs
+    # was re-installed just before this phase). Fail-fast if any secret never
+    # shows up — the alternative (silently falling through to helm install) is
+    # 5 minutes of FailedMount-loop before helm gives up with an opaque message.
+    _wait_for_secret() {
+        local _name="$1"
+        local _ns="$2"
+        local _hint="$3"
+        for _i in $(seq 1 24); do
+            if kubectl get secret "${_name}" -n "${_ns}" >/dev/null 2>&1; then
+                echo "  ${_name} ready"
+                return 0
+            fi
+            echo "  Waiting for ${_name} (${_i}/24)..."
+            sleep 5
+        done
+        echo "ERROR: Secret ${_name} did not appear in namespace ${_ns} within 120s."
+        echo "  ${_hint}"
+        return 1
+    }
+
+    echo "Waiting for psm/nsm Vault tokens..."
+    for _s in psm-vault-token nsm-vault-token; do
+        _wait_for_secret "${_s}" "${NICO_FLOW_NAMESPACE}" \
+            "Provisioned by the flow-vault-tokens helm hook in nico-prereqs. Check 'kubectl logs -n nico-system job/flow-vault-tokens' and confirm helm-prereqs/values.yaml::flow.enabled=true."
+    done
+
+    echo "Waiting for flow/psm/nsm DB credentials..."
+    for _s in flow.nico.nico-pg-cluster.credentials \
+             psm.nico.nico-pg-cluster.credentials \
+             nsm.nico.nico-pg-cluster.credentials; do
+        _wait_for_secret "${_s}" "${NICO_FLOW_NAMESPACE}" \
+            "Synced by the flow-db-eso/psm-db-eso/nsm-db-eso ClusterExternalSecrets in nico-prereqs. Check 'kubectl describe clusterexternalsecret -A | grep flow' and confirm helm-prereqs/values.yaml::flow.enabled=true."
+    done
+
+    echo "Installing flow helm chart..."
+    helm upgrade --install flow "${NICO_FLOW_CHART}" \
+        "${NICO_FLOW_ARGS[@]}" \
+        --timeout 300s --wait
+    echo "NICo Flow deployed"
+fi
+
+# --- 7i. NICo REST site-agent -------------------------------------------------
 # The site-agent is a separate chart from the main NICo REST umbrella.
+#
+# Runs AFTER NICo Flow (7h) so that flow.flow.svc.cluster.local:50051 is
+# reachable when the site-agent starts its Flow gRPC connection.
 #
 # Bootstrap order:
 #   1. Create the per-site Temporal namespace BEFORE helm install so the
@@ -710,8 +989,118 @@ fi
 # All of this is wired via --set flags so nico-rest.yaml stays registry-agnostic.
 NICO_SITE_AGENT_CHART="${NICO_REST_HELM_DIR}/nico-rest-site-agent"
 
-# Stable placeholder UUID for this site (must be a valid UUID).
-NICO_SITE_UUID="${NICO_SITE_UUID:-a1b2c3d4-e5f6-4000-8000-000000000001}"
+# ---------------------------------------------------------------------------
+# Resolve the site UUID — the site-agent must only ever be bound to a UUID
+# that a site record in the REST database backs, or its inventory is dropped
+# and `nicocli site list` stays empty (the CR+OTP that the bootstrap Job
+# creates via POST /v1/site is necessary but NOT sufficient).
+# Resolution order:
+#   1. explicit NICO_SITE_UUID           — bind to a pre-existing site
+#   2. CLUSTER_ID of a prior install     — stable across reruns
+#   3. existing REST site row by name    — adopt (idempotent reprovision)
+#   4. mint a new UUID                   — the seed below creates its site row
+# Then seed the REST DB directly (same record shape as forged's per-env
+# envs/*/carbide-rest/site.sql: a 'default' infrastructure_provider for the
+# org plus a Pending site row). DB row first, CR second — the bootstrap Job's
+# existing POST /v1/site then creates the Site CR + OTP for the same UUID.
+# IdP-agnostic: no API token needed.
+# ---------------------------------------------------------------------------
+NICO_ORG="${NICO_ORG:-ncx}"
+# siteName may be bare, single- or double-quoted in YAML; strip either style.
+NICO_SITE_NAME="${NICO_SITE_NAME:-$(awk '/^siteName:/{v=$2; gsub(/["'"'"']/,"",v); print v}' "${SCRIPT_DIR}/values.yaml" 2>/dev/null || true)}"
+if [[ -z "${NICO_SITE_NAME}" ]]; then
+    echo "ERROR: could not resolve the site name (set NICO_SITE_NAME or siteName in values.yaml)" >&2
+    exit 1
+fi
+# These values are interpolated into SQL inside a double-quoted shell string —
+# restrict them to a safe charset instead of attempting to escape.
+if ! [[ "${NICO_SITE_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "${NICO_ORG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: NICO_SITE_NAME/NICO_ORG must match [A-Za-z0-9][A-Za-z0-9._-]* (got '${NICO_SITE_NAME}' / '${NICO_ORG}')" >&2
+    exit 1
+fi
+
+# || true: under set -euo pipefail a kubectl failure here would kill the
+# script before the emptiness check that makes seeding optional.
+_REST_PG_PRIMARY="$(kubectl get pods -n postgres -l application=spilo \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.spilo-role}{"\n"}{end}' \
+    2>/dev/null | awk '$2=="master"{print $1}' | head -1 || true)"
+_rest_sql() {   # runs SQL against the nico_rest DB on the Patroni primary
+    kubectl exec -n postgres "${_REST_PG_PRIMARY}" -- \
+        su postgres -c "psql -d nico_rest -v ON_ERROR_STOP=1 -tAc \"$1\"" 2>/dev/null
+}
+
+# CLUSTER_ID reaches the agent via envFrom -> the nico-rest-site-agent-config
+# ConfigMap; it never appears as an inline env entry in the StatefulSet spec,
+# so it must be read from the ConfigMap. Fetched once; reused by the
+# stale-secret guard below.
+_PRIOR_CLUSTER_ID="$(kubectl get configmap nico-rest-site-agent-config -n nico-rest \
+    -o jsonpath='{.data.CLUSTER_ID}' 2>/dev/null || true)"
+
+if [[ -z "${NICO_SITE_UUID:-}" ]]; then
+    # 2. prior install's CLUSTER_ID (stable reruns)
+    NICO_SITE_UUID="${_PRIOR_CLUSTER_ID}"
+fi
+if [[ -z "${NICO_SITE_UUID:-}" && -n "${_REST_PG_PRIMARY}" ]]; then
+    # 3. adopt an existing site row with our name
+    NICO_SITE_UUID="$(_rest_sql "SELECT id FROM site WHERE name='${NICO_SITE_NAME}' AND org='${NICO_ORG}' AND deleted IS NULL LIMIT 1;" || true)"
+    [[ -n "${NICO_SITE_UUID}" ]] && echo "Adopting existing REST site '${NICO_SITE_NAME}' (${NICO_SITE_UUID})"
+fi
+if [[ -z "${NICO_SITE_UUID:-}" ]]; then
+    # 4. mint — the seed below registers it
+    if ! command -v python3 &>/dev/null; then
+        echo "ERROR: NICO_SITE_UUID is unset and python3 is not available" >&2
+        exit 1
+    fi
+    NICO_SITE_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+fi
+# Validate before interpolating into SQL / --set (path 1 accepts arbitrary env).
+if ! [[ "${NICO_SITE_UUID}" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo "ERROR: resolved NICO_SITE_UUID is not a valid UUID: '${NICO_SITE_UUID}'" >&2
+    exit 1
+fi
+
+# Seed the site record (idempotent): provider row per org, site row keyed by
+# our UUID. Waits briefly for the REST migrations to have created the tables.
+if [[ -n "${_REST_PG_PRIMARY}" ]]; then
+    for _s_i in $(seq 1 24); do
+        _rest_sql "SELECT 1 FROM site LIMIT 1;" >/dev/null 2>&1 && break
+        [[ "${_s_i}" -eq 24 ]] && { echo "ERROR: REST 'site' table not present after 120s — did the nico-rest-db migrations run?" >&2; exit 1; }
+        echo "  waiting for REST DB migrations (site table) (${_s_i}/24)..."
+        sleep 5
+    done
+    _rest_sql "INSERT INTO infrastructure_provider (id, name, display_name, org, created, updated, created_by)
+        SELECT gen_random_uuid(), 'default', 'default', '${NICO_ORG}', now(), now(), '${NICO_SITE_UUID}'
+        WHERE NOT EXISTS (SELECT 1 FROM infrastructure_provider WHERE org='${NICO_ORG}' AND name='default' AND deleted IS NULL);" >/dev/null \
+        || { echo "ERROR: failed to seed infrastructure_provider" >&2; exit 1; }
+    _rest_sql "INSERT INTO site (id, name, display_name, org, infrastructure_provider_id, registration_token,
+            registration_token_expiration, is_infinity_enabled, is_serial_console_enabled, status, created, updated, created_by, config)
+        SELECT '${NICO_SITE_UUID}', '${NICO_SITE_NAME}', '${NICO_SITE_NAME}', '${NICO_ORG}',
+            (SELECT id FROM infrastructure_provider WHERE org='${NICO_ORG}' AND name='default' AND deleted IS NULL LIMIT 1),
+            gen_random_uuid(), now() + interval '7 days', false, false, 'Pending', now(), now(), '${NICO_SITE_UUID}',
+            '{\\\"native_networking\\\": true, \\\"network_security_group\\\": true, \\\"flow\\\": true}'
+        WHERE NOT EXISTS (SELECT 1 FROM site WHERE id='${NICO_SITE_UUID}');" >/dev/null \
+        || { echo "ERROR: failed to seed the site record" >&2; exit 1; }
+    # Parity with the REST create handler: it defaults native_networking and
+    # network_security_group to true ("v2 networking posture", site.go) and
+    # writes a status_detail row in the same transaction; endpoints surfacing
+    # status details would otherwise return an empty array for a seeded site.
+    _rest_sql "INSERT INTO status_detail (id, entity_id, status, message, count, created, updated)
+        SELECT gen_random_uuid(), '${NICO_SITE_UUID}', 'Pending', 'received site creation request, pending pairing', 1, now(), now()
+        WHERE NOT EXISTS (SELECT 1 FROM status_detail WHERE entity_id='${NICO_SITE_UUID}');" >/dev/null \
+        || echo "WARNING: could not seed the site status_detail row (non-fatal)" >&2
+    echo "REST site record ready: '${NICO_SITE_NAME}' (${NICO_SITE_UUID}, org ${NICO_ORG})"
+else
+    echo "WARNING: no Patroni primary found — skipping REST site seeding (site-agent inventory will be dropped until the site exists)" >&2
+fi
+
+# If a previous bootstrap bound the site-registration secret to a DIFFERENT
+# UUID, delete it so the bootstrap Job re-registers under the resolved one
+# instead of silently keeping the stale identity.
+if kubectl get secret site-registration -n nico-rest &>/dev/null \
+   && [[ -n "${_PRIOR_CLUSTER_ID}" && "${_PRIOR_CLUSTER_ID}" != "${NICO_SITE_UUID}" ]]; then
+    echo "site-registration secret is bound to stale UUID ${_PRIOR_CLUSTER_ID} — deleting for re-bootstrap"
+    kubectl delete secret site-registration -n nico-rest >/dev/null
+fi
 
 NICO_SITE_AGENT_ARGS=(
     --namespace nico-rest
@@ -725,8 +1114,8 @@ if [[ -n "${REGISTRY_PULL_SECRET:-}" ]]; then
     )
 fi
 
-_SETUP_PHASE="[7h/7] NICo REST site-agent"
-echo "=== [7h/7] NICo REST site-agent (site UUID: ${NICO_SITE_UUID}) ==="
+_SETUP_PHASE="[7i/7] NICo REST site-agent"
+echo "=== [7i/7] NICo REST site-agent (site UUID: ${NICO_SITE_UUID}) ==="
 
 # Pre-apply the Certificate resource so cert-manager issues the NICo gRPC client
 # cert BEFORE the StatefulSet pod starts. Without this, there is a race: helm creates
@@ -762,14 +1151,14 @@ _TEMPORAL_TLS="--tls-cert-path /var/secrets/temporal/certs/server-interservice/t
     --tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
     --tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
     --tls-server-name interservice.server.temporal.local"
-kubectl exec -n temporal deploy/temporal-admintools -- \
-    sh -c "temporal operator namespace create -n '${NICO_SITE_UUID}' --retention 72h --address ${_TEMPORAL_ADDR} ${_TEMPORAL_TLS}" 2>/dev/null || true
+_create_temporal_namespace "${NICO_SITE_UUID}"
+_verify_temporal_namespaces "${NICO_SITE_UUID}"
 echo "Temporal namespace ready"
 
 # FLOW_GRPC_ENABLED toggles the site-agent's Flow gRPC client (see
 # carbide-rest/site-agent/pkg/components/config/config_manager.go —
 # strings.ToLower(env)=="true"). Without it, site-agent never opens a
-# connection to the Flow pod deployed in phase 7i. We default it ON when
+# connection to the Flow pod deployed in phase 7h. We default it ON when
 # Flow itself is being deployed; users can flip it back via --set when
 # pairing --skip-flow.
 _FLOW_GRPC_ENABLED="true"
@@ -814,139 +1203,6 @@ if [ "${_CONNECTED}" = "false" ]; then
     kubectl rollout status statefulset/nico-rest-site-agent -n nico-rest --timeout=120s
     echo "Site-agent pod restarted — gRPC connection will be retried"
 fi
-
-# --- 7i. NICo Flow ------------------------------------------------------------
-# Flow is the rack lifecycle orchestrator (formerly RLA). Single pod with three
-# containers — flow (50051), psm (50052), nsm (50053).  Runs in its own `flow`
-# namespace.
-#
-# Prerequisites already in place by this point:
-#   - flow/psm/nsm databases on nico-pg-cluster (helm-prereqs postgresql.yaml)
-#   - flow.nico/psm.nico/nsm.nico DB credentials synced via ESO into the flow
-#     namespace by the flow-db-eso / psm-db-eso / nsm-db-eso ClusterExternalSecrets
-#   - psm-vault-token and nsm-vault-token Secrets in the flow namespace
-#     (provisioned by the flow-vault-tokens post-install hook)
-#   - Temporal `flow` namespace (created in phase 7f above)
-#   - nico-rest-ca-issuer ClusterIssuer (installed by phase 7b — issues the
-#     temporal-client-certs)
-#   - vault-nico-issuer ClusterIssuer (issues the SPIFFE cert)
-#
-# Same pre-apply-cert dance as the site-agent: render the Certificate(s) ahead
-# of the helm install so cert-manager has time to issue them and the pod doesn't
-# hit a FailedMount race on the spiffe / temporal-client-certs secrets.
-if "${SKIP_FLOW}"; then
-    echo "=== [7i/7] NICo Flow — skipped (--skip-flow) ==="
-    _SETUP_PHASE="complete"
-    exit 0
-fi
-_SETUP_PHASE="[7i/7] NICo Flow"
-echo "=== [7i/7] NICo Flow ==="
-
-NICO_FLOW_CHART="${SCRIPT_DIR}/../helm/charts/nico-flow"
-NICO_FLOW_NAMESPACE="flow"
-
-NICO_FLOW_ARGS=(
-    --namespace "${NICO_FLOW_NAMESPACE}"
-    --create-namespace
-    --set "global.image.repository=${NICO_IMAGE_REGISTRY}"
-    ## Flow (nico-flow / nico-psm / nico-nsm) ships on the same image release
-    ## line as NICo REST — they're built and tagged together — so reuse
-    ## NICO_REST_IMAGE_TAG, not NICO_CORE_IMAGE_TAG (which is carbide-api).
-    --set "global.image.tag=${NICO_REST_IMAGE_TAG}"
-)
-
-# Render the dockerconfigjson for the chart-managed image-pull-secret. Same
-# pattern as the NICo REST common chart — keep the registry credential on
-# the helm command line so the chart template can install it as a
-# pre-install hook (pod can't pull from nvcr.io otherwise).
-if [[ -n "${REGISTRY_PULL_SECRET:-}" ]]; then
-    _flow_registry_server="${NICO_IMAGE_REGISTRY%%/*}"
-    _flow_docker_cfg="$(printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
-        "${_flow_registry_server}" \
-        "${REGISTRY_PULL_USERNAME:-\$oauthtoken}" \
-        "${REGISTRY_PULL_SECRET}" | base64 | tr -d '\n')"
-    NICO_FLOW_ARGS+=(
-        --set "global.imagePullSecrets[0].name=image-pull-secret"
-        --set "imagePullSecret.dockerconfigjson=${_flow_docker_cfg}"
-    )
-fi
-
-# Pre-apply Certificates so cert-manager can issue secrets before the pod schedules.
-echo "Pre-applying flow Certificates (SPIFFE + Temporal client)..."
-helm template flow "${NICO_FLOW_CHART}" \
-    "${NICO_FLOW_ARGS[@]}" \
-    --show-only templates/namespace.yaml | kubectl apply -f -
-helm template flow "${NICO_FLOW_CHART}" \
-    "${NICO_FLOW_ARGS[@]}" \
-    --show-only templates/certificate.yaml | kubectl apply -f -
-kubectl annotate certificate/flow-certificate -n "${NICO_FLOW_NAMESPACE}" \
-    "meta.helm.sh/release-name=flow" \
-    "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
-kubectl annotate certificate/temporal-client-certs -n "${NICO_FLOW_NAMESPACE}" \
-    "meta.helm.sh/release-name=flow" \
-    "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
-kubectl label certificate/flow-certificate -n "${NICO_FLOW_NAMESPACE}" \
-    "app.kubernetes.io/managed-by=Helm" --overwrite
-kubectl label certificate/temporal-client-certs -n "${NICO_FLOW_NAMESPACE}" \
-    "app.kubernetes.io/managed-by=Helm" --overwrite
-
-# Annotate/label the namespace itself — the flow-vault-tokens-job (nico-prereqs
-# helm hook) creates this namespace ahead of the flow release. Without Helm
-# ownership metadata, helm install refuses to adopt it.
-kubectl annotate namespace "${NICO_FLOW_NAMESPACE}" \
-    "meta.helm.sh/release-name=flow" \
-    "meta.helm.sh/release-namespace=${NICO_FLOW_NAMESPACE}" --overwrite
-kubectl label namespace "${NICO_FLOW_NAMESPACE}" \
-    "app.kubernetes.io/managed-by=Helm" --overwrite
-
-echo "Waiting for cert-manager to issue flow-certificate..."
-kubectl wait --for=condition=Ready certificate/flow-certificate \
-    -n "${NICO_FLOW_NAMESPACE}" --timeout=120s
-echo "Waiting for cert-manager to issue temporal-client-certs..."
-kubectl wait --for=condition=Ready certificate/temporal-client-certs \
-    -n "${NICO_FLOW_NAMESPACE}" --timeout=120s
-
-# Wait for the psm/nsm vault tokens and DB credential ESO syncs to land
-# (provisioned by helm-prereqs hooks; may still be in flight if nico-prereqs
-# was re-installed just before this phase). Fail-fast if any secret never
-# shows up — the alternative (silently falling through to helm install) is
-# 5 minutes of FailedMount-loop before helm gives up with an opaque message.
-_wait_for_secret() {
-    local _name="$1"
-    local _ns="$2"
-    local _hint="$3"
-    for _i in $(seq 1 24); do
-        if kubectl get secret "${_name}" -n "${_ns}" >/dev/null 2>&1; then
-            echo "  ${_name} ready"
-            return 0
-        fi
-        echo "  Waiting for ${_name} (${_i}/24)..."
-        sleep 5
-    done
-    echo "ERROR: Secret ${_name} did not appear in namespace ${_ns} within 120s."
-    echo "  ${_hint}"
-    return 1
-}
-
-echo "Waiting for psm/nsm Vault tokens..."
-for _s in psm-vault-token nsm-vault-token; do
-    _wait_for_secret "${_s}" "${NICO_FLOW_NAMESPACE}" \
-        "Provisioned by the flow-vault-tokens helm hook in nico-prereqs. Check 'kubectl logs -n nico-system job/flow-vault-tokens' and confirm helm-prereqs/values.yaml::flow.enabled=true."
-done
-
-echo "Waiting for flow/psm/nsm DB credentials..."
-for _s in flow.nico.nico-pg-cluster.credentials \
-         psm.nico.nico-pg-cluster.credentials \
-         nsm.nico.nico-pg-cluster.credentials; do
-    _wait_for_secret "${_s}" "${NICO_FLOW_NAMESPACE}" \
-        "Synced by the flow-db-eso/psm-db-eso/nsm-db-eso ClusterExternalSecrets in nico-prereqs. Check 'kubectl describe clusterexternalsecret -A | grep flow' and confirm helm-prereqs/values.yaml::flow.enabled=true."
-done
-
-echo "Installing flow helm chart..."
-helm upgrade --install flow "${NICO_FLOW_CHART}" \
-    "${NICO_FLOW_ARGS[@]}" \
-    --timeout 300s --wait
-echo "NICo Flow deployed"
 
 echo ""
 echo "========================================================================="

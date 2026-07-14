@@ -24,7 +24,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	cwutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 )
@@ -40,7 +40,7 @@ type ManageVpc struct {
 // Activity functions
 
 // UpdateVpcsInDB is a Temporal activity that takes a collection of VPC data pushed by Site Agent and updates the DB
-func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInventory *cwssaws.VPCInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
+func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInventory *corev1.VPCInventory) ([]cwm.InventoryObjectLifecycleEvent, error) {
 	logger := log.With().Str("Activity", "UpdateVpcsInDB").Str("Site ID", siteID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -67,7 +67,7 @@ func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInv
 		return nil, err
 	}
 
-	if vpcInventory.InventoryStatus == cwssaws.InventoryStatus_INVENTORY_STATUS_FAILED {
+	if vpcInventory.InventoryStatus == corev1.InventoryStatus_INVENTORY_STATUS_FAILED {
 		logger.Warn().Msg("received failed inventory status from Site Agent, skipping inventory processing")
 		return nil, errors.New(vpcInventory.StatusMsg)
 	}
@@ -318,7 +318,7 @@ func (mv ManageVpc) UpdateVpcsInDB(ctx context.Context, siteID uuid.UUID, vpcInv
 
 			// Leave orderBy as nil as the result is sorted by created timestamp by default
 			if status == vpc.Status {
-				latestsd, _, serr := sdDAO.GetAllByEntityID(ctx, nil, vpc.ID.String(), nil, cwutil.GetPtr(1), nil)
+				latestsd, _, serr := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{vpc.ID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(1)})
 				if serr != nil {
 					slogger.Error().Err(serr).Msg("failed to retrieve latest Status Detail for VPC")
 					continue
@@ -357,7 +357,7 @@ func (mv ManageVpc) updateVpcStatusInDB(ctx context.Context, tx *cdb.Tx, vpcID u
 		}
 
 		statusDetailDAO := cdbm.NewStatusDetailDAO(mv.dbSession)
-		_, err = statusDetailDAO.CreateFromParams(ctx, tx, vpcID.String(), *status, statusMessage)
+		_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpcID.String(), Status: *status, Message: statusMessage})
 		if err != nil {
 			return err
 		}
@@ -367,7 +367,7 @@ func (mv ManageVpc) updateVpcStatusInDB(ctx context.Context, tx *cdb.Tx, vpcID u
 
 // UpdateVpcMetadata is a Temporal activity that will trigger an update of an vpc's metadata
 // if they are found out of sync with the cloud.
-func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc client.Client, vpcID uuid.UUID, controllerVpc *cwssaws.Vpc) error {
+func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc client.Client, vpcID uuid.UUID, controllerVpc *corev1.Vpc) error {
 	logger := log.With().Str("Activity", "UpdateVpcMetadata").Str("Site ID", siteID.String()).Str("VPC ID", vpcID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -387,9 +387,9 @@ func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc 
 	}
 
 	// Prepare the labels for the metadata of the nico call.
-	labels := []*cwssaws.Label{}
+	labels := []*corev1.Label{}
 	for k, v := range vpc.Labels {
-		labels = append(labels, &cwssaws.Label{
+		labels = append(labels, &corev1.Label{
 			Key:   k,
 			Value: &v,
 		})
@@ -403,9 +403,9 @@ func (mv ManageVpc) UpdateVpcMetadata(ctx context.Context, siteID uuid.UUID, tc 
 
 	// Prepare the config update request workflow object. NetworkSecurityGroupId is
 	// intentionally omitted: this activity only syncs metadata fields.
-	updateVpcRequest := &cwssaws.VpcUpdateRequest{
-		Id: &cwssaws.VpcId{Value: vpc.ID.String()},
-		Metadata: &cwssaws.Metadata{
+	updateVpcRequest := &corev1.VpcUpdateRequest{
+		Id: &corev1.VpcId{Value: vpc.ID.String()},
+		Metadata: &corev1.Metadata{
 			Name:        vpc.Name,
 			Description: description,
 			Labels:      labels,
@@ -466,7 +466,7 @@ func (mvlm ManageVpcLifecycleMetrics) RecordVpcStatusTransitionMetrics(ctx conte
 	metricsRecorded := 0
 
 	for _, event := range vpcLifecycleEvents {
-		statusDetails, _, err := sdDAO.GetAllByEntityID(ctx, nil, event.ObjectID.String(), nil, cwutil.GetPtr(cdbp.TotalLimit), nil)
+		statusDetails, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{event.ObjectID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)})
 		if err != nil {
 			logger.Error().Err(err).Str("VPC ID", event.ObjectID.String()).Msg("failed to retrieve Status Details for VPC")
 			return err

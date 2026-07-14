@@ -23,7 +23,7 @@ defaults:
     working-directory: rest-api
 
 env:
-  GO_VERSION: "1.25.11"
+  GO_VERSION: "1.26.4"
 
 jobs:
   build-binaries:
@@ -59,6 +59,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5

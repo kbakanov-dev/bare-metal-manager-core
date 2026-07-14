@@ -21,12 +21,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use carbide_metrics_utils::OtelView;
 use eyre::WrapErr;
 use opentelemetry::metrics::{Meter, MeterProvider};
-use opentelemetry::trace::{Link, SamplingDecision, SamplingResult, SpanKind, TracerProvider};
-use opentelemetry::{Context, KeyValue, TraceId, Value};
-use opentelemetry_otlp::{ExportConfig, WithExportConfig};
+use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TracerProvider};
+use opentelemetry::{Context, KeyValue, TraceId, Value, global};
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::{Sampler, ShouldSample};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 use opentelemetry_semantic_conventions as semcov;
 use spancounter::SpanCountReader;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
@@ -45,7 +46,9 @@ pub struct Logging {
     pub filter: Arc<ActiveLevel>,
     pub tracing_enabled: Arc<AtomicBool>,
     pub spancount_reader: Option<spancounter::SpanCountReader>,
-    /// Log stream used to feed the admin web UI.
+    /// Log stream used to feed the admin web UI. Only fed when the admin UI is
+    /// enabled (`enable_admin_ui`); otherwise no [`LogStreamLayer`] is
+    /// installed and the stream stays empty.
     pub log_stream: LogStream,
 }
 
@@ -74,13 +77,32 @@ pub fn dep_log_filter(env_filter: EnvFilter) -> EnvFilter {
         .unwrap_or_else(|err| panic!("could not reparse combined filter '{combined}': {err}"))
 }
 
+/// The admin-UI log-stream layer, or `None` when the admin UI is disabled.
+/// The layer's only consumer is the web UI's log viewer: with the UI off there
+/// is no subscriber, so installing it would spend per-event work (a second
+/// field visit, timestamp/target strings, ring-buffer churn under a mutex) on
+/// lines nothing reads. Composed into the registry as an `Option`, which
+/// `tracing-subscriber` treats as a no-op layer when `None`.
+fn admin_ui_log_stream_layer(
+    enable_admin_ui: bool,
+    log_stream: &LogStream,
+) -> Option<LogStreamLayer> {
+    enable_admin_ui.then(|| LogStreamLayer::new(log_stream.clone()))
+}
+
 pub fn setup_logging(
     debug: u8,
     extra_logfmt_event_fields: Vec<String>,
     override_logging_subscriber: Option<impl SubscriberInitExt>,
     log_history_max_bytes: usize,
+    enable_admin_ui: bool,
     tracing_config: &TracingConfig,
 ) -> eyre::Result<Logging> {
+    // Install the global W3C trace-context propagator so NICo can extract inbound and inject
+    // outbound `traceparent`/`tracestate` at network boundaries (issue #2438). Without it,
+    // OpenTelemetry's default propagator is a no-op.
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
     // This configures emission of logs in LogFmt syntax
     // and emission of metrics
     let log_level = match debug {
@@ -113,6 +135,7 @@ pub fn setup_logging(
     let logfmt_stdout_formatter = logfmt::layer().with_event_fields(event_fields);
     let spancount_layer = spancounter::layer();
     let spancount_reader = spancount_layer.reader();
+    let log_events = carbide_instrument::LogEventsMetric::new("nico-api");
 
     // Used as part of a layer for collecting + brodcasting
     // log events to the admin web UI.
@@ -142,15 +165,12 @@ pub fn setup_logging(
                     let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
                         .with_tonic()
                         .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-                        .with_export_config(ExportConfig {
-                            endpoint: Some(endpoint),
-                            ..Default::default()
-                        })
+                        .with_endpoint(endpoint)
                         .build()?;
 
                     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
                         // CarbideSpanSampler selects explicitly marked application trace roots.
-                        .with_sampler(trace_sampler.into_sampler())
+                        .with_sampler(trace_sampler)
                         .with_batch_exporter(otlp_exporter)
                         .with_resource(
                             Resource::builder()
@@ -166,11 +186,17 @@ pub fn setup_logging(
                 }
             };
 
+        // Installed only when the admin UI can consume it; `None` keeps this
+        // second per-event consumer out of the subscriber stack entirely.
+        let log_stream_layer = admin_ui_log_stream_layer(enable_admin_ui, &log_stream)
+            .map(|layer| layer.with_filter(initial_log_filter.clone()));
+
         tracing_subscriber::registry()
+            .with(log_events.layer().with_filter(initial_log_filter.clone()))
             .with(spancount_layer.with_filter(log_level))
             .with(maybe_otel_tracing_layer)
             .with(logfmt_stdout_formatter.with_filter(logfmt_stdout_filter))
-            .with(LogStreamLayer::new(log_stream.clone()).with_filter(initial_log_filter.clone()))
+            .with(log_stream_layer)
             .with(sqlx_query_tracing::create_sqlx_query_tracing_layer())
             .try_init()
             .wrap_err("new tracing subscriber try_init()")?;
@@ -220,6 +246,12 @@ pub fn create_metrics() -> eyre::Result<Metrics> {
         .with_view(create_metric_view_for_retry_histograms("*_attempts_*")?)
         .with_view(create_metric_view_for_retry_histograms("*_retries_*")?)
         .with_view(ApiMetricsEmitter::machine_reboot_duration_view()?)
+        .with_view(carbide_site_explorer::site_explorer_latency_histogram_view(
+            "carbide_site_explorer_*_latency",
+        )?)
+        .with_view(carbide_site_explorer::site_explorer_latency_histogram_view(
+            "carbide_endpoint_exploration_duration",
+        )?)
         .build();
     // After this call `global::meter()` will be available
     opentelemetry::global::set_meter_provider(meter_provider.clone());
@@ -259,11 +291,6 @@ impl CarbideSpanSampler {
     fn new(enabled: Arc<AtomicBool>) -> Self {
         Self(enabled)
     }
-
-    /// Construct a new Sampler that samples spans originating from carbide-api.
-    fn into_sampler(self) -> Sampler {
-        Sampler::ParentBased(Box::new(self))
-    }
 }
 
 /// Predicate to check if a child span or event should be accepted. This is distinct from
@@ -283,7 +310,7 @@ fn should_accept_span_or_event(metadata: &tracing::Metadata<'_>) -> bool {
 impl ShouldSample for CarbideSpanSampler {
     fn should_sample(
         &self,
-        _parent_context: Option<&Context>,
+        parent_context: Option<&Context>,
         _trace_id: TraceId,
         _name: &str,
         _span_kind: &SpanKind,
@@ -292,23 +319,34 @@ impl ShouldSample for CarbideSpanSampler {
     ) -> SamplingResult {
         let enabled = self.0.load(Ordering::Relaxed);
 
-        // We want this to short-circuit if enabled is false, because we want to skip iterating
-        // through all attributes. (This could be a simple && expression but it should be really
-        // clear from reading the code here.)
-        let should_sample = if !enabled {
-            false
-        } else {
-            is_carbide_root_span(attributes)
-        };
+        let parent_span_context = parent_context
+            .map(|cx| cx.span().span_context().clone())
+            .filter(|sc| sc.is_valid());
 
-        SamplingResult {
-            decision: if should_sample {
+        let decision = if !enabled {
+            SamplingDecision::Drop
+        } else if let Some(local_parent) = parent_span_context.as_ref().filter(|sc| !sc.is_remote())
+        {
+            // In-process parent: inherit its sampling decision.
+            if local_parent.is_sampled() {
                 SamplingDecision::RecordAndSample
             } else {
                 SamplingDecision::Drop
-            },
+            }
+        } else if is_carbide_root_span(attributes) {
+            // Root or remote-parented span: record iff explicitly marked `carbide.trace_root`.
+            SamplingDecision::RecordAndSample
+        } else {
+            SamplingDecision::Drop
+        };
+
+        SamplingResult {
+            decision,
             attributes: vec![],
-            trace_state: Default::default(),
+            // Carry any inbound `tracestate` so it propagates onward unchanged.
+            trace_state: parent_span_context
+                .map(|sc| sc.trace_state().clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -407,6 +445,178 @@ mod tests {
         assert!(matches!(decision, SamplingDecision::Drop));
     }
 
+    fn sample_decision_with_parent(
+        enabled: bool,
+        parent: Option<&Context>,
+        attributes: Vec<KeyValue>,
+    ) -> SamplingDecision {
+        CarbideSpanSampler::new(Arc::new(AtomicBool::new(enabled)))
+            .should_sample(
+                parent,
+                TraceId::from(1u128),
+                "request",
+                &SpanKind::Server,
+                &attributes,
+                &[],
+            )
+            .decision
+    }
+
+    /// A parent `Context` carrying a span context with the given sampled / remote flags.
+    fn parent_ctx(sampled: bool, remote: bool) -> Context {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceState};
+
+        let sc = SpanContext::new(
+            TraceId::from(0x1111_1111_1111_1111_1111_1111_1111_1111u128),
+            SpanId::from(0x2222_2222_2222_2222u64),
+            if sampled {
+                TraceFlags::SAMPLED
+            } else {
+                TraceFlags::default()
+            },
+            remote,
+            TraceState::default(),
+        );
+        Context::new().with_remote_span_context(sc)
+    }
+
+    fn root_marker() -> Vec<KeyValue> {
+        vec![KeyValue::new(CARBIDE_TRACE_ROOT_ATTRIBUTE, true)]
+    }
+
+    #[test]
+    fn sampler_disabled_drops_even_with_sampled_remote_parent() {
+        // issue #2438: the local toggle is the master switch — an inbound sampled trace
+        // must not be recorded while tracing is disabled locally.
+        assert!(matches!(
+            sample_decision_with_parent(false, Some(&parent_ctx(true, true)), root_marker()),
+            SamplingDecision::Drop
+        ));
+    }
+
+    #[test]
+    fn sampler_remote_parent_gated_by_marker_not_inbound_sampled() {
+        // A remote (ingress) parent never inherits its decision: the local `carbide.trace_root`
+        // marker decides, whether or not the inbound trace was sampled.
+        for remote_sampled in [true, false] {
+            let parent = parent_ctx(remote_sampled, true);
+            assert!(
+                matches!(
+                    sample_decision_with_parent(true, Some(&parent), root_marker()),
+                    SamplingDecision::RecordAndSample
+                ),
+                "marked -> record (inbound sampled={remote_sampled})"
+            );
+            assert!(
+                matches!(
+                    sample_decision_with_parent(true, Some(&parent), vec![]),
+                    SamplingDecision::Drop
+                ),
+                "unmarked -> drop (inbound sampled={remote_sampled})"
+            );
+        }
+    }
+
+    #[test]
+    fn sampler_inherits_in_process_parent_decision() {
+        // Sampled in-process parent pulls its subtree in, even without a marker.
+        assert!(matches!(
+            sample_decision_with_parent(true, Some(&parent_ctx(true, false)), vec![]),
+            SamplingDecision::RecordAndSample
+        ));
+        // Unsampled in-process parent drops the subtree, even if the child is marked.
+        assert!(matches!(
+            sample_decision_with_parent(true, Some(&parent_ctx(false, false)), root_marker()),
+            SamplingDecision::Drop
+        ));
+    }
+
+    #[test]
+    fn sampler_carries_parent_tracestate() {
+        // The inbound `tracestate` must ride through the SamplingResult so it propagates onward
+        // (issue #2438). A neutral, W3C-formatted single-entry tracestate keeps ordering trivial.
+        use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceState};
+
+        let trace_state = TraceState::from_key_value([("key1", "value1")]).unwrap();
+        let parent = Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from(0x1111_1111_1111_1111_1111_1111_1111_1111u128),
+            SpanId::from(0x2222_2222_2222_2222u64),
+            TraceFlags::SAMPLED,
+            true,
+            trace_state.clone(),
+        ));
+
+        let result = CarbideSpanSampler::new(Arc::new(AtomicBool::new(true))).should_sample(
+            Some(&parent),
+            TraceId::from(1u128),
+            "request",
+            &SpanKind::Server,
+            &root_marker(),
+            &[],
+        );
+
+        assert_eq!(result.trace_state, trace_state);
+    }
+
+    /// An OpenTelemetry layer is present (an exporter was built) but the `tracing-enabled` flag is
+    /// off, so `CarbideSpanSampler` drops every span. Verifies what NICo forwards on egress in that
+    /// state: does an inbound trace-id still reach a downstream service even though NICo records
+    /// nothing?
+    ///
+    /// Inbound and egress headers are built and asserted as raw `traceparent` strings (the W3C wire
+    /// format), so this test relies only on the propagation entry points NICo actually calls.
+    #[test]
+    fn egress_forwards_trace_id_when_exporter_on_but_flag_off() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use trace_propagation::{inject_current_context, set_span_parent_from_headers};
+        use tracing_subscriber::prelude::*;
+
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        // OTel layer present ("exporter on"), runtime flag OFF -> the sampler drops everything.
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(CarbideSpanSampler::new(Arc::new(AtomicBool::new(false))))
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("carbide")));
+
+        // Inbound: a sampled remote trace as a raw W3C traceparent (final `01` = sampled).
+        let mut inbound = http::HeaderMap::new();
+        inbound.insert(
+            "traceparent",
+            "00-11111111111111111111111111111111-2222222222222222-01"
+                .parse()
+                .unwrap(),
+        );
+
+        let mut egress = http::HeaderMap::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request");
+            set_span_parent_from_headers(&span, &inbound);
+            let _enter = span.enter();
+            inject_current_context(&mut egress);
+        });
+
+        let out = egress
+            .get("traceparent")
+            .expect("egress should still carry a traceparent")
+            .to_str()
+            .unwrap();
+        // The inbound trace-id IS forwarded downstream even though NICo recorded nothing -- the
+        // dropped request span still inherits it (with a fresh child span-id)...
+        assert!(
+            out.starts_with("00-11111111111111111111111111111111-"),
+            "egress must forward the inbound trace-id: {out}"
+        );
+        // ...but it goes out marked NOT sampled, because NICo dropped its span.
+        assert!(
+            out.ends_with("-00"),
+            "egress must be marked not-sampled (NICo dropped its span): {out}"
+        );
+    }
+
     /// This test mostly mimics the test setup above and checks whether
     /// the prometheus opentelemetry stack will only report the most recent
     /// values for gauges and not cached values that are not important anymore
@@ -425,6 +635,18 @@ mod tests {
             .with_view(create_metric_view_for_retry_histograms("*_attempts_*").unwrap())
             .with_view(create_metric_view_for_retry_histograms("*_retries_*").unwrap())
             .with_view(ApiMetricsEmitter::machine_reboot_duration_view().unwrap())
+            .with_view(
+                carbide_site_explorer::site_explorer_latency_histogram_view(
+                    "carbide_site_explorer_*_latency",
+                )
+                .unwrap(),
+            )
+            .with_view(
+                carbide_site_explorer::site_explorer_latency_histogram_view(
+                    "carbide_endpoint_exploration_duration",
+                )
+                .unwrap(),
+            )
             .build();
 
         let state = KeyValue::new("state", "mystate");
@@ -471,6 +693,49 @@ mod tests {
                 assert!(!encoded.contains(r#"mygauge{error="ErrC",state="mystate"} 1"#));
             }
         }
+    }
+
+    #[test]
+    fn log_stream_layer_absent_when_admin_ui_disabled() {
+        use tracing_subscriber::prelude::*;
+
+        let stream = LogStream::new(8, 64 * 1024);
+        let layer = admin_ui_log_stream_layer(false, &stream);
+        assert!(layer.is_none(), "disabled admin UI must not build a layer");
+
+        // Composed the way `setup_logging` composes it, the `None` layer is a
+        // no-op: events reach neither live subscribers nor the replay ring.
+        let mut rx = stream.subscribe();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("not streamed");
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "no line may be broadcast with the admin UI disabled"
+        );
+        assert!(
+            stream.latest(10).is_empty(),
+            "no history may be retained with the admin UI disabled"
+        );
+    }
+
+    #[test]
+    fn log_stream_layer_present_when_admin_ui_enabled() {
+        use tracing_subscriber::prelude::*;
+
+        let stream = LogStream::new(8, 64 * 1024);
+        let mut rx = stream.subscribe();
+        let layer = admin_ui_log_stream_layer(true, &stream);
+        assert!(layer.is_some(), "enabled admin UI must build the layer");
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("streamed");
+        });
+        let line = rx.try_recv().expect("a line should have been broadcast");
+        assert_eq!(line.message, "streamed");
+        assert_eq!(stream.latest(10).len(), 1);
     }
 
     /// Install `dep_log_filter(user_directives)` as the thread-local subscriber

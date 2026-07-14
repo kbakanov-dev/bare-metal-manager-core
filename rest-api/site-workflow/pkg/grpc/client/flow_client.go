@@ -25,7 +25,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 
-	flowv1 "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/flow/protobuf/v1"
+	flowv1 "github.com/NVIDIA/infra-controller/rest-api/proto/flow/gen/v1"
 )
 
 // Errors
@@ -158,9 +158,19 @@ func NewFlowGrpcClient(config *FlowGrpcClientConfig) (client *FlowGrpcClient, er
 		if !capool.AppendCertsFromPEM(cabytes) {
 			return nil, fmt.Errorf("FlowGrpcClient: Failed to append CA cert to CA pool")
 		}
+		// Use GetClientCertificate (not Certificates) to unconditionally present
+		// the client cert. With Certificates, Go's TLS stack only selects a cert
+		// whose issuer matches the acceptable CA list from the server's
+		// CertificateRequest; when no match is found it silently sends no cert,
+		// causing the server to reject with "tls: certificate required".
+		// GetClientCertificate bypasses that matching and always returns the cert,
+		// leaving verification to the server — the same approach used in
+		// rest-api/flow/pkg/certs/certs.go TLSConfig().
 		mutualTLSConfig := &tls.Config{
-			Certificates: []tls.Certificate{clientCert},
-			RootCAs:      capool,
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				return &clientCert, nil
+			},
+			RootCAs: capool,
 		}
 		creds := credentials.NewTLS(mutualTLSConfig)
 

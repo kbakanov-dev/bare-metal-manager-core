@@ -31,8 +31,8 @@ import (
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	cdbu "github.com/NVIDIA/infra-controller/rest-api/db/pkg/util"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
@@ -46,6 +46,14 @@ import (
 	tp "go.temporal.io/sdk/temporal"
 	"gopkg.in/yaml.v3"
 )
+
+func assertDeletionAcceptedResponse(t *testing.T, body []byte) {
+	t.Helper()
+
+	var resp model.APIMessageResponse
+	require.NoError(t, json.Unmarshal(body, &resp))
+	assert.Equal(t, model.DeletionRequestAcceptedMessage, resp.Message)
+}
 
 func testInstanceInitDB(t *testing.T) *cdb.Session {
 	dbSession := cdbu.GetTestDBSession(t, false)
@@ -138,7 +146,12 @@ func testInstanceSetupSchema(t *testing.T, dbSession *cdb.Session) {
 func testInstanceSiteBuildInfrastructureProvider(t *testing.T, dbSession *cdb.Session, name string, org string, user *cdbm.User) *cdbm.InfrastructureProvider {
 	ipDAO := cdbm.NewInfrastructureProviderDAO(dbSession)
 
-	ip, err := ipDAO.CreateFromParams(context.Background(), nil, name, cutil.GetPtr("Test Infrastructure Provider"), org, nil, user)
+	ip, err := ipDAO.Create(context.Background(), nil, cdbm.InfrastructureProviderCreateInput{
+		Name:        name,
+		DisplayName: cutil.GetPtr("Test Infrastructure Provider"),
+		Org:         org,
+		CreatedBy:   user.ID,
+	})
 	assert.Nil(t, err)
 
 	return ip
@@ -357,7 +370,10 @@ func testInstanceBuildOperatingSystemSiteAssociation(t *testing.T, dbSession *cd
 func testInstanceBuildMachineInstanceType(t *testing.T, dbSession *cdb.Session, mc *cdbm.Machine, in *cdbm.InstanceType) *cdbm.MachineInstanceType {
 	mitDAO := cdbm.NewMachineInstanceTypeDAO(dbSession)
 
-	mit, err := mitDAO.CreateFromParams(context.Background(), nil, mc.ID, in.ID)
+	mit, err := mitDAO.Create(context.Background(), nil, cdbm.MachineInstanceTypeCreateInput{
+		MachineID:      mc.ID,
+		InstanceTypeID: in.ID,
+	})
 	assert.Nil(t, err)
 
 	mDAO := cdbm.NewMachineDAO(dbSession)
@@ -537,7 +553,7 @@ func testUpdateMachineToMissing(t *testing.T, dbSession *cdb.Session, m *cdbm.Ma
 func testUpdateMachineStatusAndControllerState(t *testing.T, dbSession *cdb.Session, m *cdbm.Machine, status string, controllerState string) *cdbm.Machine {
 	m.Status = status
 	if controllerState != "" {
-		m.Metadata = &cdbm.SiteControllerMachine{Machine: &cwssaws.Machine{State: controllerState}}
+		m.Metadata = &cdbm.SiteControllerMachine{Machine: &corev1.Machine{State: controllerState}}
 	} else {
 		m.Metadata = nil
 	}
@@ -582,7 +598,7 @@ func testInstanceBuildInstanceNVLinkInterface(t *testing.T, dbSession *cdb.Sessi
 
 func testInstanceBuildStatusDetail(t *testing.T, dbSession *cdb.Session, entityID uuid.UUID, status string) {
 	sdDAO := cdbm.NewStatusDetailDAO(dbSession)
-	ssd, err := sdDAO.CreateFromParams(context.Background(), nil, entityID.String(), status, nil)
+	ssd, err := sdDAO.Create(context.Background(), nil, cdbm.StatusDetailCreateInput{EntityID: entityID.String(), Status: status, Message: nil})
 	assert.Nil(t, err)
 	assert.NotNil(t, ssd)
 	assert.Equal(t, entityID.String(), ssd.EntityID)
@@ -641,7 +657,7 @@ func testUpdateOSIsActive(t *testing.T, dbSession *cdb.Session, ins *cdbm.Operat
 }
 
 // assertInterfaceRoutingProfilePrefixes verifies proto routing profile prefix order.
-func assertInterfaceRoutingProfilePrefixes(t *testing.T, actual *cwssaws.InstanceInterfaceRoutingProfile, expected []string) {
+func assertInterfaceRoutingProfilePrefixes(t *testing.T, actual *corev1.InstanceInterfaceRoutingProfile, expected []string) {
 	t.Helper()
 	require.NotNil(t, actual)
 	require.Len(t, actual.AllowedAnycastPrefixes, len(expected))
@@ -652,9 +668,9 @@ func assertInterfaceRoutingProfilePrefixes(t *testing.T, actual *cwssaws.Instanc
 
 func TestBuildInstanceNetworkConfig(t *testing.T) {
 	controllerVpcID := uuid.New()
-	interfaceConfigs := []*cwssaws.InstanceInterfaceConfig{
+	interfaceConfigs := []*corev1.InstanceInterfaceConfig{
 		{
-			NetworkSegmentId: &cwssaws.NetworkSegmentId{Value: uuid.NewString()},
+			NetworkSegmentId: &corev1.NetworkSegmentId{Value: uuid.NewString()},
 		},
 	}
 
@@ -863,6 +879,13 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 
 	mcinst20 := testInstanceBuildMachineInstanceType(t, dbSession, mc20, ist1)
 	assert.NotNil(t, mcinst20)
+
+	addIst1InfiniBandMachineCapability := func(t *testing.T, machineID string) {
+		common.TestBuildMachineCapability(t, dbSession, &machineID, nil, cdbm.MachineCapabilityTypeInfiniBand, "MT28908 Family [ConnectX-6]", nil, nil, cutil.GetPtr("Mellanox Technologies"), cutil.GetPtr(3), cutil.GetPtr(cdbm.MachineCapabilityDeviceType("")), nil)
+	}
+	for _, mc := range []*cdbm.Machine{mc1, mc12, mc13, mc14, mc15, mc16, mc17, mc18, mc19, mc20} {
+		addIst1InfiniBandMachineCapability(t, mc.ID)
+	}
 
 	// Tenant 1
 	os1 := testInstanceBuildOperatingSystem(t, dbSession, "test-operating-system-1", tn1, cdbm.OperatingSystemTypeIPXE, false, nil, true, cdbm.OperatingSystemStatusReady, tnu1)
@@ -1292,6 +1315,43 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 
 	// OTEL Spanner configuration
 	tracer, _, ctx := common.TestCommonTraceProviderSetup(t, ctx)
+
+	setupIbInactiveDevicesInstanceType := func(t *testing.T, allocName string, machineInactiveDevices []int) (*cdbm.InstanceType, *cdbm.Machine) {
+		ist := testInstanceBuildInstanceType(t, dbSession, ip, "ist-ib-inactive-"+uuid.NewString(), st1, cdbm.InstanceStatusReady)
+		al := testInstanceSiteBuildAllocation(t, dbSession, st1, tn1, allocName, ipu)
+		testInstanceSiteBuildAllocationContraints(t, dbSession, al, cdbm.AllocationResourceTypeInstanceType, ist.ID, cdbm.AllocationConstraintTypeReserved, 10, ipu)
+		common.TestBuildMachineCapability(t, dbSession, nil, &ist.ID, cdbm.MachineCapabilityTypeInfiniBand, "MT28908 Family [ConnectX-6]", nil, nil, cutil.GetPtr("Mellanox Technologies"), cutil.GetPtr(3), cutil.GetPtr(cdbm.MachineCapabilityDeviceType("")), []int{1, 2})
+
+		mc := testInstanceBuildMachine(t, dbSession, ip.ID, st1.ID, cutil.GetPtr(false), nil)
+		testInstanceBuildMachineInstanceType(t, dbSession, mc, ist)
+		common.TestBuildMachineCapability(t, dbSession, &mc.ID, nil, cdbm.MachineCapabilityTypeInfiniBand, "MT28908 Family [ConnectX-6]", nil, nil, cutil.GetPtr("Mellanox Technologies"), cutil.GetPtr(3), cutil.GetPtr(cdbm.MachineCapabilityDeviceType("")), machineInactiveDevices)
+		testInstanceBuildMachineInterface(t, dbSession, subnet1.ID, mc.ID)
+		return ist, mc
+	}
+
+	ibInactiveDevicesBaseReq := func(name string) *model.APIInstanceCreateRequest {
+		return &model.APIInstanceCreateRequest{
+			Name:              name,
+			TenantID:          tn1.ID.String(),
+			VpcID:             vpc1.ID.String(),
+			OperatingSystemID: cutil.GetPtr(os1.ID.String()),
+			IpxeScript:        cutil.GetPtr(common.DefaultIpxeScript),
+			Interfaces: []model.APIInterfaceCreateOrUpdateRequest{
+				{
+					SubnetID: cutil.GetPtr(subnet1.ID.String()),
+				},
+			},
+			InfiniBandInterfaces: []model.APIInfiniBandInterfaceCreateOrUpdateRequest{
+				{
+					InfiniBandPartitionID: ibp1.ID.String(),
+					Device:                "MT28908 Family [ConnectX-6]",
+					Vendor:                cutil.GetPtr("Mellanox Technologies"),
+					DeviceInstance:        0,
+					IsPhysical:            true,
+				},
+			},
+		}
+	}
 
 	type fields struct {
 		dbSession *cdb.Session
@@ -2491,7 +2551,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 				reqOrg:      tnOrg,
 				reqUser:     tnu1,
 				respCode:    http.StatusBadRequest,
-				respMessage: "InfiniBand Interfaces cannot be specified if Instance Type or Machine doesn't have InfiniBand Capability",
+				respMessage: "No Machines are available for specified Instance Type",
 			},
 			wantErr: false,
 		},
@@ -3414,7 +3474,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 				reqOrg:      tnOrg,
 				reqUser:     tnu1,
 				respCode:    http.StatusBadRequest,
-				respMessage: "Device Instance: 4 for Device MT28908 Family [ConnectX-6] exceeds Instance Type's InfiniBand Capabilities count",
+				respMessage: "Requested InfiniBand device instances are not available on any Machine for this Instance Type",
 			},
 			wantErr:            false,
 			verifyChildSpanner: true,
@@ -3559,6 +3619,68 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "test Instance create API endpoint selects machine when Instance Type and Machine InactiveDevices differ but request is satisfied",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: ibInactiveDevicesBaseReq("Test Instance IB inactive devices mismatch"),
+				prepareReq: func(t *testing.T, req *model.APIInstanceCreateRequest) {
+					ist, _ := setupIbInactiveDevicesInstanceType(t, "test-allocation-ib-inactive-mismatch", []int{1, 3})
+					req.InstanceTypeID = cutil.GetPtr(ist.ID.String())
+				},
+				reqOrg:   tnOrg,
+				reqUser:  tnu1,
+				respCode: http.StatusCreated,
+			},
+			wantErr: false,
+		},
+		{
+			name: "test Instance create API endpoint returns suggested device instances when requested InfiniBand device instance is inactive on Machine",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: func() *model.APIInstanceCreateRequest {
+					req := ibInactiveDevicesBaseReq("Test Instance IB inactive devices suggest")
+					req.InfiniBandInterfaces[0].DeviceInstance = 1
+					return req
+				}(),
+				prepareReq: func(t *testing.T, req *model.APIInstanceCreateRequest) {
+					ist, _ := setupIbInactiveDevicesInstanceType(t, "test-allocation-ib-inactive-suggest", []int{1, 3})
+					req.InstanceTypeID = cutil.GetPtr(ist.ID.String())
+				},
+				reqOrg:      tnOrg,
+				reqUser:     tnu1,
+				respCode:    http.StatusBadRequest,
+				respMessage: "Requested InfiniBand device instances are not available on any Machine for this Instance Type",
+			},
+			wantErr: false,
+		},
+		{
+			name: "test Instance create API endpoint selects machine when InfiniBand InactiveDevices match on Machine",
+			fields: fields{
+				dbSession: dbSession,
+				tc:        tc,
+				cfg:       cfg,
+			},
+			args: args{
+				reqData: ibInactiveDevicesBaseReq("Test Instance IB inactive devices match"),
+				prepareReq: func(t *testing.T, req *model.APIInstanceCreateRequest) {
+					ist, _ := setupIbInactiveDevicesInstanceType(t, "test-allocation-ib-inactive-match", []int{1, 2})
+					req.InstanceTypeID = cutil.GetPtr(ist.ID.String())
+				},
+				reqOrg:   tnOrg,
+				reqUser:  tnu1,
+				respCode: http.StatusCreated,
+			},
+			wantErr: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3668,7 +3790,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 			}
 
 			if len(tsc.Calls) > 0 && len(tsc.Calls[len(tsc.Calls)-1].Arguments) > 3 {
-				req := tsc.Calls[len(tsc.Calls)-1].Arguments[3].(*cwssaws.InstanceAllocationRequest)
+				req := tsc.Calls[len(tsc.Calls)-1].Arguments[3].(*corev1.InstanceAllocationRequest)
 
 				// Check that the list of IDs match in size and order.
 				if len(tt.args.reqData.SSHKeyGroupIDs) > 0 {
@@ -4100,10 +4222,10 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 	nsgTenant1Site3 := testBuildNetworkSecurityGroup(t, dbSession, "test-nsg-4", tn1, st3, cdbm.NetworkSecurityGroupStatusReady)
 	assert.NotNil(t, nsgTenant1Site3)
 
-	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status cwssaws.NetworkSecurityGroupPropagationStatus) {
+	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status corev1.NetworkSecurityGroupPropagationStatus) {
 		vpc.NetworkSecurityGroupID = &nsgTenant1Site3.ID
 		vpc.NetworkSecurityGroupPropagationDetails = &cdbm.NetworkSecurityGroupPropagationDetails{
-			NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+			NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{
 				Id:                      vpc.ID.String(),
 				Status:                  status,
 				RelatedInstanceIds:      related,
@@ -4113,14 +4235,14 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 		testUpdateVPC(t, dbSession, vpc)
 	}
 
-	setVpcProp(vpcPrimaryFull, []string{instUpdateFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryFull, []string{instUpdateFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcPrimaryFull, []string{instUpdateRebootFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryFull, []string{instUpdateRebootFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcPrimaryNone, []string{instUpdateNone.ID.String()}, []string{instUpdateNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcSecondaryNone, []string{instUpdateNone.ID.String()}, []string{instUpdateNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcPrimaryPartial, []string{instUpdatePartial.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryPartial, []string{instUpdatePartial.ID.String()}, []string{instUpdatePartial.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryFull, []string{instUpdateFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryFull, []string{instUpdateFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcPrimaryFull, []string{instUpdateRebootFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryFull, []string{instUpdateRebootFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcPrimaryNone, []string{instUpdateNone.ID.String()}, []string{instUpdateNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcSecondaryNone, []string{instUpdateNone.ID.String()}, []string{instUpdateNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryPartial, []string{instUpdatePartial.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryPartial, []string{instUpdatePartial.ID.String()}, []string{instUpdatePartial.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
 
 	// Add Network DPU capability to Instance Type
 	common.TestBuildMachineCapability(t, dbSession, nil, &ist4.ID, cdbm.MachineCapabilityTypeNetwork, "MT42822 BlueField-2 integrated ConnectX-6 Dx network controller", nil, nil, cutil.GetPtr("Mellanox Technologies"), cutil.GetPtr(2), cutil.GetPtr(cdbm.MachineCapabilityDeviceTypeDPU), nil)
@@ -6963,10 +7085,10 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 			if tt.verifySiteControllerRequest {
 				// Collect the last matching ExecuteWorkflow call for this instance
 				// (multiple tests may trigger calls for the same instance; verify only against the current test's call)
-				var siteReq *cwssaws.InstanceConfigUpdateRequest
+				var siteReq *corev1.InstanceConfigUpdateRequest
 				for _, call := range ttscm.Calls {
 					if call.Method == "ExecuteWorkflow" && call.Arguments[2] == "UpdateInstance" {
-						req := call.Arguments[3].(*cwssaws.InstanceConfigUpdateRequest)
+						req := call.Arguments[3].(*corev1.InstanceConfigUpdateRequest)
 						if req.InstanceId.Value == tt.args.reqInstance {
 							siteReq = req
 						}
@@ -6993,7 +7115,7 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 
 						// Subnet case if we have both NetworkSegmentId and NetworkDetails
 						if siteIfc.NetworkSegmentId != nil && siteIfc.NetworkDetails != nil {
-							ifcNd, ok := siteIfc.NetworkDetails.(*cwssaws.InstanceInterfaceConfig_SegmentId)
+							ifcNd, ok := siteIfc.NetworkDetails.(*corev1.InstanceInterfaceConfig_SegmentId)
 							assert.True(t, ok)
 							assert.Equal(t, ifcNd.SegmentId, siteIfc.NetworkSegmentId)
 
@@ -7003,9 +7125,9 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 
 						// VpcPrefix case if we have only NetworkDetails
 						if siteIfc.NetworkDetails != nil && siteIfc.NetworkSegmentId == nil {
-							ifcNd, ok := siteIfc.NetworkDetails.(*cwssaws.InstanceInterfaceConfig_VpcPrefixId)
+							ifcNd, ok := siteIfc.NetworkDetails.(*corev1.InstanceInterfaceConfig_VpcPrefixId)
 							assert.True(t, ok)
-							assert.Equal(t, ifcNd.VpcPrefixId.Value, siteIfc.NetworkDetails.(*cwssaws.InstanceInterfaceConfig_VpcPrefixId).VpcPrefixId.Value)
+							assert.Equal(t, ifcNd.VpcPrefixId.Value, siteIfc.NetworkDetails.(*corev1.InstanceInterfaceConfig_VpcPrefixId).VpcPrefixId.Value)
 
 							//Make sure order is same as the request received
 							assert.Equal(t, ifcNd.VpcPrefixId.Value, reqInsIfcs[i].VpcPrefixID.String())
@@ -7278,10 +7400,10 @@ func TestGetInstanceHandler_Handle(t *testing.T) {
 	assert.NotNil(t, testInstanceBuildInstanceInterface(t, dbSession, instPartial.ID, nil, &vpcPrefixPrimaryPartial.ID, nil, cdbm.InterfaceStatusPending))
 	assert.NotNil(t, testInstanceBuildInstanceInterface(t, dbSession, instPartial.ID, nil, &vpcPrefixSecondaryPartial.ID, nil, cdbm.InterfaceStatusPending))
 
-	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status cwssaws.NetworkSecurityGroupPropagationStatus) {
+	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status corev1.NetworkSecurityGroupPropagationStatus) {
 		vpc.NetworkSecurityGroupID = &nsg1.ID
 		vpc.NetworkSecurityGroupPropagationDetails = &cdbm.NetworkSecurityGroupPropagationDetails{
-			NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+			NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{
 				Id:                      vpc.ID.String(),
 				Status:                  status,
 				RelatedInstanceIds:      related,
@@ -7291,12 +7413,12 @@ func TestGetInstanceHandler_Handle(t *testing.T) {
 		testUpdateVPC(t, dbSession, vpc)
 	}
 
-	setVpcProp(vpcPrimaryFull, []string{instFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryFull, []string{instFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcPrimaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcSecondaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcPrimaryPartial, []string{instPartial.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryPartial, []string{instPartial.ID.String()}, []string{instPartial.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryFull, []string{instFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryFull, []string{instFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcPrimaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcSecondaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryPartial, []string{instPartial.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryPartial, []string{instPartial.ID.String()}, []string{instPartial.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
 
 	e := echo.New()
 	cfg := common.GetTestConfig()
@@ -7979,10 +8101,10 @@ func TestGetAllInstanceHandler_Handle(t *testing.T) {
 	common.TestBuildStatusDetail(t, dbSession, instPartial.ID.String(), cdbm.InstanceStatusPending, cutil.GetPtr("request received, pending processing"))
 	common.TestBuildStatusDetail(t, dbSession, instPartial.ID.String(), cdbm.InstanceStatusProvisioning, cutil.GetPtr("Instance is being provisioned on Site"))
 
-	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status cwssaws.NetworkSecurityGroupPropagationStatus) {
+	setVpcProp := func(vpc *cdbm.Vpc, related []string, unprop []string, status corev1.NetworkSecurityGroupPropagationStatus) {
 		vpc.NetworkSecurityGroupID = &nsg1.ID
 		vpc.NetworkSecurityGroupPropagationDetails = &cdbm.NetworkSecurityGroupPropagationDetails{
-			NetworkSecurityGroupPropagationObjectStatus: &cwssaws.NetworkSecurityGroupPropagationObjectStatus{
+			NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{
 				Id:                      vpc.ID.String(),
 				Status:                  status,
 				RelatedInstanceIds:      related,
@@ -7992,12 +8114,12 @@ func TestGetAllInstanceHandler_Handle(t *testing.T) {
 		testUpdateVPC(t, dbSession, vpc)
 	}
 
-	setVpcProp(vpcPrimaryFull, []string{instFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryFull, []string{instFull.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcPrimaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcSecondaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
-	setVpcProp(vpcPrimaryPartial, []string{instPartial.ID.String()}, []string{}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
-	setVpcProp(vpcSecondaryPartial, []string{instPartial.ID.String()}, []string{instPartial.ID.String()}, cwssaws.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryFull, []string{instFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryFull, []string{instFull.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcPrimaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcSecondaryNone, []string{instNone.ID.String()}, []string{instNone.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
+	setVpcProp(vpcPrimaryPartial, []string{instPartial.ID.String()}, []string{}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_FULL)
+	setVpcProp(vpcSecondaryPartial, []string{instPartial.ID.String()}, []string{instPartial.ID.String()}, corev1.NetworkSecurityGroupPropagationStatus_NSG_PROP_STATUS_NONE)
 
 	// Setup instances with specific IP addresses for IP filtering tests
 	// Use instances from the array so they're both on st1 and will be on the same page
@@ -9737,14 +9859,54 @@ func TestDeleteInstanceHandler_Handle(t *testing.T) {
 			assert.Nil(t, terr)
 			assert.Equal(t, cdbm.InstanceStatusTerminating, dinstance.Status)
 
-			if tt.verifyChildSpanner {
-				span := oteltrace.SpanFromContext(ec.Request().Context())
-				assert.True(t, span.SpanContext().IsValid())
+			sdDAO := cdbm.NewStatusDetailDAO(dbSession)
+			statusDetails, _, serr := sdDAO.GetAll(context.Background(), nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{tt.args.reqInstance}}, cdbp.PageInput{})
+			require.NoError(t, serr)
+			require.NotEmpty(t, statusDetails)
+			require.NotNil(t, statusDetails[0].Message)
+
+			siteClient, scErr := tt.fields.scp.GetClientByID(dinstance.SiteID)
+			require.NoError(t, scErr)
+			mockSiteClient, ok := siteClient.(*tmocks.Client)
+			require.True(t, ok, "site temporal client should be a test mock")
+
+			var releaseReq *corev1.InstanceReleaseRequest
+			for i := len(mockSiteClient.Calls) - 1; i >= 0; i-- {
+				call := mockSiteClient.Calls[i]
+				if call.Method != "ExecuteWorkflow" || len(call.Arguments) <= 3 {
+					continue
+				}
+				wfName, ok := call.Arguments[2].(string)
+				if !ok || wfName != "DeleteInstanceV2" {
+					continue
+				}
+				req, ok := call.Arguments[3].(*corev1.InstanceReleaseRequest)
+				if !ok || req.GetId().GetValue() != tt.args.reqInstance {
+					continue
+				}
+				releaseReq = req
+				break
+			}
+			require.NotNil(t, releaseReq, "DeleteInstanceV2 workflow should have been called for this Instance")
+
+			require.NotNil(t, releaseReq.DeleteAttribution)
+			require.NotNil(t, releaseReq.DeleteAttribution.InitiatedBy)
+			assert.Equal(t, tt.args.reqOrg, releaseReq.DeleteAttribution.InitiatedBy.Org)
+			assert.Equal(t, tt.args.reqUser.ID.String(), releaseReq.DeleteAttribution.InitiatedBy.UserId)
+			assert.Equal(t, dinstance.TenantID.String(), releaseReq.DeleteAttribution.InitiatedBy.TenantId)
+
+			if tt.args.reqData != nil && tt.args.reqData.MachineHealthIssue != nil {
+				require.NotNil(t, releaseReq.Issue)
+				if tt.args.reqData.MachineHealthIssue.Details != nil {
+					assert.Equal(t, *tt.args.reqData.MachineHealthIssue.Details, releaseReq.Issue.Details)
+				}
+				if tt.args.reqData.MachineHealthIssue.Summary != nil {
+					assert.Equal(t, *tt.args.reqData.MachineHealthIssue.Summary, releaseReq.Issue.Summary)
+				}
 			}
 		})
 	}
 }
-
 func TestNewCreateInstanceHandler(t *testing.T) {
 	type args struct {
 		dbSession *cdb.Session

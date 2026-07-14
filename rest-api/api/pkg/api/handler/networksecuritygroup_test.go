@@ -32,7 +32,7 @@ import (
 	sc "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/site"
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/api/enums/v1"
@@ -184,6 +184,37 @@ func TestNetworkSecurityGroupHandler_Create(t *testing.T) {
 
 	ts2 := testBuildTenantSiteAssociation(t, dbSession, tnOrg2, tn2.ID, st.ID, tnu2.ID)
 	assert.NotNil(t, ts2)
+
+	requestedNetworkSecurityGroupID := uuid.New()
+	existingNetworkSecurityGroupID := uuid.New()
+	deletedNetworkSecurityGroupID := uuid.New()
+	nsgDAO := cdbm.NewNetworkSecurityGroupDAO(dbSession)
+	_, err := nsgDAO.Create(ctx, nil, cdbm.NetworkSecurityGroupCreateInput{
+		NetworkSecurityGroupID: cutil.GetPtr(existingNetworkSecurityGroupID.String()),
+		Name:                   "existing-network-security-group-id",
+		SiteID:                 st.ID,
+		TenantID:               tn1.ID,
+		TenantOrg:              tn1.Org,
+		Status:                 cdbm.NetworkSecurityGroupStatusReady,
+		Rules:                  []*cdbm.NetworkSecurityGroupRule{},
+		CreatedByID:            tnu1.ID,
+	})
+	require.NoError(t, err)
+	deletedNSG, err := nsgDAO.Create(ctx, nil, cdbm.NetworkSecurityGroupCreateInput{
+		NetworkSecurityGroupID: cutil.GetPtr(deletedNetworkSecurityGroupID.String()),
+		Name:                   "deleted-network-security-group-id",
+		SiteID:                 st.ID,
+		TenantID:               tn1.ID,
+		TenantOrg:              tn1.Org,
+		Status:                 cdbm.NetworkSecurityGroupStatusReady,
+		Rules:                  []*cdbm.NetworkSecurityGroupRule{},
+		CreatedByID:            tnu1.ID,
+	})
+	require.NoError(t, err)
+	require.NoError(t, nsgDAO.Delete(ctx, nil, cdbm.NetworkSecurityGroupDeleteInput{
+		NetworkSecurityGroupID: deletedNSG.ID,
+		UpdatedByID:            tnu1.ID,
+	}))
 
 	e := echo.New()
 	cfg := common.GetTestConfig()
@@ -391,6 +422,77 @@ func TestNetworkSecurityGroupHandler_Create(t *testing.T) {
 				Labels: map[string]string{
 					"flavor": "coconut",
 				},
+			},
+		},
+		{
+			name:             "test good config with user-specified ID - success",
+			wantErr:          false,
+			wantResponseCode: http.StatusCreated,
+			handlerConfig: handlerConfig{
+				dbSession:      dbSession,
+				temporalClient: tc,
+				clientPool:     scp,
+				config:         cfg,
+			},
+			params: params{
+				org:  tnOrg,
+				user: tnu1,
+			},
+			requestPayload: &model.APINetworkSecurityGroupCreateRequest{
+				ID:             &requestedNetworkSecurityGroupID,
+				Name:           "Spark VPC Firewall With User ID",
+				Description:    cutil.GetPtr("Security policies for machines in Spark VPC"),
+				SiteID:         st.ID.String(),
+				StatefulEgress: true,
+				Rules: []model.APINetworkSecurityGroupRule{
+					{
+						Direction:         model.APINetworkSecurityGroupRuleDirectionIngress,
+						Protocol:          model.APINetworkSecurityGroupRuleProtocolTcp,
+						Action:            model.APINetworkSecurityGroupRuleActionPermit,
+						SourcePrefix:      cutil.GetPtr("0.0.0.0/0"),
+						DestinationPrefix: cutil.GetPtr("1.1.1.1/0"),
+					},
+				},
+			},
+		},
+		{
+			name:             "test duplicate user-specified ID - fail",
+			wantErr:          false,
+			wantResponseCode: http.StatusConflict,
+			handlerConfig: handlerConfig{
+				dbSession:      dbSession,
+				temporalClient: tc,
+				clientPool:     scp,
+				config:         cfg,
+			},
+			params: params{
+				org:  tnOrg,
+				user: tnu1,
+			},
+			requestPayload: &model.APINetworkSecurityGroupCreateRequest{
+				ID:     &existingNetworkSecurityGroupID,
+				Name:   "Spark VPC Firewall Existing ID",
+				SiteID: st.ID.String(),
+			},
+		},
+		{
+			name:             "test soft-deleted user-specified ID - fail",
+			wantErr:          false,
+			wantResponseCode: http.StatusConflict,
+			handlerConfig: handlerConfig{
+				dbSession:      dbSession,
+				temporalClient: tc,
+				clientPool:     scp,
+				config:         cfg,
+			},
+			params: params{
+				org:  tnOrg,
+				user: tnu1,
+			},
+			requestPayload: &model.APINetworkSecurityGroupCreateRequest{
+				ID:     &deletedNetworkSecurityGroupID,
+				Name:   "Spark VPC Firewall Deleted ID",
+				SiteID: st.ID.String(),
 			},
 		},
 		{
@@ -652,6 +754,9 @@ func TestNetworkSecurityGroupHandler_Create(t *testing.T) {
 			//t.Errorf(rec.Body.String())
 
 			assert.Equal(t, test.requestPayload.SiteID, rst.SiteID)
+			if test.requestPayload.ID != nil {
+				assert.Equal(t, test.requestPayload.ID.String(), rst.ID)
+			}
 
 			assert.Equal(t, test.requestPayload.Name, rst.Name)
 
@@ -769,35 +874,35 @@ func TestNetworkSecurityGroupHandler_GetAll(t *testing.T) {
 
 	rules := []*cdbm.NetworkSecurityGroupRule{
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
 			},
 		},
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
 			},
 		},
 	}
@@ -1173,35 +1278,35 @@ func TestNetworkSecurityGroupHandler_Get(t *testing.T) {
 
 	rules := []*cdbm.NetworkSecurityGroupRule{
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
 			},
 		},
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
 			},
 		},
 	}
@@ -1844,35 +1949,35 @@ func TestNetworkSecurityGroupHandler_Update(t *testing.T) {
 
 	dbRules := []*cdbm.NetworkSecurityGroupRule{
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "0.0.0.0/0"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "1.1.1.1/0"},
 			},
 		},
 		&cdbm.NetworkSecurityGroupRule{
-			NetworkSecurityGroupRuleAttributes: &cwssaws.NetworkSecurityGroupRuleAttributes{
+			NetworkSecurityGroupRuleAttributes: &corev1.NetworkSecurityGroupRuleAttributes{
 				Id:             cutil.GetPtr(uuid.NewString()),
-				Direction:      cwssaws.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
-				Protocol:       cwssaws.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
-				Action:         cwssaws.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
+				Direction:      corev1.NetworkSecurityGroupRuleDirection_NSG_RULE_DIRECTION_EGRESS,
+				Protocol:       corev1.NetworkSecurityGroupRuleProtocol_NSG_RULE_PROTO_TCP,
+				Action:         corev1.NetworkSecurityGroupRuleAction_NSG_RULE_ACTION_DENY,
 				Priority:       55,
 				Ipv6:           false,
 				SrcPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(55)),
 				SrcPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(56)),
 				DstPortStart:   getIntPtrToUint32Ptr(cutil.GetPtr(57)),
 				DstPortEnd:     getIntPtrToUint32Ptr(cutil.GetPtr(58)),
-				SourceNet:      &cwssaws.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
-				DestinationNet: &cwssaws.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
+				SourceNet:      &corev1.NetworkSecurityGroupRuleAttributes_SrcPrefix{SrcPrefix: "3.3.3.3/24"},
+				DestinationNet: &corev1.NetworkSecurityGroupRuleAttributes_DstPrefix{DstPrefix: "2.2.2.2/24"},
 			},
 		},
 	}

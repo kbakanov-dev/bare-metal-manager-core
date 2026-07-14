@@ -102,6 +102,10 @@ Deprecation notices continue to be returned for one more release cycle after the
 
 Endpoints that have deprecations will be grouped here. Following deprecations are in effect:
 
+### Operating System
+
+- `isCloudInit` on create and update requests is deprecated and ignored. The value returned in API responses is derived from whether `userData` is non-empty.
+
 ### Tenant Account
 
 - `accountNumber`, `subscriptionId`, and `subscriptionTier` attributes were deprecated and will be removed on **September 10th, 2026 0:00 UTC**. Please update your usage accordingly.
@@ -121,6 +125,10 @@ Endpoints that have deprecations will be grouped here. Following deprecations ar
 ### Network Security Group
 
 - `object_id` attribute on Network Security Group propagation details was deprecated in favor of `objectId` and will be removed on **September 10th, 2026 0:00 UTC**. Please use `objectId` instead.
+
+### Instance
+
+- `infrastructureProviderId` query parameter on the list Instances endpoint was deprecated and will be removed on **October 10th, 2026 0:00 UTC**. Instances will no longer be filtered by Infrastructure Provider; results are scoped to the org's Tenant. Use the `siteId` parameter to scope results to a specific Infrastructure Provider's Sites.
 
 ## Recent Deprecations
 

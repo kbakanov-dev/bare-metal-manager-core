@@ -19,7 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 const (
@@ -44,10 +44,10 @@ var (
 
 	// MachineIssueCategoriesFromAPIToProtobuf is the map of instance issue categories to their corresponding values
 	MachineIssueCategoriesFromAPIToProtobuf = map[string]int32{
-		MachineIssueCategoryHardware:    int32(cwssaws.IssueCategory_HARDWARE),
-		MachineIssueCategoryNetwork:     int32(cwssaws.IssueCategory_NETWORK),
-		MachineIssueCategoryPerformance: int32(cwssaws.IssueCategory_PERFORMANCE),
-		MachineIssueCategoryOther:       int32(cwssaws.IssueCategory_OTHER),
+		MachineIssueCategoryHardware:    int32(corev1.IssueCategory_HARDWARE),
+		MachineIssueCategoryNetwork:     int32(corev1.IssueCategory_NETWORK),
+		MachineIssueCategoryPerformance: int32(corev1.IssueCategory_PERFORMANCE),
+		MachineIssueCategoryOther:       int32(corev1.IssueCategory_OTHER),
 	}
 )
 
@@ -175,6 +175,91 @@ func ValidateInterfaces(ifcs *[]APIInterfaceCreateOrUpdateRequest) error {
 	return nil
 }
 
+// InfiniBandInterfaceRequestMatchResult captures whether a machine can satisfy an InfiniBand interface request.
+type InfiniBandInterfaceRequestMatchResult struct {
+	Satisfied                 bool
+	CountSatisfiable          bool
+	SuggestedByDevice         map[string][]int
+	UnsatisfiedRequestIndices []int
+}
+
+// ValidateInfiniBandRequestForMachineCapability checks whether machine InfiniBand capabilities
+// can satisfy the requested interfaces.
+func (req *APIInstanceCreateRequest) ValidateInfiniBandRequestForMachineCapability(machineIbCaps []cdbm.MachineCapability) InfiniBandInterfaceRequestMatchResult {
+	capByDevice := make(map[string]cdbm.MachineCapability, len(machineIbCaps))
+	for _, cap := range machineIbCaps {
+		capByDevice[cap.Name] = cap
+	}
+
+	result := InfiniBandInterfaceRequestMatchResult{
+		Satisfied:         true,
+		CountSatisfiable:  true,
+		SuggestedByDevice: make(map[string][]int, len(capByDevice)),
+	}
+
+	// Build the available by device map from the capabilities
+	for device, cap := range capByDevice {
+		// If the count is nil, skip the device
+		if cap.Count == nil {
+			continue
+		}
+
+		inactive := make(map[int]bool, len(cap.InactiveDevices))
+		for _, deviceInstance := range cap.InactiveDevices {
+			inactive[deviceInstance] = true
+		}
+
+		active := make([]int, 0, *cap.Count)
+		for deviceInstance := 0; deviceInstance < *cap.Count; deviceInstance++ {
+			if !inactive[deviceInstance] {
+				active = append(active, deviceInstance)
+			}
+		}
+		// Add the active device instances to the available by device map
+		result.SuggestedByDevice[device] = active
+	}
+
+	requestedByDevice := make(map[string]int)
+	for idx, ibifc := range req.InfiniBandInterfaces {
+		cap, found := capByDevice[ibifc.Device]
+		if !found {
+			result.Satisfied = false
+			result.CountSatisfiable = false
+			result.UnsatisfiedRequestIndices = append(result.UnsatisfiedRequestIndices, idx)
+			continue
+		}
+
+		if ibifc.Vendor != nil && cap.Vendor != nil && *ibifc.Vendor != *cap.Vendor {
+			result.Satisfied = false
+			result.UnsatisfiedRequestIndices = append(result.UnsatisfiedRequestIndices, idx)
+		}
+
+		activeDeviceInstance := make(map[int]bool, len(result.SuggestedByDevice[ibifc.Device]))
+		for _, deviceInstance := range result.SuggestedByDevice[ibifc.Device] {
+			activeDeviceInstance[deviceInstance] = true
+		}
+		if !activeDeviceInstance[ibifc.DeviceInstance] {
+			result.Satisfied = false
+			result.UnsatisfiedRequestIndices = append(result.UnsatisfiedRequestIndices, idx)
+		}
+
+		requestedByDevice[ibifc.Device]++
+	}
+
+	for device, requestedCount := range requestedByDevice {
+		if len(result.SuggestedByDevice[device]) < requestedCount {
+			result.CountSatisfiable = false
+		}
+	}
+
+	if len(req.InfiniBandInterfaces) == 0 {
+		result.Satisfied = true
+		result.CountSatisfiable = true
+	}
+
+	return result
+}
+
 // ValidateInfiniBandInterfaces validates the InfiniBand Interfaces for Instance create/update request
 func ValidateInfiniBandInterfaces(itIbCaps []cdbm.MachineCapability, ibifcs []APIInfiniBandInterfaceCreateOrUpdateRequest) error {
 	// Get the total count of device instances for the InfiniBand Instance Type's Machine Capabilities
@@ -214,7 +299,7 @@ func ValidateInfiniBandInterfaces(itIbCaps []cdbm.MachineCapability, ibifcs []AP
 				}
 			}
 
-			// Check if the infiniband device name is present in the Instance Type's InfiniBand Capabilities
+			// Check if the infiniband device name is present in the  Instance Type's InfiniBand Capabilities
 			_, exists = deviceInstanceCountMap[ibifc.Device]
 			if !exists {
 				return validation.Errors{
@@ -222,7 +307,7 @@ func ValidateInfiniBandInterfaces(itIbCaps []cdbm.MachineCapability, ibifcs []AP
 				}
 			}
 
-			// Check if the infiniband device vendor is present in the Instance Type's InfiniBand Capabilities
+			// Check if the infiniband device vendor is present in the  Instance Type's InfiniBand Capabilities
 			if ibifc.Vendor != nil && !deviceVendorMap[*ibifc.Vendor] {
 				return validation.Errors{
 					"vendor": fmt.Errorf("Vendor %v is not present in Instance Type's InfiniBand Capabilities", *ibifc.Vendor),
@@ -235,7 +320,7 @@ func ValidateInfiniBandInterfaces(itIbCaps []cdbm.MachineCapability, ibifcs []AP
 				}
 			}
 
-			// Check if the specified InfiniBand device instance is inactive
+			// Check if the specified Instance Type's InfiniBand device instance is inactive
 			_, exists = deviceInactiveInstanceMap[ibifc.Device]
 			if exists {
 				_, exists = deviceInactiveInstanceMap[ibifc.Device][ibifc.DeviceInstance]
@@ -1604,11 +1689,11 @@ func (idr *APIInstanceDeleteRequest) Validate() error {
 // cannot see. In particular, the `IsRepairTenant` capability gate
 // (TargetedInstanceCreation on the Tenant config) is an authorization
 // check that stays in the handler before this method runs.
-func (idr *APIInstanceDeleteRequest) ToProto(instance *cdbm.Instance) *cwssaws.InstanceReleaseRequest {
+func (idr *APIInstanceDeleteRequest) ToProto(instance *cdbm.Instance, user *cdbm.User) *corev1.InstanceReleaseRequest {
 	req := instance.ToReleaseRequestProto()
 	if idr.MachineHealthIssue != nil {
-		req.Issue = &cwssaws.Issue{
-			Category: cwssaws.IssueCategory(MachineIssueCategoriesFromAPIToProtobuf[idr.MachineHealthIssue.Category]),
+		req.Issue = &corev1.Issue{
+			Category: corev1.IssueCategory(MachineIssueCategoriesFromAPIToProtobuf[idr.MachineHealthIssue.Category]),
 		}
 		if idr.MachineHealthIssue.Summary != nil {
 			req.Issue.Summary = *idr.MachineHealthIssue.Summary
@@ -1619,6 +1704,19 @@ func (idr *APIInstanceDeleteRequest) ToProto(instance *cdbm.Instance) *cwssaws.I
 	}
 	if idr.IsRepairTenant != nil {
 		req.IsRepairTenant = idr.IsRepairTenant
+	}
+
+	// Build the delete attribution proto
+	initiatedBy := &corev1.DeleteInitiatedBy{
+		Org:      instance.Tenant.Org,
+		UserId:   user.ID.String(),
+		TenantId: instance.Tenant.ID.String(),
+	}
+	if instance.Tenant.OrgDisplayName != nil {
+		initiatedBy.OrgDisplayName = *instance.Tenant.OrgDisplayName
+	}
+	req.DeleteAttribution = &corev1.DeleteAttribution{
+		InitiatedBy: initiatedBy,
 	}
 	return req
 }
@@ -1735,6 +1833,29 @@ type APIInstance struct {
 
 // APIInstanceStats holds aggregated instance status counts at the API layer.
 type APIInstanceStats = cdbm.InstanceCountByStatus
+
+var (
+	// instanceQueryParamDeprecationTime is when the deprecated infrastructureProviderId
+	// query parameter on the list-Instances endpoint will no longer be accepted.
+	instanceQueryParamDeprecationTime = time.Date(2026, time.October, 10, 0, 0, 0, 0, time.UTC)
+
+	// instanceListQueryParamDeprecations are the deprecated query parameters accepted by the
+	// list-Instances endpoint. Instances will no longer be filtered by Infrastructure Provider;
+	// results are scoped to the org's Tenant.
+	instanceListQueryParamDeprecations = []DeprecatedEntity{
+		{OldValue: "infrastructureProviderId", Type: DeprecationTypeQueryParam, TakeActionBy: instanceQueryParamDeprecationTime},
+	}
+)
+
+// InstanceListQueryParamDeprecations returns the deprecation notices for the deprecated query
+// parameters accepted by the list-Instances endpoint.
+func InstanceListQueryParamDeprecations() []APIDeprecation {
+	deprecations := make([]APIDeprecation, 0, len(instanceListQueryParamDeprecations))
+	for _, d := range instanceListQueryParamDeprecations {
+		deprecations = append(deprecations, NewAPIDeprecation(d))
+	}
+	return deprecations
+}
 
 // NewAPIInstance accepts a DB layer Instance object returns an API layer object.
 // SecondaryVpcIDs are derived from interface relations, so callers must preload

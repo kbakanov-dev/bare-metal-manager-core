@@ -50,7 +50,7 @@ use nv_redfish::oem::lenovo::computer_system::{FpMode, PortSwitchingTo};
 use nv_redfish::oem::lenovo::manager::KcsState;
 use nv_redfish::oem::lenovo::security_service::FwRollbackState;
 use nv_redfish::oem::supermicro::Privilege as SupermicroPrivilege;
-use nv_redfish::resource::ResourceNameRef;
+use nv_redfish::resource::{ResourceIdRef, ResourceNameRef};
 use nv_redfish::service_root::{Product, Vendor};
 use nv_redfish::{Bmc, Resource, ServiceRoot};
 
@@ -62,23 +62,44 @@ pub enum ErrorClass {
 
 pub type ErrorClassifier<'a, B> = &'a (dyn Fn(&<B as Bmc>::Error) -> Option<ErrorClass> + Sync);
 
+fn is_bluefield_system_id(id: ResourceIdRef<'_>) -> bool {
+    matches!(id.into_inner(), "Bluefield" | "BlueField_0")
+}
+
 pub struct Config<'a, B: Bmc> {
     pub boot_interface_mac: Option<MacAddress>,
     pub error_classifier: ErrorClassifier<'a, B>,
     pub retry_timeout: Duration,
 }
 
+fn is_bf4_product(product: Option<Product<&str>>) -> bool {
+    // TODO: we should use part_number similar to BF3.
+    product == Some(Product::new("B4240V")) || product == Some(Product::new("BlueField-4"))
+}
+
 /// Builds the chassis exploration config shared by [`nv_generate_exploration_report`]
 /// and the [`detect_hw_type`] accessor, so detection cannot drift between them.
 fn build_chassis_explore_config<B: Bmc>(root: &ServiceRoot<B>) -> chassis::Config {
+    let is_nvidia_vendor = root.vendor() == Some(Vendor::new("Nvidia"))
+        || root.vendor() == Some(Vendor::new("NVIDIA"));
+    let need_bf4_network_device_fns = is_nvidia_vendor && is_bf4_product(root.product());
+
     chassis::Config {
         network_adapter: network_adapter::Config {
-            need_network_device_fns: root.vendor() == Some(Vendor::new("Dell")),
+            // Dell exploration needs NDF data for host-DPU pairing. BF4 needs
+            // NDF0 `PermanentMACAddress` to derive PF0 base MAC as (NDF0 - 0x10)
+            // while some BMC firmware does not expose ComputerSystem BaseMAC.
+            need_network_device_fns: root.vendor() == Some(Vendor::new("Dell"))
+                || need_bf4_network_device_fns,
         },
         need_assembly_sn: |id| {
-            // For GB200s, use the Chassis_0 assembly serial number to match Nautobot.
-            (*id.inner() == "Chassis_0")
-                .then_some(|model| model == Some(AssemblyModel::new("GB200 NVL")))
+            // For GB200 and Vera Rubin hosts, use the Chassis_0 assembly serial
+            // number to match Nautobot / expected-machine inventory serials.
+            (*id.inner() == "Chassis_0").then_some(|model| {
+                model.is_some_and(|model| {
+                    hw::vera_rubin::chassis_assembly_serial_model(model.into_inner())
+                }) || model == Some(AssemblyModel::new("GB200 NVL"))
+            })
         },
         // BlueField-3 DPU (Tested on BF-25.10-9 firmware) has issue
         // with ERoT chassis. It stucks sometimes until next request
@@ -131,7 +152,7 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
         .next()
         .ok_or_else(Error::bmc_not_provided("at least one manager"))?;
 
-    let is_bluefield_system = system.id().into_inner() == "Bluefield";
+    let is_bluefield_system = is_bluefield_system_id(system.id());
     let system_explore_config = computer_system::Config {
         need_oem_nvidia_bluefield: is_bluefield_system,
         ignore_500_on_bios_fetch: is_bluefield_system,
@@ -191,10 +212,12 @@ pub async fn nv_generate_exploration_report<B: Bmc>(
             ) => chassis.chassis.id().into_inner() == explored_system.system.id().into_inner(),
             // Provides only one Chassis.
             Some(hw::HwType::LenovoAmi) => true,
-            Some(hw::HwType::LenovoGb300 | hw::HwType::DgxGb300 | hw::HwType::SupermicroGb300) => {
-                let chassis_id = chassis.chassis.id().into_inner();
-                chassis_id.starts_with("HGX_GPU_")
-            }
+            Some(
+                hw::HwType::LenovoGb300
+                | hw::HwType::DgxGb300
+                | hw::HwType::SupermicroGb300
+                | hw::HwType::VeraRubin,
+            ) => chassis.chassis.id().into_inner().starts_with("HGX_GPU_"),
             // No meaningful PCIeDevices.
             Some(
                 hw::HwType::Bluefield
@@ -309,7 +332,10 @@ pub(crate) fn hw_type<B: Bmc>(
             "Lenovo" if oem_id != Some("Ami") => Some(hw::HwType::Lenovo),
             "Supermicro" => Some(hw::HwType::Supermicro),
             "HPE" => Some(hw::HwType::Hpe),
-            "Nvidia" if system.id().into_inner() == "Bluefield" => Some(hw::HwType::Bluefield),
+            "Nvidia" if is_bluefield_system_id(system.id()) => Some(hw::HwType::Bluefield),
+            "NVIDIA" if root.product() == Some(Product::new("VR NVL72")) => {
+                Some(hw::HwType::VeraRubin)
+            }
             "WIWYNN" | "NVIDIA"
                 if root.product() == Some(Product::new("GB200 NVL"))
                     || root.product() == Some(Product::new("GB BMC")) =>
@@ -888,6 +914,40 @@ fn machine_setup_status<B: Bmc>(
             if let Some(mac) = boot_interface_mac {
                 // Looking for UEFI Device path:
                 // VenHw(REDACTED)/MemoryMapped(REDACTED)/PciRoot(0x6)/Pci(0x0,0x0)/Pci(0x0,0x0)/Pci(0x0,0x0)/Pci(0x0,0x0)/MAC(020304050607,0x1)/IPv4(0.0.0.0)/Uri()
+                let actual = explored_system.boot_order_first_option();
+                let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
+                let expected = explored_system.boot_options.iter().find(|option| {
+                    option.uefi_device_path().is_some_and(|path| {
+                        path.inner().contains(&mac_str)
+                            && path.inner().contains("/IPv4(")
+                            && path.inner().ends_with("/Uri()")
+                    })
+                });
+                if let Some(diff) = compare_boot_options(expected, actual) {
+                    diffs.push(diff)
+                }
+            }
+        }
+
+        hw::HwType::VeraRubin => {
+            if explored_system
+                .secure_boot_status()
+                .is_ok_and(|s| s.is_enabled)
+            {
+                diffs.push(MachineSetupDiff {
+                    key: "SecureBoot".to_string(),
+                    expected: "false".to_string(),
+                    actual: "true".to_string(),
+                })
+            }
+            diffs.extend(
+                hw::vera_rubin::EXPECTED_BIOS_ATTRS
+                    .iter()
+                    .flat_map(|expected| explored_system.verify_bios_attr(expected)),
+            );
+            if let Some(mac) = boot_interface_mac {
+                // Looking for UEFI Device path:
+                // VenHw(...)/.../MAC(020304050607,0x1)/IPv4(0.0.0.0)/Uri()
                 let actual = explored_system.boot_order_first_option();
                 let mac_str = format!("/MAC({},", mac.to_string().replace(":", ""));
                 let expected = explored_system.boot_options.iter().find(|option| {

@@ -45,6 +45,14 @@ use crate::cfg::dispatch::Dispatch;
 pub enum Cmd {
     #[clap(about = "Display Machine information")]
     Show(show::Args),
+    // Hidden: the view moved to the top-level `boot-interface show`. This
+    // variant keeps `machine boot-interfaces` parsing for existing scripts and
+    // runs the exact same handler (the payload type is the new command's Args).
+    #[clap(
+        hide = true,
+        about = "Moved: use `boot-interface show` (kept as a hidden alias)"
+    )]
+    BootInterfaces(crate::boot_interface::show::Args),
     #[clap(subcommand, about = "Networking information")]
     Network(network::Args),
     #[clap(

@@ -43,9 +43,14 @@ impl DataSink for CountingSink {
         "counting_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), carbide_health::HealthError> {
         std::hint::black_box(context);
         std::hint::black_box(event);
+        Ok(())
     }
 }
 
@@ -96,6 +101,7 @@ fn event_context() -> EventContext {
             slot_number: None,
             tray_index: None,
             nvlink_domain_uuid: None,
+            driver_version: None,
         })),
         rack_id: None,
     }
@@ -273,6 +279,7 @@ fn rack_event_contexts(rack_id: &str, tray_count: usize) -> Vec<EventContext> {
                     slot_number: None,
                     tray_index: None,
                     nvlink_domain_uuid: None,
+                    driver_version: None,
                 })),
                 rack_id: Some(RackId::new(rack_id)),
             }

@@ -15,7 +15,7 @@ import (
 
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	"github.com/uptrace/bun"
 )
@@ -102,11 +102,11 @@ type VpcPeering struct {
 // treats them as opaque identifiers, and any ControllerVpcID
 // indirection has already been applied by the time the peering rows
 // reference these UUIDs.
-func (vp *VpcPeering) ToProto() *cwssaws.VpcPeering {
-	return &cwssaws.VpcPeering{
-		Id:        &cwssaws.VpcPeeringId{Value: vp.ID.String()},
-		VpcId:     &cwssaws.VpcId{Value: vp.Vpc1ID.String()},
-		PeerVpcId: &cwssaws.VpcId{Value: vp.Vpc2ID.String()},
+func (vp *VpcPeering) ToProto() *corev1.VpcPeering {
+	return &corev1.VpcPeering{
+		Id:        &corev1.VpcPeeringId{Value: vp.ID.String()},
+		VpcId:     &corev1.VpcId{Value: vp.Vpc1ID.String()},
+		PeerVpcId: &corev1.VpcId{Value: vp.Vpc2ID.String()},
 	}
 }
 
@@ -114,7 +114,7 @@ func (vp *VpcPeering) ToProto() *cwssaws.VpcPeering {
 // representation. A nil proto is a no-op. This is the inverse of
 // `ToProto` and exists for convention symmetry — currently no code
 // path on the cloud side reconstructs a full VpcPeering entity from a
-// `cwssaws.VpcPeering` (the site is the destination, not the source),
+// `corev1.VpcPeering` (the site is the destination, not the source),
 // but the method is provided so future reconciliation flows have a
 // single canonical entry point.
 //
@@ -125,7 +125,7 @@ func (vp *VpcPeering) ToProto() *cwssaws.VpcPeering {
 //     omits the matching `VpcId` / `PeerVpcId` or carries an
 //     unparseable value, so `FromProto` cannot silently zero out a
 //     required foreign key.
-func (vp *VpcPeering) FromProto(proto *cwssaws.VpcPeering) {
+func (vp *VpcPeering) FromProto(proto *corev1.VpcPeering) {
 	if proto == nil {
 		return
 	}
@@ -149,9 +149,9 @@ func (vp *VpcPeering) FromProto(proto *cwssaws.VpcPeering) {
 // ToDeletionRequestProto builds the workflow request that asks a Site to
 // delete this VpcPeering. Stays on the entity because the delete-by-id
 // flow has no API request body.
-func (vp *VpcPeering) ToDeletionRequestProto() *cwssaws.VpcPeeringDeletionRequest {
-	return &cwssaws.VpcPeeringDeletionRequest{
-		Id: &cwssaws.VpcPeeringId{Value: vp.ID.String()},
+func (vp *VpcPeering) ToDeletionRequestProto() *corev1.VpcPeeringDeletionRequest {
+	return &corev1.VpcPeeringDeletionRequest{
+		Id: &corev1.VpcPeeringId{Value: vp.ID.String()},
 	}
 }
 
@@ -172,7 +172,11 @@ type VpcPeeringFilterInput struct {
 	IsMultiTenant             *bool
 	InfrastructureProviderIDs []uuid.UUID
 	TenantIDs                 []uuid.UUID
-	Statuses                  []string
+	// PeerTenantIDs filters peerings where vpc1 OR vpc2 belongs to any of the specified
+	// tenants. This is a user-requested filter and is distinct from TenantIDs, which
+	// scopes results to the caller's authorization context.
+	PeerTenantIDs []uuid.UUID
+	Statuses      []string
 }
 
 func (vp *VpcPeering) BeforeCreateTable(ctx context.Context, query *bun.CreateTableQuery) error {
@@ -348,6 +352,15 @@ func (vpsd VpcPeeringSQLDAO) setQueryWithFilter(filter VpcPeeringFilterInput, qu
 				WhereOr("vp.vpc2_id IN (SELECT id FROM vpc WHERE tenant_id IN (?))", bun.In(filter.TenantIDs))
 		})
 		vpsd.tracerSpan.SetAttribute(vpDAOSpan, "tenant_ids", filter.TenantIDs)
+	}
+
+	if len(filter.PeerTenantIDs) > 0 {
+		query = query.WhereGroup(" AND ", func(q *bun.SelectQuery) *bun.SelectQuery {
+			return q.
+				WhereOr("vp.vpc1_id IN (SELECT id FROM vpc WHERE tenant_id IN (?))", bun.In(filter.PeerTenantIDs)).
+				WhereOr("vp.vpc2_id IN (SELECT id FROM vpc WHERE tenant_id IN (?))", bun.In(filter.PeerTenantIDs))
+		})
+		vpsd.tracerSpan.SetAttribute(vpDAOSpan, "peer_tenant_ids", filter.PeerTenantIDs)
 	}
 
 	return query, nil

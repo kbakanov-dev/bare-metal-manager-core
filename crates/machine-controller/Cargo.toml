@@ -21,6 +21,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
 [features]
 default = []
 test-support = ["dep:mockall"]
@@ -34,6 +38,7 @@ carbide-health-report = { path = "../health-report", default-features = false }
 carbide-health-metrics = { path = "../health-metrics" }
 carbide-utils = { path = "../utils", default-features = false }
 carbide-firmware = { path = "../firmware", default-features = false }
+carbide-instrument = { path = "../instrument" }
 carbide-ipmi = { path = "../ipmi", default-features = false }
 carbide-measured-boot = { path = "../measured-boot", default-features = false }
 carbide-redfish = { path = "../redfish", default-features = false }
@@ -49,6 +54,7 @@ duration-str = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 libredfish = { workspace = true }
@@ -59,18 +65,25 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 version-compare = { workspace = true }
 
 [dev-dependencies]
+carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-redfish = { path = "../redfish", features = ["test-support"] }
+carbide-test-harness = { path = "../test-harness" }
 
 figment = { workspace = true, features = ["env", "test", "toml"] }
 regex = { workspace = true }
 lazy_static = { workspace = true }
+tempfile = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

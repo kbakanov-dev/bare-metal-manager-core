@@ -58,6 +58,7 @@ impl WiwynnGB200Nvl<'_> {
                         .interface_enabled(true)
                         .build(),
                     ]),
+                    serial_interfaces: None,
                     firmware_version: Some("25.06-2_NV_WW_02"),
                     oem: None,
                 },
@@ -65,6 +66,7 @@ impl WiwynnGB200Nvl<'_> {
                     id: "HGX_BMC_0",
                     eth_interfaces: Some(vec![]), // TODO: usb0
                     host_interfaces: None,
+                    serial_interfaces: None,
                     firmware_version: Some("GB200Nvl-25.06-A"),
                     oem: None,
                 },
@@ -92,7 +94,7 @@ impl WiwynnGB200Nvl<'_> {
                 .display_name(&display_name)
                 .uefi_device_path(&format!("MAC({mac},0x1)/IPv4(0.0.0.0,0x0,DHCP,0.0.0.0,0.0.0.0,0.0.0.0)/Uri()"))
                 .build()
-        })).collect();
+        })).collect::<Vec<_>>();
 
         let hgx_baseboard_id = "HGX_Baseboard_0";
 
@@ -120,6 +122,7 @@ impl WiwynnGB200Nvl<'_> {
                     log_services: None,
                     storage: None,
                     processors: None,
+                    serial_console: None,
                     secure_boot_available: true,
                 },
                 redfish::computer_system::SingleSystemConfig {
@@ -143,6 +146,7 @@ impl WiwynnGB200Nvl<'_> {
                             .flat_map(|board| board.hgx_gpu_processors(hgx_baseboard_id))
                             .collect(),
                     ),
+                    serial_console: None,
                     secure_boot_available: false,
                 },
             ],

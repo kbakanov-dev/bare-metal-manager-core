@@ -25,8 +25,8 @@ import (
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	swe "github.com/NVIDIA/infra-controller/rest-api/site-workflow/pkg/error"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
 
 	cwma "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/activity/machine"
 
@@ -217,14 +217,13 @@ func (cith CreateInstanceTypeHandler) Handle(c echo.Context) error {
 
 		// Create a status detail record for Instance Type
 		var serr error
-		ssd, serr = sdDAO.CreateFromParams(ctx, tx, it.ID.String(), *cutil.GetPtr(cdbm.InstanceTypeStatusReady),
-			cutil.GetPtr("Instance type is ready for use"))
+		ssd, serr = sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: it.ID.String(), Status: *cutil.GetPtr(cdbm.InstanceTypeStatusReady), Message: cutil.GetPtr("Instance type is ready for use")})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for Instance Type", nil)
 		}
 		if ssd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for Instance Type", nil)
 		}
 
@@ -636,7 +635,7 @@ func (gaith GetAllInstanceTypeHandler) Handle(c echo.Context) error {
 			}
 		}
 		if len(mitIDs) > 0 {
-			mit, _, err = mitDAO.GetAll(ctx, nil, nil, mitIDs, nil, nil, cutil.GetPtr(cdbp.TotalLimit), nil)
+			mit, _, err = mitDAO.GetAll(ctx, nil, cdbm.MachineInstanceTypeFilterInput{InstanceTypeIDs: mitIDs}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 			if err != nil {
 				logger.Error().Err(err).Msg("error retrieving Machine assignments for Instance Type")
 				return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve  Machine assignments for Instance Type", nil)
@@ -836,7 +835,7 @@ func (gith GetInstanceTypeHandler) Handle(c echo.Context) error {
 	if includeMachineAssignment {
 		// Check if Machine/InstanceType association already exists
 		mitDAO := cdbm.NewMachineInstanceTypeDAO(gith.dbSession)
-		mit, _, err = mitDAO.GetAll(ctx, nil, nil, []uuid.UUID{it.ID}, nil, nil, cutil.GetPtr(cdbp.TotalLimit), nil)
+		mit, _, err = mitDAO.GetAll(ctx, nil, cdbm.MachineInstanceTypeFilterInput{InstanceTypeIDs: []uuid.UUID{it.ID}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 		if err != nil {
 			logger.Error().Err(err).Msg("error retrieving Machine assignments for Instance Type")
 			return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve  Machine assignments for Instance Type", nil)
@@ -1155,7 +1154,7 @@ func (uith UpdateInstanceTypeHandler) Handle(c echo.Context) error {
 
 		// Get Instance Type status details
 		var serr error
-		ssds, _, serr = sdDAO.GetAllByEntityID(ctx, tx, it.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		ssds, _, serr = sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{it.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error retrieving Status Details for Instance Type from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve status history for Instance Type", nil)
@@ -1432,10 +1431,8 @@ func (dith DeleteInstanceTypeHandler) Handle(c echo.Context) error {
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to delete Instance Type", nil)
 		}
 
-		//
-		// Get the machines for instance type
 		mDAO := cdbm.NewMachineDAO(dith.dbSession)
-		mcs, _, derr := mDAO.GetAll(ctx, tx, cdbm.MachineFilterInput{InstanceTypeIDs: []uuid.UUID{it.ID}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
+		mcs, _, derr := mDAO.GetAll(ctx, tx, cdbm.MachineFilterInput{InstanceTypeIDs: []uuid.UUID{it.ID}, ExcludeMetadata: true}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Machines for Instance Type from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Machines for Instance Type", nil)
@@ -1464,7 +1461,7 @@ func (dith DeleteInstanceTypeHandler) Handle(c echo.Context) error {
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve client for Site", nil)
 		}
 
-		deleteInstanceTypeRequest := &cwssaws.DeleteInstanceTypeRequest{
+		deleteInstanceTypeRequest := &corev1.DeleteInstanceTypeRequest{
 			Id: it.ID.String(),
 		}
 

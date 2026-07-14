@@ -17,7 +17,7 @@ import (
 
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	cwutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 )
@@ -32,7 +32,7 @@ type ManageNetworkSecurityGroup struct {
 // Activity functions
 
 // UpdateNetworkSecurityGroupsInDB is a Temporal activity that takes a collection of NetworkSecurityGroup data pushed by Site Agent and updates the DB
-func (mv ManageNetworkSecurityGroup) UpdateNetworkSecurityGroupsInDB(ctx context.Context, siteID uuid.UUID, networkSecurityGroupInventory *cwssaws.NetworkSecurityGroupInventory) error {
+func (mv ManageNetworkSecurityGroup) UpdateNetworkSecurityGroupsInDB(ctx context.Context, siteID uuid.UUID, networkSecurityGroupInventory *corev1.NetworkSecurityGroupInventory) error {
 	logger := log.With().Str("Activity", "UpdateNetworkSecurityGroupsInDB").Str("Site ID", siteID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -42,7 +42,7 @@ func (mv ManageNetworkSecurityGroup) UpdateNetworkSecurityGroupsInDB(ctx context
 		return errors.New("UpdateNetworkSecurityGroupsInDB called with nil inventory")
 	}
 
-	if networkSecurityGroupInventory.InventoryStatus == cwssaws.InventoryStatus_INVENTORY_STATUS_FAILED {
+	if networkSecurityGroupInventory.InventoryStatus == corev1.InventoryStatus_INVENTORY_STATUS_FAILED {
 		logger.Warn().Msg("received failed inventory status from Site Agent, skipping inventory processing")
 		return nil
 	}
@@ -106,7 +106,7 @@ func (mv ManageNetworkSecurityGroup) UpdateNetworkSecurityGroupsInDB(ctx context
 			// tenants, so if we see a tenant we don't know about, we'll
 			// query and cache it.
 			if !foundTenant {
-				tenants, err := tenantDAO.GetAllByOrg(ctx, nil, controllerNetworkSecurityGroup.TenantOrganizationId, nil)
+				tenants, _, err := tenantDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{controllerNetworkSecurityGroup.TenantOrganizationId}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)}, nil)
 				if err != nil {
 					slogger.Error().Err(err).Msg("failed to query for tenant ID for " + controllerNetworkSecurityGroup.TenantOrganizationId)
 					return err

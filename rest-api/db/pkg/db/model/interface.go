@@ -12,7 +12,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 )
@@ -63,21 +63,21 @@ type InterfaceInlineRoutingProfile struct {
 }
 
 // ToProto converts this interface routing profile into its workflow proto representation.
-func (irp *InterfaceInlineRoutingProfile) ToProto() *cwssaws.InstanceInterfaceRoutingProfile {
+func (irp *InterfaceInlineRoutingProfile) ToProto() *corev1.InstanceInterfaceRoutingProfile {
 	if irp == nil {
 		return nil
 	}
-	profile := &cwssaws.InstanceInterfaceRoutingProfile{
-		AllowedAnycastPrefixes: make([]*cwssaws.PrefixFilterPolicyEntry, 0, len(irp.AllowedAnycastPrefixes)),
+	profile := &corev1.InstanceInterfaceRoutingProfile{
+		AllowedAnycastPrefixes: make([]*corev1.PrefixFilterPolicyEntry, 0, len(irp.AllowedAnycastPrefixes)),
 	}
 	for _, prefix := range irp.AllowedAnycastPrefixes {
-		profile.AllowedAnycastPrefixes = append(profile.AllowedAnycastPrefixes, &cwssaws.PrefixFilterPolicyEntry{Prefix: prefix})
+		profile.AllowedAnycastPrefixes = append(profile.AllowedAnycastPrefixes, &corev1.PrefixFilterPolicyEntry{Prefix: prefix})
 	}
 	return profile
 }
 
 // FromProto populates this routing profile from its workflow proto representation.
-func (irp *InterfaceInlineRoutingProfile) FromProto(proto *cwssaws.InstanceInterfaceRoutingProfile) {
+func (irp *InterfaceInlineRoutingProfile) FromProto(proto *corev1.InstanceInterfaceRoutingProfile) {
 	if proto == nil {
 		*irp = InterfaceInlineRoutingProfile{}
 		return
@@ -384,7 +384,7 @@ func (ifcd InterfaceSQLDAO) GetAll(ctx context.Context, tx *db.Tx, filter Interf
 // The updated fields are assumed to be set to non-null values
 func (ifcd InterfaceSQLDAO) Update(ctx context.Context, tx *db.Tx, input InterfaceUpdateInput) (*Interface, error) {
 	// Create a child span and set the attributes for current request
-	ctx, interfaceDAOSpan := ifcd.tracerSpan.CreateChildInCurrentContext(ctx, "InterfaceDAO.UpdateFromParams")
+	ctx, interfaceDAOSpan := ifcd.tracerSpan.CreateChildInCurrentContext(ctx, "InterfaceDAO.Update")
 	if interfaceDAOSpan != nil {
 		defer interfaceDAOSpan.End()
 	}

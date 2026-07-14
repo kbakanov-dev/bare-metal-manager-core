@@ -17,7 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun/extra/bundebug"
+	tclient "go.temporal.io/sdk/client"
+	tmocks "go.temporal.io/sdk/mocks"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -129,7 +132,12 @@ func testCommonSetupSchema(t *testing.T, dbSession *cdb.Session) {
 
 func testCommonBuildInfrastructureProvider(t *testing.T, dbSession *cdb.Session, name string, org string, user *cdbm.User) *cdbm.InfrastructureProvider {
 	ipDAO := cdbm.NewInfrastructureProviderDAO(dbSession)
-	ip, err := ipDAO.CreateFromParams(context.Background(), nil, name, cutil.GetPtr("Test Infrastructure Provider"), org, nil, user)
+	ip, err := ipDAO.Create(context.Background(), nil, cdbm.InfrastructureProviderCreateInput{
+		Name:        name,
+		DisplayName: cutil.GetPtr("Test Infrastructure Provider"),
+		Org:         org,
+		CreatedBy:   user.ID,
+	})
 	assert.Nil(t, err)
 	assert.NotNil(t, ip)
 	return ip
@@ -263,7 +271,10 @@ func testCommonBuildInstanceType(t *testing.T, dbSession *cdb.Session, name stri
 
 func testCommonBuildMachineInstanceType(t *testing.T, dbSession *cdb.Session, machineID string, instanceTypeID uuid.UUID) *cdbm.MachineInstanceType {
 	mitDAO := cdbm.NewMachineInstanceTypeDAO(dbSession)
-	mit, err := mitDAO.CreateFromParams(context.Background(), nil, machineID, instanceTypeID)
+	mit, err := mitDAO.Create(context.Background(), nil, cdbm.MachineInstanceTypeCreateInput{
+		MachineID:      machineID,
+		InstanceTypeID: instanceTypeID,
+	})
 	assert.Nil(t, err)
 	return mit
 }
@@ -341,6 +352,39 @@ func TestGetInfrastructureProviderForOrg(t *testing.T) {
 			if !tc.expectedErr {
 				assert.NotNil(t, ip)
 			}
+		})
+	}
+}
+
+func TestGRPCStatusMessage(t *testing.T) {
+	grpcInvalid := status.Error(codes.InvalidArgument, "model is required")
+	plainErr := errors.New("plain error")
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: "",
+		},
+		{
+			name: "gRPC status message",
+			err:  grpcInvalid,
+			want: "model is required",
+		},
+		{
+			name: "plain error",
+			err:  plainErr,
+			want: "plain error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, GRPCStatusMessage(tt.err))
 		})
 	}
 }
@@ -564,6 +608,99 @@ func TestGetSiteFromIDString(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthorizeProviderSiteForCore(t *testing.T) {
+	ctx := context.Background()
+	dbSession := TestInitDB(t)
+	defer dbSession.Close()
+
+	TestSetupSchema(t, dbSession)
+
+	logger := zerolog.New(os.Stdout)
+
+	org := "test-provider-org"
+	user := TestBuildUser(t, dbSession, uuid.NewString(), org, []string{authz.ProviderAdminRole})
+	assert.NotNil(t, user)
+	ip := TestBuildInfrastructureProvider(t, dbSession, "Test Infrastructure Provider", org, user)
+	assert.NotNil(t, ip)
+	site := TestBuildSite(t, dbSession, ip, "Test Site", user)
+	sDAO := cdbm.NewSiteDAO(dbSession)
+	_, err := sDAO.Update(context.Background(), nil, cdbm.SiteUpdateInput{
+		SiteID: site.ID,
+		Status: cutil.GetPtr(cdbm.SiteStatusRegistered),
+	})
+	require.NoError(t, err)
+
+	otherOrg := "other-provider-org"
+	otherUser := TestBuildUser(t, dbSession, uuid.NewString(), otherOrg, []string{authz.ProviderAdminRole})
+	assert.NotNil(t, otherUser)
+	otherIP := TestBuildInfrastructureProvider(t, dbSession, "Other Infrastructure Provider", otherOrg, otherUser)
+	assert.NotNil(t, otherIP)
+	otherSite := TestBuildSite(t, dbSession, otherIP, "Other Site", otherUser)
+	assert.NotNil(t, otherSite)
+
+	tenantOrg := "tenant-org"
+	tenantUser := TestBuildUser(t, dbSession, uuid.NewString(), tenantOrg, []string{authz.TenantAdminRole})
+	assert.NotNil(t, tenantUser)
+	tenant := TestBuildTenant(t, dbSession, tenantOrg, "Tenant", tenantUser)
+	assert.NotNil(t, tenant)
+	tenantSite := TestBuildTenantSite(t, dbSession, tenant, site, user)
+	assert.NotNil(t, tenantSite)
+
+	scp := &stubSiteTemporalClientPool{client: &tmocks.Client{}}
+	authInput := func(org string, user *cdbm.User, siteID string) AuthorizeProviderSiteForCoreInput {
+		return AuthorizeProviderSiteForCoreInput{
+			Ctx:       ctx,
+			Logger:    logger,
+			DBSession: dbSession,
+			SCP:       scp,
+			Org:       org,
+			User:      user,
+			SiteID:    siteID,
+		}
+	}
+
+	t.Run("success", func(t *testing.T) {
+		client, siteID, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, site.ID.String()))
+		require.Nil(t, apiErr)
+		require.NotNil(t, client)
+		assert.Equal(t, site.ID.String(), siteID)
+	})
+
+	t.Run("nil user", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, nil, site.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusInternalServerError, apiErr.Code)
+	})
+
+	t.Run("user is not a provider admin", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(tenantOrg, tenantUser, site.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.Code)
+	})
+
+	t.Run("site not found", func(t *testing.T) {
+		missingSiteID := uuid.NewString()
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, missingSiteID))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusBadRequest, apiErr.Code)
+		assert.Contains(t, apiErr.Message, missingSiteID)
+	})
+
+	t.Run("site belongs to another provider", func(t *testing.T) {
+		_, _, apiErr := AuthorizeProviderSiteForCore(authInput(org, user, otherSite.ID.String()))
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusForbidden, apiErr.Code)
+	})
+}
+
+type stubSiteTemporalClientPool struct {
+	client tclient.Client
+}
+
+func (s *stubSiteTemporalClientPool) GetClientByID(siteID uuid.UUID) (tclient.Client, error) {
+	return s.client, nil
 }
 
 func TestGetIPBlockFromIDString(t *testing.T) {
@@ -905,7 +1042,7 @@ func TestGetUnallocatedMachineForInstanceType(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s, err := GetUnallocatedMachineForInstanceType(ctx, tx, dbSession, tc.instancetype)
+			s, err := GetUnallocatedMachineForInstanceType(ctx, zerolog.Nop(), tx, dbSession, tc.instancetype, nil)
 			assert.Equal(t, tc.expectErr, err != nil)
 			if err == nil {
 				assert.NotNil(t, s)
@@ -1036,6 +1173,76 @@ func TestGetSiteMachineCountStats(t *testing.T) {
 			assert.Equal(t, tc.wantMachineAllocationStats, ms[tc.siteID].TotalByAllocation)
 		})
 	}
+}
+
+func TestGetSiteGPUStats(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testCommonInitDB(t)
+	defer dbSession.Close()
+
+	testCommonSetupSchema(t, dbSession)
+
+	ipOrg := "test-gpu-ip-org"
+	orgRoles := []string{"NICO_SERVICE_PROVIDER_ADMIN"}
+	ipuser := testCommonBuildUser(t, dbSession, uuid.New().String(), []string{ipOrg}, orgRoles)
+
+	ip := testCommonBuildInfrastructureProvider(t, dbSession, "test-gpu-ip", ipOrg, ipuser)
+	assert.NotNil(t, ip)
+
+	site1 := testCommonBuildSite(t, dbSession, ip, "gpu-site-1", ipuser)
+	site2 := testCommonBuildSite(t, dbSession, ip, "gpu-site-2", ipuser)
+
+	mA := testCommonBuildMachine(t, dbSession, ip.ID, site1.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+	mB := testCommonBuildMachine(t, dbSession, ip.ID, site1.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+	mC := testCommonBuildMachine(t, dbSession, ip.ID, site2.ID, nil, uuid.New(), nil, nil, nil, cdbm.MachineStatusReady)
+
+	const h100 = "NVIDIA H100"
+	const a100 = "NVIDIA A100"
+
+	// site1: H100 on mA(8) and mB(8) -> 16 GPUs / 2 machines; A100 on mA(2) -> 2 GPUs / 1 machine
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(8), nil, nil)
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeGPU, a100, nil, nil, nil, cutil.GetPtr(2), nil, nil)
+	TestBuildMachineCapability(t, dbSession, &mB.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(8), nil, nil)
+	// site2: H100 on mC(4)
+	TestBuildMachineCapability(t, dbSession, &mC.ID, nil, cdbm.MachineCapabilityTypeGPU, h100, nil, nil, nil, cutil.GetPtr(4), nil, nil)
+	// non-GPU capability must be excluded from GPU stats
+	TestBuildMachineCapability(t, dbSession, &mA.ID, nil, cdbm.MachineCapabilityTypeCPU, "Intel Xeon", nil, nil, nil, cutil.GetPtr(2), nil, nil)
+
+	logger := zerolog.Nop()
+
+	t.Run("provider-wide returns per-site stats sorted by name", func(t *testing.T) {
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, nil)
+		require.Nil(t, err)
+
+		require.Len(t, stats[site1.ID], 2)
+		assert.Equal(t, a100, stats[site1.ID][0].Name)
+		assert.Equal(t, 2, stats[site1.ID][0].GPUs)
+		assert.Equal(t, 1, stats[site1.ID][0].Machines)
+		assert.Equal(t, h100, stats[site1.ID][1].Name)
+		assert.Equal(t, 16, stats[site1.ID][1].GPUs)
+		assert.Equal(t, 2, stats[site1.ID][1].Machines)
+
+		require.Len(t, stats[site2.ID], 1)
+		assert.Equal(t, h100, stats[site2.ID][0].Name)
+		assert.Equal(t, 4, stats[site2.ID][0].GPUs)
+		assert.Equal(t, 1, stats[site2.ID][0].Machines)
+	})
+
+	t.Run("site-scoped returns only the requested site", func(t *testing.T) {
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, &site2.ID)
+		require.Nil(t, err)
+
+		assert.Len(t, stats, 1)
+		require.Len(t, stats[site2.ID], 1)
+		assert.Equal(t, 4, stats[site2.ID][0].GPUs)
+	})
+
+	t.Run("site with no GPUs yields no entry", func(t *testing.T) {
+		emptySite := testCommonBuildSite(t, dbSession, ip, "gpu-site-empty", ipuser)
+		stats, err := GetSiteGPUStats(ctx, nil, dbSession, logger, &ip.ID, &emptySite.ID)
+		require.Nil(t, err)
+		assert.Empty(t, stats[emptySite.ID])
+	})
 }
 
 func TestGetAllocationIDsForTenantAtSite(t *testing.T) {
@@ -2620,5 +2827,39 @@ func TestGetFlowUUIDPtr(t *testing.T) {
 		if assert.NotNil(t, got) {
 			assert.Equal(t, s, got.GetId())
 		}
+	})
+}
+
+func TestEvaluateInfiniBandRequestAgainstMachineCaps(t *testing.T) {
+	deviceType := cdbm.MachineCapabilityDeviceType("")
+	machineIbCaps := []cdbm.MachineCapability{
+		{
+			Type:            cdbm.MachineCapabilityTypeInfiniBand,
+			Name:            "MT28908 Family [ConnectX-6]",
+			Vendor:          cutil.GetPtr("Mellanox Technologies"),
+			Count:           cutil.GetPtr(3),
+			DeviceType:      &deviceType,
+			InactiveDevices: []int{1, 3},
+		},
+	}
+
+	t.Run("builds validation errors from suggested device instances", func(t *testing.T) {
+		req := cam.APIInstanceCreateRequest{
+			InfiniBandInterfaces: []cam.APIInfiniBandInterfaceCreateOrUpdateRequest{
+				{Device: "MT28908 Family [ConnectX-6]", DeviceInstance: 1, IsPhysical: true},
+			},
+		}
+		match := req.ValidateInfiniBandRequestForMachineCapability(machineIbCaps)
+		assert.False(t, match.Satisfied)
+		assert.True(t, match.CountSatisfiable)
+
+		selErr := &InfiniBandMachineSelectionError{SuggestedByDevice: match.SuggestedByDevice}
+		errs := selErr.ValidationError()
+		require.Len(t, errs, 1)
+		assert.Contains(t, errs, "infiniBandInterfaces")
+		errMsg := errs["infiniBandInterfaces"].Error()
+		assert.Contains(t, errMsg, "requested device instances are not available on any Machine for this Instance Type")
+		assert.Contains(t, errMsg, "Use deviceInstances: [0 2] for device: MT28908 Family [ConnectX-6]")
+		assert.Equal(t, []int{0, 2}, match.SuggestedByDevice["MT28908 Family [ConnectX-6]"])
 	})
 }

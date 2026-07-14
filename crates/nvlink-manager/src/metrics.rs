@@ -23,7 +23,6 @@ use std::time::Duration;
 use ::carbide_utils::metrics::SharedMetricsHolder;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
-use serde::Serialize;
 
 use crate::NmxcPartitionOperationType;
 
@@ -98,7 +97,7 @@ pub struct AppliedChange {
 }
 
 /// Metrics collected for NMX-C data
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct NmxcMetrics {
     /// The endpoint that we use to interact with NMX-C
     pub endpoint: String,
@@ -106,10 +105,12 @@ pub struct NmxcMetrics {
     pub connect_error: String,
     /// Version of NMX-C
     pub version: String,
-    /// Number of partitions visible at NMX-C
-    pub num_partitions: usize,
-    /// Number of GPUs visible at NMX-C
-    pub num_gpus: usize,
+    /// Partition count per (nvlink_domain_uuid, health).
+    pub partition_health: HashMap<(String, &'static str), usize>,
+    /// GPU count per (nvlink_domain_uuid, health).
+    pub gpu_health: HashMap<(String, &'static str), usize>,
+    /// Compute-node count per (nvlink_domain_uuid, health).
+    pub compute_node_health: HashMap<(String, &'static str), usize>,
 }
 
 impl NvlPartitionMonitorMetrics {
@@ -133,8 +134,9 @@ impl NvlPartitionMonitorMetrics {
                 endpoint: String::new(),
                 connect_error: String::new(),
                 version: String::new(),
-                num_partitions: 0,
-                num_gpus: 0,
+                partition_health: HashMap::new(),
+                gpu_health: HashMap::new(),
+                compute_node_health: HashMap::new(),
             },
         }
     }
@@ -156,8 +158,8 @@ impl Display for NvlPartitionMonitorMetrics {
             self.num_nmx_c_unreachable_chassis,
             self.applied_changes.len(),
             self.nmxc.connect_error,
-            self.nmxc.num_partitions,
-            self.nmxc.num_gpus,
+            self.nmxc.partition_health.values().sum::<usize>(),
+            self.nmxc.gpu_health.values().sum::<usize>(),
             self.num_completed_operations,
             self.recording_started_at.elapsed().as_millis(),
         )
@@ -201,7 +203,7 @@ impl NvlPartitionMonitorInstruments {
                 .u64_observable_gauge(
                     "carbide_nvlink_partition_monitor_machine_status_updates_count",
                 )
-                .with_description("Number of machines nvlink_status_observation got updated")
+                .with_description("Number of machines whose NVLink status observation was updated")
                 .with_callback(move |o| {
                     metrics.if_available(|metrics, attrs| {
                         o.observe(metrics.num_machine_nvl_status_updates as u64, attrs);
@@ -214,7 +216,7 @@ impl NvlPartitionMonitorInstruments {
             let metrics = shared_metrics.clone();
             meter
                 .u64_observable_gauge("carbide_nvlink_partition_monitor_num_logical_partitions")
-                .with_description("Number of logical partitions that were monitored")
+                .with_description("Number of monitored logical partitions")
                 .with_callback(move |o| {
                     metrics.if_available(|metrics, attrs| {
                         o.observe(metrics.num_logical_partitions as u64, attrs);
@@ -227,7 +229,7 @@ impl NvlPartitionMonitorInstruments {
             let metrics = shared_metrics.clone();
             meter
                 .u64_observable_gauge("carbide_nvlink_partition_monitor_num_physical_partitions")
-                .with_description("Number of physical partitions that were monitored")
+                .with_description("Number of monitored physical partitions")
                 .with_callback(move |o| {
                     metrics.if_available(|metrics, attrs| {
                         o.observe(metrics.num_physical_partitions as u64, attrs);
@@ -272,10 +274,24 @@ impl NvlPartitionMonitorInstruments {
             let metrics = shared_metrics.clone();
             meter
                 .u64_observable_gauge("carbide_nvlink_partition_monitor_nmxc_partition_count")
-                .with_description("Number of partitions NMX-C is reporting")
+                .with_description(
+                    "Number of partitions NMX-C is reporting, by NVLink domain and health state",
+                )
                 .with_callback(move |o| {
                     metrics.if_available(|metrics, attrs| {
-                        o.observe(metrics.nmxc.num_partitions as u64, attrs);
+                        for ((domain, health), &count) in &metrics.nmxc.partition_health {
+                            o.observe(
+                                count as u64,
+                                &[
+                                    attrs,
+                                    &[
+                                        KeyValue::new("nvlink_domain_uuid", domain.clone()),
+                                        KeyValue::new("health", *health),
+                                    ],
+                                ]
+                                .concat(),
+                            );
+                        }
                     })
                 })
                 .build();
@@ -285,10 +301,51 @@ impl NvlPartitionMonitorInstruments {
             let metrics = shared_metrics.clone();
             meter
                 .u64_observable_gauge("carbide_nvlink_partition_monitor_nmxc_gpu_count")
-                .with_description("Number of GPUs NMX-C is reporting")
+                .with_description(
+                    "Number of GPUs NMX-C is reporting, by NVLink domain and health state",
+                )
                 .with_callback(move |o| {
                     metrics.if_available(|metrics, attrs| {
-                        o.observe(metrics.nmxc.num_gpus as u64, attrs);
+                        for ((domain, health), &count) in &metrics.nmxc.gpu_health {
+                            o.observe(
+                                count as u64,
+                                &[
+                                    attrs,
+                                    &[
+                                        KeyValue::new("nvlink_domain_uuid", domain.clone()),
+                                        KeyValue::new("health", *health),
+                                    ],
+                                ]
+                                .concat(),
+                            );
+                        }
+                    })
+                })
+                .build();
+        }
+
+        {
+            let metrics = shared_metrics.clone();
+            meter
+                .u64_observable_gauge("carbide_nvlink_partition_monitor_nmxc_compute_node_count")
+                .with_description(
+                    "Number of compute nodes NMX-C reports, by NVLink domain and health state",
+                )
+                .with_callback(move |o| {
+                    metrics.if_available(|metrics, attrs| {
+                        for ((domain, health), &count) in &metrics.nmxc.compute_node_health {
+                            o.observe(
+                                count as u64,
+                                &[
+                                    attrs,
+                                    &[
+                                        KeyValue::new("nvlink_domain_uuid", domain.clone()),
+                                        KeyValue::new("health", *health),
+                                    ],
+                                ]
+                                .concat(),
+                            );
+                        }
                     })
                 })
                 .build();

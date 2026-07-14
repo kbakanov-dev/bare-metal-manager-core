@@ -16,7 +16,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	stracer "github.com/NVIDIA/infra-controller/rest-api/db/pkg/tracer"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 var (
@@ -55,10 +55,10 @@ func TestVpcPeering_FromProto(t *testing.T) {
 		v1 := uuid.New()
 		v2 := uuid.New()
 		vp := &VpcPeering{}
-		vp.FromProto(&cwssaws.VpcPeering{
-			Id:        &cwssaws.VpcPeeringId{Value: id.String()},
-			VpcId:     &cwssaws.VpcId{Value: v1.String()},
-			PeerVpcId: &cwssaws.VpcId{Value: v2.String()},
+		vp.FromProto(&corev1.VpcPeering{
+			Id:        &corev1.VpcPeeringId{Value: id.String()},
+			VpcId:     &corev1.VpcId{Value: v1.String()},
+			PeerVpcId: &corev1.VpcId{Value: v2.String()},
 		})
 		assert.Equal(t, id, vp.ID)
 		assert.Equal(t, v1, vp.Vpc1ID)
@@ -70,10 +70,10 @@ func TestVpcPeering_FromProto(t *testing.T) {
 		origV1 := uuid.New()
 		origV2 := uuid.New()
 		vp := &VpcPeering{ID: origID, Vpc1ID: origV1, Vpc2ID: origV2}
-		vp.FromProto(&cwssaws.VpcPeering{
-			Id:        &cwssaws.VpcPeeringId{Value: "not-a-uuid"},
+		vp.FromProto(&corev1.VpcPeering{
+			Id:        &corev1.VpcPeeringId{Value: "not-a-uuid"},
 			VpcId:     nil,
-			PeerVpcId: &cwssaws.VpcId{Value: "also-bad"},
+			PeerVpcId: &corev1.VpcId{Value: "also-bad"},
 		})
 		assert.Equal(t, origID, vp.ID)
 		assert.Equal(t, origV1, vp.Vpc1ID)
@@ -331,6 +331,7 @@ func TestVpcPeeringSQLDAO_GetAll(t *testing.T) {
 		isMultiTenant             *bool
 		infrastructureProviderIDs []uuid.UUID
 		tenantIDs                 []uuid.UUID
+		peerTenantIDs             []uuid.UUID
 		statuses                  []string
 
 		expectError bool
@@ -402,6 +403,21 @@ func TestVpcPeeringSQLDAO_GetAll(t *testing.T) {
 			verifyChildSpanner: true,
 		},
 		{
+			desc:               "GetAll with filters on PeerTenantIDs",
+			peerTenantIDs:      []uuid.UUID{tenant2.ID},
+			expectError:        false,
+			expectCount:        1,
+			verifyChildSpanner: true,
+		},
+		{
+			desc:               "GetAll with filters on TenantIDs and PeerTenantIDs",
+			tenantIDs:          []uuid.UUID{tenant.ID},
+			peerTenantIDs:      []uuid.UUID{tenant2.ID},
+			expectError:        false,
+			expectCount:        1,
+			verifyChildSpanner: true,
+		},
+		{
 			desc:               "GetAll with filters on pending statuses",
 			ids:                nil,
 			vpcIDs:             nil,
@@ -462,6 +478,7 @@ func TestVpcPeeringSQLDAO_GetAll(t *testing.T) {
 					IsMultiTenant:             tc.isMultiTenant,
 					InfrastructureProviderIDs: tc.infrastructureProviderIDs,
 					TenantIDs:                 tc.tenantIDs,
+					PeerTenantIDs:             tc.peerTenantIDs,
 					Statuses:                  tc.statuses,
 				},
 				paginator.PageInput{Offset: tc.paramOffset, Limit: tc.paramLimit, OrderBy: tc.paramOrderBy}, tc.includeRelations)

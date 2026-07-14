@@ -15,13 +15,15 @@
  * limitations under the License.
  */
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
+use rustls_pki_types::DnsName;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
@@ -29,6 +31,8 @@ use url::Url;
 #[serde(default)]
 pub struct Config {
     pub endpoint_sources: EndpointSourcesConfig,
+
+    pub tls: TlsConfig,
 
     pub sinks: SinksConfig,
 
@@ -61,6 +65,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             endpoint_sources: EndpointSourcesConfig::default(),
+            tls: TlsConfig::default(),
             sinks: SinksConfig::default(),
             rate_limit: Configurable::Enabled(RateLimitConfig::default()),
             collectors: CollectorsConfig::default(),
@@ -114,12 +119,22 @@ pub struct StaticBmcEndpoint {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticMachineEndpoint {
+    /// Stable NICo machine ID for this BMC endpoint.
     pub id: String,
+
+    /// Optional chassis serial to emit as machine telemetry metadata.
     pub serial: Option<String>,
+
+    /// Optional uniform GPU driver version to emit for local/static validation.
+    pub driver_version: Option<String>,
+
     #[serde(alias = "physical_slot_number")]
     pub slot_number: Option<i32>,
+
     #[serde(alias = "compute_tray_index")]
     pub tray_index: Option<i32>,
+
+    /// Optional NVLink domain UUID associated with this machine.
     pub nvlink_domain_uuid: Option<String>,
 }
 
@@ -154,6 +169,8 @@ pub struct StaticSwitchEndpoint {
     pub endpoint_role: StaticSwitchEndpointRole,
     #[serde(default)]
     pub is_primary: bool,
+    #[serde(default)]
+    pub nmxc_enabled: Option<bool>,
     #[serde(default)]
     pub nmxt_enabled: Option<bool>,
 }
@@ -258,25 +275,69 @@ impl Default for SinksConfig {
     }
 }
 
+impl SinksConfig {
+    /// Returns true when at least one enabled sink consumes log events.
+    pub fn includes_log_events(&self) -> bool {
+        self.tracing.is_enabled() || self.log_file.is_enabled() || self.otlp.is_enabled()
+    }
+
+    /// Returns true when at least one diagnostic-capable sink opts in.
+    pub fn includes_log_diagnostics(&self) -> bool {
+        self.tracing
+            .as_option()
+            .is_some_and(|config| config.include_diagnostics)
+            || self
+                .log_file
+                .as_option()
+                .is_some_and(|config| config.include_diagnostics)
+            || self
+                .otlp
+                .as_option()
+                .is_some_and(OtlpSinkConfig::includes_diagnostics)
+    }
+}
+
+/// Configuration for the tracing sink.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct TracingSinkConfig {}
+pub struct TracingSinkConfig {
+    /// Emit Redfish diagnostic payload fields.
+    ///
+    /// Disabled by default because payload bodies are opaque and may be large or
+    /// sensitive. If no diagnostic-capable sink enables this, collectors do not
+    /// attach diagnostic fields.
+    pub include_diagnostics: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PrometheusSinkConfig {}
 
+/// Configuration for the JSONL log file sink.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogFileSinkConfig {
+    /// Directory where rotated health log files are written.
     pub output_dir: String,
+
+    /// Maximum bytes per active log file before rotation.
     pub max_file_size: u64,
+
+    /// Number of rotated backup files to retain.
     pub max_backups: usize,
+
+    /// Write Redfish diagnostic payload fields.
+    ///
+    /// Disabled by default because payload bodies are opaque and may be large or
+    /// sensitive. If no diagnostic-capable sink enables this, collectors do not
+    /// attach diagnostic fields.
+    pub include_diagnostics: bool,
 }
 
 impl Default for LogFileSinkConfig {
     fn default() -> Self {
         Self {
+            include_diagnostics: false,
             output_dir: "/tmp/logs".to_string(),
             max_file_size: 104_857_600, // 100MB
             max_backups: 5,
@@ -284,22 +345,80 @@ impl Default for LogFileSinkConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configures OTLP/gRPC fan-out to independent targets.
+///
+/// Each supported log and metric is sent to every target. Targets own separate
+/// queues and drain tasks, so a slow or unavailable destination does not block
+/// delivery to another destination.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OtlpSinkConfig {
-    pub endpoint: String,
-    pub batch_size: usize,
-    #[serde(with = "humantime_serde")]
-    pub flush_interval: std::time::Duration,
+    /// Destinations that receive OTLP logs and metrics.
+    ///
+    /// At least one target is required when the sink is enabled.
+    pub targets: Vec<OtlpTargetConfig>,
 }
 
-impl Default for OtlpSinkConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: "http://localhost:4317".to_string(),
-            batch_size: 512,
-            flush_interval: std::time::Duration::from_secs(2),
+impl OtlpSinkConfig {
+    fn includes_diagnostics(&self) -> bool {
+        self.targets.iter().any(|target| target.include_diagnostics)
+    }
+}
+
+/// Delivery and batching policy for one OTLP/gRPC destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtlpTargetConfig {
+    /// Endpoint URI that receives both logs and metrics over OTLP/gRPC.
+    pub endpoint: String,
+
+    /// Maximum number of events or samples exported per request. Defaults to
+    /// 512.
+    #[serde(default = "OtlpTargetConfig::default_batch_size")]
+    pub batch_size: usize,
+
+    /// Maximum time to wait before flushing a non-empty batch for either
+    /// signal. Defaults to two seconds.
+    #[serde(
+        default = "OtlpTargetConfig::default_flush_interval",
+        with = "humantime_serde"
+    )]
+    pub flush_interval: std::time::Duration,
+
+    /// Export Redfish diagnostic payload fields to this target.
+    ///
+    /// Disabled by default because payload bodies are opaque and may be large or
+    /// sensitive. If no diagnostic-capable sink enables diagnostics, collectors
+    /// do not attach diagnostic fields. OTLP exports parent logs normally and
+    /// keeps diagnostics as latest-wins per endpoint while the drain is backed
+    /// up.
+    #[serde(default)]
+    pub include_diagnostics: bool,
+}
+
+impl OtlpTargetConfig {
+    fn default_batch_size() -> usize {
+        512
+    }
+
+    fn default_flush_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(2)
+    }
+
+    fn validate(&self, index: usize) -> Result<(), String> {
+        let path = format!("sinks.otlp.targets[{index}]");
+
+        if self.batch_size == 0 {
+            return Err(format!("{path}.batch_size must be greater than 0"));
         }
+
+        if self.flush_interval.is_zero() {
+            return Err(format!("{path}.flush_interval must be greater than 0"));
+        }
+
+        tonic::transport::Channel::from_shared(self.endpoint.clone())
+            .map_err(|_| format!("invalid {path}.endpoint: {}", self.endpoint))?;
+
+        Ok(())
     }
 }
 
@@ -472,6 +591,9 @@ pub struct CollectorsConfig {
     /// Switch NMX-T collector configuration (if present, nmxt collector is enabled)
     pub nmxt: Configurable<NmxtCollectorConfig>,
 
+    /// NMX-C streaming collector configuration.
+    pub nmxc: Configurable<NmxcCollectorConfig>,
+
     /// NVUE collector configuration for direct NVUE HTTP(s) polling of NVLink switches
     pub nvue: Configurable<NvueCollectorConfig>,
 }
@@ -486,8 +608,87 @@ impl Default for CollectorsConfig {
             leak_detector: Configurable::Enabled(LeakDetectorCollectorConfig::default()),
             logs: Configurable::Disabled,
             nmxt: Configurable::Disabled,
+            nmxc: Configurable::Disabled,
             nvue: Configurable::Disabled,
         }
+    }
+}
+
+/// TLS settings owned by hardware-health.
+///
+/// This section is intentionally outside `[collectors]` because TLS material is
+/// connection policy shared by multiple collectors, not a collector itself.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Optional mTLS profile used by direct switch collectors.
+    pub switch: Option<MtlsProfileConfig>,
+}
+
+/// mTLS profile for outbound client TLS connections.
+///
+/// `[tls.switch]` uses this shape for direct switch collector connections.
+/// These paths are independent from the Carbide API certificate paths. The
+/// files are read and validated when collectors build HTTP clients or gRPC
+/// channel TLS configs. The optional TLS server name is profile-wide because
+/// deployed switch certificates use the same DNS identity, and Carbide API
+/// discovery does not provide switch certificate identities.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MtlsProfileConfig {
+    /// Path to the CA bundle used to verify switch server certificates.
+    pub ca_cert_path: PathBuf,
+
+    /// Path to the client certificate chain sent to switch services.
+    pub client_cert_path: PathBuf,
+
+    /// Path to the client private key sent to switch services.
+    pub client_key_path: PathBuf,
+
+    /// Optional DNS name used only for TLS SNI and server certificate checks.
+    ///
+    /// Direct switch collectors still open TCP connections to each discovered
+    /// switch endpoint IP. When all switch server certificates carry the same
+    /// DNS subjectAltName, set this field so TLS verifies that DNS identity
+    /// instead of requiring every switch certificate to include an IP SAN.
+    /// This value is never used for endpoint discovery or DNS resolution.
+    ///
+    /// For HTTP collectors, the request URL and HTTP Host header stay on the
+    /// discovered switch IP. Only the TLS server name changes.
+    pub tls_server_name: Option<String>,
+}
+
+impl MtlsProfileConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.ca_cert_path.as_os_str().is_empty() {
+            return Err("[tls.switch].ca_cert_path must not be empty".to_string());
+        }
+
+        if self.client_cert_path.as_os_str().is_empty() {
+            return Err("[tls.switch].client_cert_path must not be empty".to_string());
+        }
+
+        if self.client_key_path.as_os_str().is_empty() {
+            return Err("[tls.switch].client_key_path must not be empty".to_string());
+        }
+
+        if let Some(tls_server_name) = self.tls_server_name.as_deref() {
+            if tls_server_name.trim().is_empty() {
+                return Err("[tls.switch].tls_server_name must not be empty".to_string());
+            }
+
+            if tls_server_name.trim() != tls_server_name {
+                return Err(
+                    "[tls.switch].tls_server_name must not contain leading or trailing whitespace"
+                        .to_string(),
+                );
+            }
+
+            DnsName::try_from(tls_server_name)
+                .map_err(|_| "[tls.switch].tls_server_name must be a valid DNS name".to_string())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -862,6 +1063,11 @@ pub struct NmxtCollectorConfig {
     /// Timeout for individual NMX-T HTTP requests.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
+
+    /// Dangerously disable TLS certificate verification for NMX-T HTTPS requests.
+    ///
+    /// Defaults to false so strict TLS verification remains the default.
+    pub dangerously_skip_tls_verification: bool,
 }
 
 impl Default for NmxtCollectorConfig {
@@ -869,7 +1075,114 @@ impl Default for NmxtCollectorConfig {
         Self {
             scrape_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            dangerously_skip_tls_verification: false,
         }
+    }
+}
+
+const DEFAULT_NMX_C_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_NMX_C_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Configuration for streaming NMX-C controller notifications from switch hosts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NmxcCollectorConfig {
+    /// NMX-C gRPC port on switch host endpoints.
+    pub grpc_port: u16,
+
+    /// `gateway_id` value sent in NMX-C requests.
+    pub gateway_id: String,
+
+    /// Whether NMX-C should notify this client about changes caused by this gateway.
+    pub notify_on_self_change: bool,
+
+    /// Heartbeat rate value sent to `Subscribe`; NMX-C uses it to send `DomainStateInfo`.
+    pub heartbeat_rate: u32,
+
+    /// Optional TCP connect timeout for the switch-host NMX-C gRPC endpoint.
+    #[serde(with = "humantime_serde::option", default)]
+    pub connect_timeout: Option<Duration>,
+
+    /// Optional timeout for NMX-C Hello, Subscribe, and initial Subscribe acknowledgement.
+    #[serde(with = "humantime_serde::option", default)]
+    pub rpc_timeout: Option<Duration>,
+
+    /// Initial retry backoff after a streaming connection failure.
+    #[serde(with = "humantime_serde")]
+    pub initial_backoff: Duration,
+
+    /// Maximum retry backoff after repeated streaming connection failures.
+    #[serde(with = "humantime_serde")]
+    pub max_backoff: Duration,
+}
+
+impl Default for NmxcCollectorConfig {
+    fn default() -> Self {
+        Self {
+            grpc_port: 9370,
+            gateway_id: "hw-health".to_string(),
+            notify_on_self_change: false,
+            heartbeat_rate: 30,
+            connect_timeout: None,
+            rpc_timeout: None,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+impl NmxcCollectorConfig {
+    /// Returns the configured NMX-C connect timeout, or the default when unset.
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+            .unwrap_or(DEFAULT_NMX_C_CONNECT_TIMEOUT)
+    }
+
+    /// Returns the configured NMX-C RPC timeout, or the default when unset.
+    pub(crate) fn rpc_timeout(&self) -> Duration {
+        self.rpc_timeout.unwrap_or(DEFAULT_NMX_C_RPC_TIMEOUT)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.grpc_port == 0 {
+            return Err("[collectors.nmxc].grpc_port must be greater than 0".to_string());
+        }
+
+        if self.gateway_id.trim().is_empty() {
+            return Err("[collectors.nmxc].gateway_id must not be empty".to_string());
+        }
+
+        if self.heartbeat_rate == 0 {
+            return Err("[collectors.nmxc].heartbeat_rate must be greater than 0".to_string());
+        }
+
+        if self
+            .connect_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err("[collectors.nmxc].connect_timeout must be greater than 0".to_string());
+        }
+
+        if self.rpc_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err("[collectors.nmxc].rpc_timeout must be greater than 0".to_string());
+        }
+
+        if self.initial_backoff.is_zero() {
+            return Err("[collectors.nmxc].initial_backoff must be greater than 0".to_string());
+        }
+
+        if self.max_backoff.is_zero() {
+            return Err("[collectors.nmxc].max_backoff must be greater than 0".to_string());
+        }
+
+        if self.max_backoff < self.initial_backoff {
+            return Err(
+                "[collectors.nmxc].max_backoff must be greater than or equal to initial_backoff"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -903,6 +1216,11 @@ pub struct NvueGnmiConfig {
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
 
+    /// Dangerously disable TLS certificate and hostname verification for NVUE gNMI.
+    ///
+    /// Defaults to false so strict TLS verification remains the default.
+    pub dangerously_skip_tls_verification: bool,
+
     /// Enable gNMI ON_CHANGE subscription for live system-event messages.
     #[serde(alias = "system_events_subscription_enabled", alias = "events_enabled")]
     pub system_events_enabled: bool,
@@ -917,6 +1235,7 @@ impl Default for NvueGnmiConfig {
             gnmi_port: 9339,
             sample_interval: Duration::from_secs(300),
             request_timeout: Duration::from_secs(30),
+            dangerously_skip_tls_verification: false,
             system_events_enabled: true,
             paths: NvueGnmiPaths::default(),
         }
@@ -928,6 +1247,7 @@ impl Default for NvueGnmiConfig {
 pub struct NvueGnmiPaths {
     pub components_enabled: bool,
     pub interfaces_enabled: bool,
+    pub platform_general_enabled: bool,
 }
 
 impl Default for NvueGnmiPaths {
@@ -935,6 +1255,7 @@ impl Default for NvueGnmiPaths {
         Self {
             components_enabled: true,
             interfaces_enabled: true,
+            platform_general_enabled: true,
         }
     }
 }
@@ -966,25 +1287,45 @@ impl Default for NvueRestConfig {
 
 /// Supported NVUE REST API paths.
 /// - system_health_enabled: Poll `/nvue_v1/system/health`.
+/// - system_reboot_reason_enabled: Poll `/nvue_v1/system/reboot/reason`.
 /// - cluster_apps_enabled: Poll `/nvue_v1/cluster/apps`.
 /// - sdn_partitions_enabled: Poll `/nvue_v1/sdn/partition` (including per-partition details)
 /// - interfaces_enabled: Poll `/nvue_v1/interface`.
+/// - platform_environment_fan_enabled: Poll `/nvue_v1/platform/environment/fan`.
+/// - platform_environment_temperature_enabled: Poll `/nvue_v1/platform/environment/temperature`.
+/// - platform_environment_leakage_enabled: Poll `/nvue_v1/platform/environment/leakage`.
+/// - platform_environment_status_enabled: Poll `/nvue_v1/platform/environment` parent
+///   summary for the aggregate `FAN_STATUS` LED state.
+///
+/// Disabling a flag skips the HTTP request. This is separate from leakage
+/// returning top-level JSON `null`, which still means the path was polled and
+/// should produce an explicit health-report result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NvueRestPaths {
     pub system_health_enabled: bool,
+    pub system_reboot_reason_enabled: bool,
     pub cluster_apps_enabled: bool,
     pub sdn_partitions_enabled: bool,
     pub interfaces_enabled: bool,
+    pub platform_environment_fan_enabled: bool,
+    pub platform_environment_temperature_enabled: bool,
+    pub platform_environment_leakage_enabled: bool,
+    pub platform_environment_status_enabled: bool,
 }
 
 impl Default for NvueRestPaths {
     fn default() -> Self {
         Self {
             system_health_enabled: true,
+            system_reboot_reason_enabled: true,
             cluster_apps_enabled: true,
             sdn_partitions_enabled: true,
             interfaces_enabled: true,
+            platform_environment_fan_enabled: true,
+            platform_environment_temperature_enabled: true,
+            platform_environment_leakage_enabled: true,
+            platform_environment_status_enabled: true,
         }
     }
 }
@@ -1114,9 +1455,50 @@ impl Config {
             logs.validate()?;
         }
 
+        if let Some(tls_config) = &self.tls.switch {
+            tls_config.validate()?;
+
+            if let Configurable::Enabled(nmxt) = &self.collectors.nmxt
+                && nmxt.dangerously_skip_tls_verification
+            {
+                return Err(
+                    "[collectors.nmxt].dangerously_skip_tls_verification must be false when [tls.switch] is configured"
+                        .to_string(),
+                );
+            }
+
+            if let Configurable::Enabled(nvue) = &self.collectors.nvue
+                && let Configurable::Enabled(gnmi) = &nvue.gnmi
+                && gnmi.dangerously_skip_tls_verification
+            {
+                return Err(
+                    "[collectors.nvue.gnmi].dangerously_skip_tls_verification must be false when [tls.switch] is configured"
+                        .to_string(),
+                );
+            }
+        }
+
+        if let Configurable::Enabled(nmxc) = &self.collectors.nmxc {
+            nmxc.validate()?;
+        }
+
         if let Configurable::Enabled(ref otlp) = self.sinks.otlp {
-            tonic::transport::Channel::from_shared(otlp.endpoint.clone())
-                .map_err(|_| format!("invalid sinks.otlp.endpoint: {}", otlp.endpoint))?;
+            if otlp.targets.is_empty() {
+                return Err("sinks.otlp.targets must not be empty".to_string());
+            }
+
+            let mut endpoints = HashSet::new();
+
+            for (index, target) in otlp.targets.iter().enumerate() {
+                target.validate(index)?;
+
+                if !endpoints.insert(target.endpoint.as_str()) {
+                    return Err(format!(
+                        "sinks.otlp.targets[{index}].endpoint must be unique: {}",
+                        target.endpoint
+                    ));
+                }
+            }
         }
 
         self.metrics_addr()?;
@@ -1184,6 +1566,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::value_scenarios;
+
     use super::*;
 
     #[test]
@@ -1235,6 +1619,7 @@ mod tests {
         assert!(config.collectors.leak_detector.is_enabled());
         assert!(config.collectors.logs.is_enabled());
         assert!(config.collectors.nvue.is_enabled());
+        assert!(!config.collectors.nmxc.is_enabled());
         assert!(!config.sinks.tracing.is_enabled());
         assert!(config.sinks.prometheus.is_enabled());
 
@@ -1301,6 +1686,7 @@ mod tests {
                 assert_eq!(gnmi.gnmi_port, 9339);
                 assert_eq!(gnmi.sample_interval, Duration::from_secs(300));
                 assert_eq!(gnmi.request_timeout, Duration::from_secs(30));
+                assert!(!gnmi.dangerously_skip_tls_verification);
                 assert!(gnmi.system_events_enabled);
             } else {
                 panic!("nvue gnmi config should be enabled in example config");
@@ -1381,6 +1767,7 @@ cache_size = 50
         assert!(!config.collectors.firmware.is_enabled());
         assert!(config.collectors.leak_detector.is_enabled());
         assert!(!config.collectors.logs.is_enabled());
+        assert!(!config.collectors.nmxc.is_enabled());
         assert!(config.processors.leak_detection.is_enabled());
 
         config.validate().expect("config should be valid");
@@ -1513,14 +1900,316 @@ username = "root"
         config.collectors.logs = Configurable::Disabled;
         assert!(config.validate().is_ok());
 
-        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
-            endpoint: "not a valid uri\n".to_string(),
-            ..OtlpSinkConfig::default()
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+            grpc_port: 0,
+            ..NmxcCollectorConfig::default()
         });
+
+        assert!(config.validate().is_err());
+
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+            gateway_id: " ".to_string(),
+            ..NmxcCollectorConfig::default()
+        });
+
+        assert!(config.validate().is_err());
+
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+            heartbeat_rate: 0,
+            ..NmxcCollectorConfig::default()
+        });
+
+        assert!(config.validate().is_err());
+
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+            max_backoff: Duration::from_millis(500),
+            initial_backoff: Duration::from_secs(1),
+            ..NmxcCollectorConfig::default()
+        });
+
+        assert!(config.validate().is_err());
+
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig::default());
+
+        assert!(config.validate().is_ok());
+
+        config.collectors.nmxc = Configurable::Disabled;
+
+        assert!(config.validate().is_ok());
+
+        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+            targets: vec![OtlpTargetConfig {
+                endpoint: "not a valid uri\n".to_string(),
+                batch_size: 512,
+                flush_interval: Duration::from_secs(2),
+                include_diagnostics: false,
+            }],
+        });
+
         assert!(config.validate().is_err());
 
         config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig::default());
+
+        assert!(config.validate().is_err());
+
+        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+            targets: vec![OtlpTargetConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                batch_size: 512,
+                flush_interval: Duration::from_secs(2),
+                include_diagnostics: false,
+            }],
+        });
+
         assert!(config.validate().is_ok());
+    }
+
+    /// Verifies each diagnostic-capable sink parses the opt-in flag.
+    #[test]
+    fn test_sink_include_diagnostics_configs_parse() {
+        let tracing: TracingSinkConfig = Figment::new()
+            .merge(Toml::string("include_diagnostics = true"))
+            .extract()
+            .expect("tracing config should parse");
+        let log_file: LogFileSinkConfig = Figment::new()
+            .merge(Toml::string("include_diagnostics = true"))
+            .extract()
+            .expect("log file config should parse");
+        let otlp: OtlpSinkConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+[[targets]]
+endpoint = "http://localhost:4317"
+include_diagnostics = true
+"#,
+            ))
+            .extract()
+            .expect("otlp config should parse");
+
+        assert!(tracing.include_diagnostics);
+        assert!(log_file.include_diagnostics);
+        assert!(otlp.includes_diagnostics());
+        assert!(!TracingSinkConfig::default().include_diagnostics);
+        assert!(!LogFileSinkConfig::default().include_diagnostics);
+        assert!(!OtlpSinkConfig::default().includes_diagnostics());
+    }
+
+    #[test]
+    fn otlp_target_list_parses_independent_settings() {
+        let otlp: OtlpSinkConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+[[targets]]
+endpoint = "http://site.example:4317"
+
+[[targets]]
+endpoint = "https://central.example:4317"
+batch_size = 1024
+flush_interval = "5s"
+include_diagnostics = true
+"#,
+            ))
+            .extract()
+            .expect("multi-target OTLP config should parse");
+
+        let targets = &otlp.targets;
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].batch_size, 512);
+        assert_eq!(targets[0].flush_interval, Duration::from_secs(2));
+        assert_eq!(targets[1].batch_size, 1024);
+        assert_eq!(targets[1].flush_interval, Duration::from_secs(5));
+        assert!(targets[1].include_diagnostics);
+
+        let mut config = Config::default();
+
+        config.sinks.otlp = Configurable::Enabled(otlp);
+
+        config
+            .validate()
+            .expect("multi-target OTLP config should validate");
+    }
+
+    #[test]
+    fn otlp_target_list_rejects_invalid_target_contracts() {
+        struct TestCase {
+            name: &'static str,
+            toml: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = [
+            TestCase {
+                name: "empty list",
+                toml: "targets = []",
+                expected: "sinks.otlp.targets must not be empty",
+            },
+            TestCase {
+                name: "zero batch size",
+                toml: r#"
+[[targets]]
+endpoint = "http://site.example:4317"
+batch_size = 0
+"#,
+                expected: "sinks.otlp.targets[0].batch_size must be greater than 0",
+            },
+            TestCase {
+                name: "duplicate endpoint",
+                toml: r#"
+[[targets]]
+endpoint = "http://site.example:4317"
+
+[[targets]]
+endpoint = "http://site.example:4317"
+"#,
+                expected: "sinks.otlp.targets[1].endpoint must be unique: http://site.example:4317",
+            },
+        ];
+
+        for case in cases {
+            let otlp: OtlpSinkConfig = Figment::new()
+                .merge(Toml::string(case.toml))
+                .extract()
+                .expect(case.name);
+
+            let mut config = Config::default();
+            config.sinks.otlp = Configurable::Enabled(otlp);
+
+            let error = config.validate().expect_err(case.name);
+
+            assert_eq!(error, case.expected, "{}", case.name);
+        }
+    }
+
+    /// Verifies collectors attach diagnostics only when a capable sink opts in.
+    #[test]
+    fn test_sinks_config_includes_log_diagnostics() {
+        let cases = [
+            ("default", SinksConfig::default(), false),
+            (
+                "diagnostic-capable-sinks-enabled-without-diagnostics",
+                SinksConfig {
+                    tracing: Configurable::Enabled(TracingSinkConfig::default()),
+                    log_file: Configurable::Enabled(LogFileSinkConfig::default()),
+                    otlp: Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![OtlpTargetConfig {
+                            endpoint: "http://localhost:4317".to_string(),
+                            batch_size: 512,
+                            flush_interval: Duration::from_secs(2),
+                            include_diagnostics: false,
+                        }],
+                    }),
+                    ..SinksConfig::default()
+                },
+                false,
+            ),
+            (
+                "tracing-diagnostics",
+                SinksConfig {
+                    tracing: Configurable::Enabled(TracingSinkConfig {
+                        include_diagnostics: true,
+                    }),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+            (
+                "log-file-diagnostics",
+                SinksConfig {
+                    log_file: Configurable::Enabled(LogFileSinkConfig {
+                        include_diagnostics: true,
+                        ..LogFileSinkConfig::default()
+                    }),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+            (
+                "otlp-diagnostics",
+                SinksConfig {
+                    otlp: Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![OtlpTargetConfig {
+                            endpoint: "http://localhost:4317".to_string(),
+                            batch_size: 512,
+                            flush_interval: Duration::from_secs(2),
+                            include_diagnostics: true,
+                        }],
+                    }),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+            (
+                "one-of-multiple-otlp-targets-enables-diagnostics",
+                SinksConfig {
+                    otlp: Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![
+                            OtlpTargetConfig {
+                                endpoint: "http://site.example:4317".to_string(),
+                                batch_size: 512,
+                                flush_interval: Duration::from_secs(2),
+                                include_diagnostics: false,
+                            },
+                            OtlpTargetConfig {
+                                endpoint: "http://central.example:4317".to_string(),
+                                batch_size: 512,
+                                flush_interval: Duration::from_secs(2),
+                                include_diagnostics: true,
+                            },
+                        ],
+                    }),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+        ];
+
+        for (name, sinks, expected) in cases {
+            assert_eq!(sinks.includes_log_diagnostics(), expected, "{name}");
+        }
+    }
+
+    /// Verifies log-only collectors run only when a sink consumes log events.
+    #[test]
+    fn test_sinks_config_includes_log_events() {
+        let cases = [
+            ("default", SinksConfig::default(), false),
+            (
+                "tracing",
+                SinksConfig {
+                    tracing: Configurable::Enabled(TracingSinkConfig::default()),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+            (
+                "log-file",
+                SinksConfig {
+                    log_file: Configurable::Enabled(LogFileSinkConfig::default()),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+            (
+                "otlp",
+                SinksConfig {
+                    otlp: Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![OtlpTargetConfig {
+                            endpoint: "http://localhost:4317".to_string(),
+                            batch_size: 512,
+                            flush_interval: Duration::from_secs(2),
+                            include_diagnostics: false,
+                        }],
+                    }),
+                    ..SinksConfig::default()
+                },
+                true,
+            ),
+        ];
+
+        for (name, sinks, expected) in cases {
+            assert_eq!(sinks.includes_log_events(), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1533,6 +2222,7 @@ username = "root"
         assert!(config.rate_limit.is_enabled());
         assert!(config.processors.leak_detection.is_enabled());
         assert!(config.collectors.leak_detector.is_enabled());
+        assert!(!config.collectors.nmxc.is_enabled());
         assert!(!config.collectors.nvue.is_enabled());
         if let Configurable::Enabled(ref health_report) = config.sinks.health_report {
             assert!(health_report.skip_empty_reports);
@@ -1570,10 +2260,107 @@ skip_empty_reports = false
             assert_eq!(rest.poll_interval, Duration::from_secs(300));
             assert_eq!(rest.request_timeout, Duration::from_secs(30));
             assert!(rest.paths.system_health_enabled);
+            assert!(rest.paths.system_reboot_reason_enabled);
             assert!(rest.paths.cluster_apps_enabled);
             assert!(rest.paths.sdn_partitions_enabled);
             assert!(rest.paths.interfaces_enabled);
+            assert!(rest.paths.platform_environment_leakage_enabled);
         }
+    }
+
+    #[test]
+    fn test_nmxc_config_defaults() {
+        let defaults = NmxcCollectorConfig::default();
+
+        assert_eq!(defaults.grpc_port, 9370);
+        assert_eq!(defaults.gateway_id, "hw-health");
+        assert!(!defaults.notify_on_self_change);
+        assert_eq!(defaults.heartbeat_rate, 30);
+        assert_eq!(defaults.connect_timeout, None);
+        assert_eq!(defaults.rpc_timeout, None);
+        assert_eq!(defaults.connect_timeout(), Duration::from_secs(10));
+        assert_eq!(defaults.rpc_timeout(), Duration::from_secs(10));
+        assert_eq!(defaults.initial_backoff, Duration::from_secs(1));
+        assert_eq!(defaults.max_backoff, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_nmxc_config_parsing() {
+        let toml_content = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[collectors.nmxc]
+grpc_port = 9602
+gateway_id = "health-service"
+notify_on_self_change = true
+heartbeat_rate = 15
+connect_timeout = "3s"
+rpc_timeout = "4s"
+initial_backoff = "2s"
+max_backoff = "20s"
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml_content))
+            .extract()
+            .expect("failed to parse nmxc config");
+
+        if let Configurable::Enabled(ref nmxc) = config.collectors.nmxc {
+            assert_eq!(nmxc.grpc_port, 9602);
+            assert_eq!(nmxc.gateway_id, "health-service");
+            assert!(nmxc.notify_on_self_change);
+            assert_eq!(nmxc.heartbeat_rate, 15);
+            assert_eq!(nmxc.connect_timeout, Some(Duration::from_secs(3)));
+            assert_eq!(nmxc.rpc_timeout, Some(Duration::from_secs(4)));
+            assert_eq!(nmxc.connect_timeout(), Duration::from_secs(3));
+            assert_eq!(nmxc.rpc_timeout(), Duration::from_secs(4));
+            assert_eq!(nmxc.initial_backoff, Duration::from_secs(2));
+            assert_eq!(nmxc.max_backoff, Duration::from_secs(20));
+        } else {
+            panic!("nmxc config should be enabled");
+        }
+    }
+
+    #[test]
+    fn test_nmxc_transport_config_validation() {
+        value_scenarios!(
+            run = |config: NmxcCollectorConfig| config.validate().is_ok();
+
+            "NMX-C transport validation" {
+                NmxcCollectorConfig::default() => true,
+
+                NmxcCollectorConfig {
+                    connect_timeout: Some(Duration::ZERO),
+                    ..NmxcCollectorConfig::default()
+                } => false,
+
+                NmxcCollectorConfig {
+                    rpc_timeout: Some(Duration::ZERO),
+                    ..NmxcCollectorConfig::default()
+                } => false,
+
+                NmxcCollectorConfig {
+                    initial_backoff: Duration::ZERO,
+                    ..NmxcCollectorConfig::default()
+                } => false,
+
+                NmxcCollectorConfig {
+                    max_backoff: Duration::ZERO,
+                    ..NmxcCollectorConfig::default()
+                } => false,
+
+                NmxcCollectorConfig {
+                    initial_backoff: Duration::from_secs(30),
+                    max_backoff: Duration::from_secs(1),
+                    ..NmxcCollectorConfig::default()
+                } => false,
+            }
+        );
     }
 
     #[test]
@@ -1603,6 +2390,8 @@ request_timeout = "45s"
                 assert_eq!(rest.poll_interval, Duration::from_secs(120));
                 assert_eq!(rest.request_timeout, Duration::from_secs(45));
                 assert!(rest.paths.system_health_enabled);
+                assert!(rest.paths.system_reboot_reason_enabled);
+                assert!(rest.paths.platform_environment_leakage_enabled);
             } else {
                 panic!("nvue rest config should be enabled");
             }
@@ -1678,9 +2467,11 @@ poll_interval = "1m"
 
 [collectors.nvue.rest.paths]
 system_health_enabled = true
+system_reboot_reason_enabled = false
 cluster_apps_enabled = false
 sdn_partitions_enabled = true
 interfaces_enabled = false
+platform_environment_leakage_enabled = false
 "#;
 
         let config: Config = Figment::new()
@@ -1692,9 +2483,11 @@ interfaces_enabled = false
         if let Configurable::Enabled(ref nvue) = config.collectors.nvue {
             if let Configurable::Enabled(ref rest) = nvue.rest {
                 assert!(rest.paths.system_health_enabled);
+                assert!(!rest.paths.system_reboot_reason_enabled);
                 assert!(!rest.paths.cluster_apps_enabled);
                 assert!(rest.paths.sdn_partitions_enabled);
                 assert!(!rest.paths.interfaces_enabled);
+                assert!(!rest.paths.platform_environment_leakage_enabled);
             } else {
                 panic!("nvue rest config should be enabled");
             }
@@ -1732,6 +2525,335 @@ system_events_enabled = false
         } else {
             panic!("nvue config should be enabled");
         }
+    }
+
+    #[test]
+    fn test_nmxt_dangerous_tls_skip_defaults_false_and_parses_true() {
+        assert!(!NmxtCollectorConfig::default().dangerously_skip_tls_verification);
+
+        let omitted = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[collectors.nmxt]
+"#;
+        let enabled = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[collectors.nmxt]
+dangerously_skip_tls_verification = true
+"#;
+
+        for (toml, expected) in [(omitted, false), (enabled, true)] {
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(toml))
+                .extract()
+                .expect("failed to parse NMX-T TLS flag");
+            let Configurable::Enabled(nmxt) = config.collectors.nmxt else {
+                panic!("nmxt config should be enabled");
+            };
+            assert_eq!(nmxt.dangerously_skip_tls_verification, expected);
+        }
+    }
+
+    #[test]
+    fn test_tls_switch_profile_absent_by_default_and_does_not_reuse_api_cert_paths() {
+        let config = Config::default();
+
+        assert!(config.tls.switch.is_none());
+
+        let Configurable::Enabled(carbide_api) = config.endpoint_sources.carbide_api else {
+            panic!("carbide api endpoint source should be enabled by default");
+        };
+
+        assert_eq!(carbide_api.root_ca, "/var/run/secrets/spiffe.io/ca.crt");
+
+        assert_eq!(
+            carbide_api.client_cert,
+            "/var/run/secrets/spiffe.io/tls.crt"
+        );
+
+        assert_eq!(carbide_api.client_key, "/var/run/secrets/spiffe.io/tls.key");
+    }
+
+    #[test]
+    fn test_tls_switch_profile_parses_independent_paths() {
+        let toml = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[tls.switch]
+ca_cert_path = "/var/run/secrets/switch-mtls/ca.crt"
+client_cert_path = "/var/run/secrets/switch-mtls/tls.crt"
+client_key_path = "/var/run/secrets/switch-mtls/tls.key"
+tls_server_name = "switches.example.forge"
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("failed to parse mTLS profile config");
+
+        config
+            .validate()
+            .expect("mTLS profile config should validate");
+
+        let tls_config = config
+            .tls
+            .switch
+            .expect("mTLS profile config should be present");
+
+        assert_eq!(
+            tls_config.ca_cert_path,
+            PathBuf::from("/var/run/secrets/switch-mtls/ca.crt")
+        );
+
+        assert_eq!(
+            tls_config.client_cert_path,
+            PathBuf::from("/var/run/secrets/switch-mtls/tls.crt")
+        );
+
+        assert_eq!(
+            tls_config.client_key_path,
+            PathBuf::from("/var/run/secrets/switch-mtls/tls.key")
+        );
+
+        assert_eq!(
+            tls_config.tls_server_name.as_deref(),
+            Some("switches.example.forge")
+        );
+    }
+
+    #[test]
+    fn test_tls_switch_profile_rejects_incomplete_or_unknown_fields() {
+        struct TestCase {
+            name: &'static str,
+            toml: &'static str,
+        }
+
+        let cases = [
+            TestCase {
+                name: "missing CA",
+                toml: r#"
+[tls.switch]
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+"#,
+            },
+            TestCase {
+                name: "missing client cert",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_key_path = "/switch/tls.key"
+"#,
+            },
+            TestCase {
+                name: "missing client key",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+"#,
+            },
+            TestCase {
+                name: "unknown field",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+root_ca = "/var/run/secrets/spiffe.io/ca.crt"
+"#,
+            },
+        ];
+
+        for case in cases {
+            let result = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(case.toml))
+                .extract::<Config>();
+
+            assert!(result.is_err(), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_tls_switch_rejects_empty_paths_and_dangerous_tls_bypass() {
+        struct TestCase {
+            name: &'static str,
+            toml: &'static str,
+            expected: &'static str,
+        }
+
+        let base = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+"#;
+        let cases = [
+            TestCase {
+                name: "empty CA path",
+                toml: r#"
+[tls.switch]
+ca_cert_path = ""
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+"#,
+                expected: "[tls.switch].ca_cert_path must not be empty",
+            },
+            TestCase {
+                name: "empty TLS server name",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+tls_server_name = " "
+"#,
+                expected: "[tls.switch].tls_server_name must not be empty",
+            },
+            TestCase {
+                name: "TLS server name with surrounding whitespace",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+tls_server_name = " switches.example.forge "
+"#,
+                expected: "[tls.switch].tls_server_name must not contain leading or trailing whitespace",
+            },
+            TestCase {
+                name: "invalid TLS server name",
+                toml: r#"
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+tls_server_name = "not a dns name"
+"#,
+                expected: "[tls.switch].tls_server_name must be a valid DNS name",
+            },
+            TestCase {
+                name: "NMX-T dangerous skip conflict",
+                toml: r#"
+[collectors.nmxt]
+dangerously_skip_tls_verification = true
+
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+"#,
+                expected: "[collectors.nmxt].dangerously_skip_tls_verification must be false when [tls.switch] is configured",
+            },
+            TestCase {
+                name: "gNMI dangerous skip conflict",
+                toml: r#"
+[collectors.nvue.gnmi]
+dangerously_skip_tls_verification = true
+
+[tls.switch]
+ca_cert_path = "/switch/ca.crt"
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+"#,
+                expected: "[collectors.nvue.gnmi].dangerously_skip_tls_verification must be false when [tls.switch] is configured",
+            },
+        ];
+
+        for case in cases {
+            let toml = format!("{base}{}", case.toml);
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(&toml))
+                .extract()
+                .expect(case.name);
+
+            let error = config.validate().expect_err(case.name);
+
+            assert_eq!(error, case.expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_example_config_documents_platform_environment_fan_toggle() {
+        let toml_content = include_str!("../example/config.example.toml");
+
+        assert!(
+            toml_content
+                .lines()
+                .any(|line| line == "platform_environment_fan_enabled = true")
+        );
+    }
+
+    #[test]
+    fn test_nvue_gnmi_dangerous_tls_skip_defaults_false_and_parses_true() {
+        let omitted = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[collectors.nvue.gnmi]
+gnmi_port = 9339
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(omitted))
+            .extract()
+            .expect("failed to parse omitted tls flag");
+
+        let Configurable::Enabled(nvue) = config.collectors.nvue else {
+            panic!("nvue config should be enabled");
+        };
+        let Configurable::Enabled(gnmi) = nvue.gnmi else {
+            panic!("gnmi config should be enabled");
+        };
+        assert!(!gnmi.dangerously_skip_tls_verification);
+
+        let enabled = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[collectors.nvue.gnmi]
+gnmi_port = 9339
+dangerously_skip_tls_verification = true
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(enabled))
+            .extract()
+            .expect("failed to parse enabled tls flag");
+
+        let Configurable::Enabled(nvue) = config.collectors.nvue else {
+            panic!("nvue config should be enabled");
+        };
+        let Configurable::Enabled(gnmi) = nvue.gnmi else {
+            panic!("gnmi config should be enabled");
+        };
+        assert!(gnmi.dangerously_skip_tls_verification);
     }
 
     #[test]
@@ -1874,11 +2996,12 @@ switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
 
         assert_eq!(switch.endpoint_role, StaticSwitchEndpointRole::Host);
         assert!(switch.is_primary);
+        assert_eq!(switch.nmxc_enabled, None);
         assert_eq!(switch.nmxt_enabled, None);
     }
 
     #[test]
-    fn test_static_switch_host_accepts_nmxt_override() {
+    fn test_static_switch_host_accepts_nmx_collector_overrides() {
         let toml_content = r#"
 [endpoint_sources.carbide_api]
 enabled = false
@@ -1888,7 +3011,7 @@ ip = "10.0.1.2"
 mac = "11:22:33:44:55:77"
 username = "admin"
 password = "pass"
-switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SW-002", endpoint_role = "host", is_primary = false, nmxt_enabled = true }
+switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SW-002", endpoint_role = "host", is_primary = false, nmxc_enabled = true, nmxt_enabled = true }
 "#;
 
         let config: Config = Figment::new()
@@ -1904,6 +3027,7 @@ switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
 
         assert_eq!(switch.endpoint_role, StaticSwitchEndpointRole::Host);
         assert!(!switch.is_primary);
+        assert_eq!(switch.nmxc_enabled, Some(true));
         assert_eq!(switch.nmxt_enabled, Some(true));
     }
 
@@ -1918,7 +3042,7 @@ ip = "10.0.1.2"
 mac = "11:22:33:44:55:11"
 username = "admin"
 password = "pass"
-machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "MN-001", slot_number = 15, tray_index = 5, nvlink_domain_uuid = "00000000-0000-0000-0000-000000000000" }
+machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "MN-001", driver_version = "570.82", slot_number = 15, tray_index = 5, nvlink_domain_uuid = "00000000-0000-0000-0000-000000000000" }
 "#;
 
         let config: Config = Figment::new()
@@ -1934,6 +3058,7 @@ machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
 
         assert_eq!(machine.slot_number, Some(15));
         assert_eq!(machine.tray_index, Some(5));
+        assert_eq!(machine.driver_version.as_deref(), Some("570.82"));
         assert_eq!(
             machine.nvlink_domain_uuid.as_deref(),
             Some("00000000-0000-0000-0000-000000000000")

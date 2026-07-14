@@ -23,6 +23,7 @@ pub mod arch;
 pub mod cmd;
 pub mod config;
 mod host_port_pair;
+pub mod managed_loop;
 pub mod metrics;
 pub mod periodic_timer;
 pub mod redfish;
@@ -37,6 +38,7 @@ pub const DEFAULT_DMI_SYSTEM_MANUFACTURER: &str = "Unspecified System Manufactur
 pub const DEFAULT_DMI_SYSTEM_MODEL: &str = "Unspecified Model";
 pub const BF2_PRODUCT_NAME: &str = "BlueField SoC";
 pub const BF3_PRODUCT_NAME: &str = "BlueField-3 SmartNIC Main Card";
+pub const SCOUT_FIRMWARE_SCRIPTS_DIR: &str = "/opt/carbide/scout-firmware-scripts";
 
 // ordered_map is used with serde to take a HashMap and always serialize it in key sorted order
 pub fn ordered_map<S, K: Ord + Serialize, V: Serialize>(

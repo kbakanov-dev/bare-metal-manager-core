@@ -19,11 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use carbide_firmware::FirmwareConfig;
 use carbide_uuid::machine::MachineId;
-use db::{self, desired_firmware};
+use db::{self, desired_firmware, host_firmware_config};
 use model::machine::ManagedHostStateSnapshot;
 use model::machine_update_module::HOST_FW_UPDATE_HEALTH_REPORT_SOURCE;
 use opentelemetry::metrics::Meter;
@@ -31,6 +32,7 @@ use sqlx::PgConnection;
 use tokio::sync::Mutex;
 
 use super::machine_update_module::MachineUpdateModule;
+use super::metrics::{FirmwareUpdatePhase, FirmwareUpdateProgress, FirmwareUpdateTarget};
 use crate::CarbideResult;
 use crate::cfg::file::CarbideConfig;
 
@@ -38,7 +40,13 @@ pub struct HostFirmwareUpdate {
     pub metrics: HostFirmwareUpdateMetrics,
     config: Arc<CarbideConfig>,
     firmware_config: FirmwareConfig,
-    firmware_dir_last_read: Arc<Mutex<Option<std::time::SystemTime>>>,
+    firmware_catalog_last_read: Arc<Mutex<Option<FirmwareCatalogMarker>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FirmwareCatalogMarker {
+    firmware_dir_mod_time: Option<SystemTime>,
+    host_firmware_config_summary: host_firmware_config::HostFirmwareConfigSummary,
 }
 
 #[async_trait]
@@ -60,20 +68,15 @@ impl MachineUpdateModule for HostFirmwareUpdate {
         _snapshots: &HashMap<MachineId, ManagedHostStateSnapshot>,
     ) -> CarbideResult<HashSet<MachineId>> {
         let mut txn = db::Transaction::begin(pool).await?;
-        if let Ok(mut firmware_dir_last_read) = self.firmware_dir_last_read.try_lock() {
-            let firmware_dir_mod_time = self.firmware_config.config_update_time();
-            if (firmware_dir_mod_time.is_none() && firmware_dir_last_read.is_none()) // Not using an auto firmware directory, one and done
-                || (firmware_dir_mod_time.is_some_and(|firmware_dir_mod_time| {
-                firmware_dir_last_read.unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                    < firmware_dir_mod_time // Using an auto firmware directory, and a new file has been created or this is the first run
-            })) {
+        if let Ok(mut firmware_catalog_last_read) = self.firmware_catalog_last_read.try_lock() {
+            let catalog_marker = self.firmware_catalog_marker(&mut txn).await?;
+            if firmware_catalog_last_read.as_ref() != Some(&catalog_marker) {
                 // Save the firmware config in an SQL table so that we can filter for hosts with non-matching firmware there.
-                let fw_config_snapshot = self.firmware_config.create_snapshot();
+                let fw_config_snapshot = self.effective_firmware_config_snapshot(&mut txn).await?;
                 tracing::info!("Firmware config now: {:?}", fw_config_snapshot);
                 let models = fw_config_snapshot.into_values().collect::<Vec<_>>();
                 desired_firmware::snapshot_desired_firmware(&mut txn, &models).await?;
-                *firmware_dir_last_read =
-                    Some(firmware_dir_mod_time.unwrap_or(std::time::SystemTime::now()));
+                *firmware_catalog_last_read = Some(catalog_marker);
             }
         }
 
@@ -88,8 +91,6 @@ impl MachineUpdateModule for HostFirmwareUpdate {
                 continue;
             }
 
-            tracing::info!("Moving {} to host reprovision", machine_update);
-
             db::host_machine_update::trigger_host_reprovisioning_request(
                 &mut txn,
                 "Automated",
@@ -97,6 +98,15 @@ impl MachineUpdateModule for HostFirmwareUpdate {
             )
             .await?;
 
+            // Counted after the trigger succeeds; the commit below spans the
+            // whole batch, so a later DB error can re-count machines on the
+            // next pass -- the same repeat-on-retry the old log line had.
+            carbide_instrument::emit(FirmwareUpdateProgress {
+                target: FirmwareUpdateTarget::Host,
+                phase: FirmwareUpdatePhase::Started,
+                machine_id: *machine_update,
+                detail: String::new(),
+            });
             updates_started.insert(*machine_update);
         }
 
@@ -107,18 +117,21 @@ impl MachineUpdateModule for HostFirmwareUpdate {
     async fn clear_completed_updates(&self, txn: &mut PgConnection) -> CarbideResult<()> {
         let completed = db::host_machine_update::find_completed_updates(txn).await?;
 
-        if !completed.is_empty() {
-            tracing::info!("Completed host firmware updates: {completed:?}");
-            for machine in completed {
-                db::machine::remove_health_report(
-                    txn,
-                    &machine,
-                    health_report::HealthReportApplyMode::Merge,
-                    HOST_FW_UPDATE_HEALTH_REPORT_SOURCE,
-                )
-                .await?;
-                db::machine::update_update_complete(&machine, true, txn).await?;
-            }
+        for machine in completed {
+            db::machine::remove_health_report(
+                txn,
+                &machine,
+                health_report::HealthReportApplyMode::Merge,
+                HOST_FW_UPDATE_HEALTH_REPORT_SOURCE,
+            )
+            .await?;
+            db::machine::update_update_complete(&machine, true, txn).await?;
+            carbide_instrument::emit(FirmwareUpdateProgress {
+                target: FirmwareUpdateTarget::Host,
+                phase: FirmwareUpdatePhase::Completed,
+                machine_id: machine,
+                detail: String::new(),
+            });
         }
         Ok(())
     }
@@ -126,8 +139,16 @@ impl MachineUpdateModule for HostFirmwareUpdate {
     async fn update_metrics(
         &self,
         pool: &sqlx::Pool<sqlx::Postgres>,
-        _snapshots: &HashMap<MachineId, ManagedHostStateSnapshot>,
+        snapshots: &HashMap<MachineId, ManagedHostStateSnapshot>,
     ) -> CarbideResult<()> {
+        let exhausted_retries = snapshots
+            .values()
+            .filter(|snapshot| snapshot.managed_state.host_repro_retries_exhausted())
+            .count();
+        self.metrics
+            .exhausted_reprovision_retries
+            .store(exhausted_retries as u64, Ordering::Relaxed);
+
         let mut txn = db::Transaction::begin(pool).await?;
         match db::host_machine_update::find_upgrade_needed(
             &mut txn,
@@ -171,8 +192,28 @@ impl HostFirmwareUpdate {
             firmware_config,
             config,
             metrics,
-            firmware_dir_last_read: Arc::new(Mutex::new(None)),
+            firmware_catalog_last_read: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn firmware_catalog_marker(
+        &self,
+        txn: &mut PgConnection,
+    ) -> CarbideResult<FirmwareCatalogMarker> {
+        Ok(FirmwareCatalogMarker {
+            firmware_dir_mod_time: self.firmware_config.config_update_time(),
+            host_firmware_config_summary: host_firmware_config::summary(txn).await?,
+        })
+    }
+
+    async fn effective_firmware_config_snapshot(
+        &self,
+        txn: &mut PgConnection,
+    ) -> CarbideResult<carbide_firmware::FirmwareConfigSnapshot> {
+        let host_firmware_configs = host_firmware_config::list_configs(txn).await?;
+        Ok(self
+            .firmware_config
+            .create_snapshot_with_overrides(host_firmware_configs))
     }
 
     pub async fn check_for_updates(
@@ -221,6 +262,7 @@ impl fmt::Display for HostFirmwareUpdate {
 pub struct HostFirmwareUpdateMetrics {
     pub pending_firmware_updates: Arc<AtomicU64>,
     pub active_firmware_updates: Arc<AtomicU64>,
+    pub exhausted_reprovision_retries: Arc<AtomicU64>,
 }
 
 impl HostFirmwareUpdateMetrics {
@@ -228,17 +270,17 @@ impl HostFirmwareUpdateMetrics {
         HostFirmwareUpdateMetrics {
             pending_firmware_updates: Arc::new(AtomicU64::new(0)),
             active_firmware_updates: Arc::new(AtomicU64::new(0)),
+            exhausted_reprovision_retries: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn register_callbacks(&self, meter: &Meter) {
         let pending_firmware_updates = self.pending_firmware_updates.clone();
         let active_firmware_updates = self.active_firmware_updates.clone();
+        let exhausted_reprovision_retries = self.exhausted_reprovision_retries.clone();
         meter
             .u64_observable_gauge("carbide_pending_host_firmware_update_count")
-            .with_description(
-                "The number of host machines in the system that need a firmware update.",
-            )
+            .with_description("Number of host machines in the system that need a firmware update.")
             .with_callback(move |observer| {
                 observer.observe(pending_firmware_updates.load(Ordering::Relaxed), &[])
             })
@@ -246,10 +288,18 @@ impl HostFirmwareUpdateMetrics {
         meter
             .u64_observable_gauge("carbide_active_host_firmware_update_count")
             .with_description(
-                "The number of host machines in the system currently working on updating their firmware.",
+                "Number of host machines in the system currently working on updating their firmware.",
             )
             .with_callback(move |observer|
                 observer.observe(active_firmware_updates.load(Ordering::Relaxed), &[]))
+            .build();
+        meter
+            .u64_observable_gauge("carbide_exhausted_reprovision_retry_count")
+            .with_description(
+                "Number of host machines in the system whose host firmware upgrade retry budget is exhausted.",
+            )
+            .with_callback(move |observer|
+                observer.observe(exhausted_reprovision_retries.load(Ordering::Relaxed), &[]))
             .build();
     }
 }

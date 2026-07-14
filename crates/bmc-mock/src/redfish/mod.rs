@@ -38,11 +38,14 @@ pub mod processor;
 pub mod resource;
 pub mod secure_boot;
 pub mod sensor;
+pub mod serial_console;
+pub mod serial_interface;
 pub mod service_root;
 pub mod session_service;
 pub mod software_inventory;
 pub mod storage;
 pub mod task_service;
+pub mod telemetry_service;
 pub mod thermal_subsystem;
 pub mod update_service;
 

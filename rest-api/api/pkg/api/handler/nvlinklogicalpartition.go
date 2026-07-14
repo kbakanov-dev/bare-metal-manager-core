@@ -33,7 +33,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 
 	wfutil "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
@@ -193,7 +193,7 @@ func (cibph CreateNVLinkLogicalPartitionHandler) Handle(c echo.Context) error {
 
 	var nvllp *cdbm.NVLinkLogicalPartition
 	var ssd *cdbm.StatusDetail
-	var protoNvllp *cwssaws.NVLinkLogicalPartition
+	var protoNvllp *corev1.NVLinkLogicalPartition
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
 	// the DB tx unwinds before we make the second remote call. nil means
@@ -221,14 +221,13 @@ func (cibph CreateNVLinkLogicalPartitionHandler) Handle(c echo.Context) error {
 		}
 
 		// create the status detail record
-		ssd, derr = sdDAO.CreateFromParams(ctx, tx, nvllp.ID.String(), string(cdbm.NVLinkLogicalPartitionStatusPending),
-			cutil.GetPtr("received NVLink Logical Partition creation request, pending"))
+		ssd, derr = sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: nvllp.ID.String(), Status: string(cdbm.NVLinkLogicalPartitionStatusPending), Message: cutil.GetPtr("received NVLink Logical Partition creation request, pending")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for NVLink Logical Partition", nil)
 		}
 		if ssd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for NVLink Logical Partition", nil)
 		}
 
@@ -955,7 +954,7 @@ func (uibph UpdateNVLinkLogicalPartitionHandler) Handle(c echo.Context) error {
 
 	// get status details for the response
 	sdDAO := cdbm.NewStatusDetailDAO(uibph.dbSession)
-	ssds, _, err := sdDAO.GetAllByEntityID(ctx, nil, nvllp.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+	ssds, _, err := sdDAO.GetAll(ctx, nil, cdbm.StatusDetailFilterInput{EntityIDs: []string{nvllp.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Status Details for NVLink Logical Partition from DB")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Status Details for NVLink Logical Partition", nil)
@@ -1263,14 +1262,13 @@ func (dibph DeleteNVLinkLogicalPartitionHandler) Handle(c echo.Context) error {
 		}
 
 		// Create status detail
-		ssd, derr := sdDAO.CreateFromParams(ctx, tx, nvllp.ID.String(), string(deletingStatus),
-			cutil.GetPtr("Received request for deletion, pending processing"))
+		ssd, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: nvllp.ID.String(), Status: string(deletingStatus), Message: cutil.GetPtr("Received request for deletion, pending processing")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for NVLink Logical Partition deletion", nil)
 		}
 		if ssd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for NVLink Logical Partition deletion", nil)
 		}
 

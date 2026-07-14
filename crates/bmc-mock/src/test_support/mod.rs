@@ -35,7 +35,7 @@ use crate::{
 pub mod axum_http_client;
 
 #[derive(Debug)]
-struct NoopCallbacks;
+pub struct NoopCallbacks;
 
 impl Callbacks for NoopCallbacks {
     fn get_power_state(&self) -> MockPowerState {
@@ -87,6 +87,20 @@ async fn test_bmc((router, state): (axum::Router, BmcState)) -> TestBmcHandle {
     }
 }
 
+pub async fn bmc_for_machine(machine_info: MachineInfo) -> TestBmcHandle {
+    let machine_id = match &machine_info {
+        MachineInfo::Host(_) => "test-host-id",
+        MachineInfo::Dpu(_) => "test-dpu-id",
+    };
+    test_bmc(machine_router(
+        &machine_info,
+        Arc::new(NoopCallbacks),
+        machine_id.to_string(),
+        false,
+    ))
+    .await
+}
+
 fn host_info(hw_type: HostHardwareType) -> MachineInfo {
     let ndpu = hw_type.fixed_number_of_dpu().unwrap_or(0);
     let mut pool = TEST_MAC_POOL.lock().unwrap();
@@ -124,6 +138,21 @@ pub async fn lenovo_gb300_bmc() -> TestBmcHandle {
 pub async fn dgx_gb300_bmc() -> TestBmcHandle {
     test_bmc(machine_router(
         &host_info(HostHardwareType::NvidiaDgxGb300),
+        Arc::new(NoopCallbacks),
+        "test-host-id".to_string(),
+        false,
+    ))
+    .await
+}
+
+/// Host-mode mock for the NvidiaDgxVr hardware type ("vr-tray" in machine-a-tron
+/// configs). Unlike the other GB300-family types (Lenovo, Nvidia DGX GB300,
+/// Supermicro), this one previously only had a DPU-mode helper
+/// (`nvidia_dgx_vr_bluefield4_dpu_bmc`), so there was no way to test exploring
+/// it as a host tray at all. Added while investigating #3159.
+pub async fn nvidia_dgx_vr_host_bmc() -> TestBmcHandle {
+    test_bmc(machine_router(
+        &host_info(HostHardwareType::NvidiaDgxVr),
         Arc::new(NoopCallbacks),
         "test-host-id".to_string(),
         false,
@@ -194,6 +223,45 @@ pub async fn dell_poweredge_r750_bluefield3_bmc(settings: DpuSettings) -> TestBm
         &machine_info,
         Arc::new(NoopCallbacks),
         "test-dpu-id".to_string(),
+        false,
+    ))
+    .await
+}
+
+pub async fn dell_poweredge_r760_bluefield4_bmc(dpu: DpuMachineInfo) -> TestBmcHandle {
+    let machine_info = MachineInfo::Dpu(dpu);
+    test_bmc(machine_router(
+        &machine_info,
+        Arc::new(NoopCallbacks),
+        "test-dpu-id".to_string(),
+        false,
+    ))
+    .await
+}
+
+pub async fn nvidia_dgx_vr_bluefield4_dpu_bmc(settings: DpuSettings) -> TestBmcHandle {
+    let machine_info = {
+        let mut mac_pool = TEST_MAC_POOL.lock().unwrap();
+        MachineInfo::Dpu(DpuMachineInfo::new(
+            HostHardwareType::NvidiaDgxVr,
+            &mut mac_pool,
+            settings,
+        ))
+    };
+    test_bmc(machine_router(
+        &machine_info,
+        Arc::new(NoopCallbacks),
+        "test-dpu-id".to_string(),
+        false,
+    ))
+    .await
+}
+
+pub async fn hpe_proliant_dl380a_gen11_bmc() -> TestBmcHandle {
+    test_bmc(machine_router(
+        &host_info(HostHardwareType::HpeProliantDl380aGen11),
+        Arc::new(NoopCallbacks),
+        "test-host-id".to_string(),
         false,
     ))
     .await
@@ -275,5 +343,25 @@ mod test {
             }
             other => panic!("expected invalid response error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn lenovo_gb300_discovery_includes_dpu_host_interface() {
+        let machine = host_info(HostHardwareType::LenovoGB300Nvl);
+        let expected_mac = match &machine {
+            MachineInfo::Host(host) => host.primary_dpu().unwrap().host_mac_address.to_string(),
+            MachineInfo::Dpu(_) => unreachable!("Lenovo GB300 must be a host"),
+        };
+
+        let interfaces = machine.discovery_info().network_interfaces;
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].mac_address, expected_mac);
+
+        let pci = interfaces[0]
+            .pci_properties
+            .as_ref()
+            .expect("DPU host interface must include PCI properties");
+        assert!(pci.vendor.to_ascii_lowercase().contains("mellanox"));
+        assert_eq!(pci.slot.as_deref(), Some("0000:03:00.0"));
     }
 }

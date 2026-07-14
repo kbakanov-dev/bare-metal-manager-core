@@ -739,7 +739,6 @@ async fn instance_reprov_start(
     env.api
         .invoke_instance_power(tonic::Request::new(::rpc::forge::InstancePowerRequest {
             instance_id: tinstance.id.into(),
-            machine_id: None,
             apply_updates_on_reboot: true,
             boot_with_custom_ipxe: false,
             operation: 0,
@@ -965,7 +964,6 @@ async fn test_instance_reprov_without_firmware_upgrade(pool: sqlx::PgPool) {
     env.api
         .invoke_instance_power(tonic::Request::new(::rpc::forge::InstancePowerRequest {
             instance_id: tinstance.id.into(),
-            machine_id: None,
             apply_updates_on_reboot: true,
             boot_with_custom_ipxe: false,
             operation: 0,
@@ -1012,7 +1010,6 @@ async fn test_instance_reprov_without_firmware_upgrade(pool: sqlx::PgPool) {
         env.api
             .invoke_instance_power(tonic::Request::new(::rpc::forge::InstancePowerRequest {
                 instance_id: tinstance.id.into(),
-                machine_id: None,
                 apply_updates_on_reboot: true,
                 boot_with_custom_ipxe: false,
                 operation: 0,
@@ -1162,6 +1159,12 @@ async fn test_dpu_for_set_but_clear_failed(pool: sqlx::PgPool) {
 
 #[crate::sqlx_test]
 async fn test_reboot_retry(pool: sqlx::PgPool) {
+    // The reconcile-heavy body builds a future too large for the test
+    // thread's stack in debug builds; box it like its siblings above.
+    Box::pin(test_reboot_retry_impl(pool)).await;
+}
+
+async fn test_reboot_retry_impl(pool: sqlx::PgPool) {
     let env = create_test_env(pool).await;
     let mh = common::api_fixtures::create_managed_host(&env).await;
     let mut txn = env.pool.begin().await.unwrap();
@@ -1923,7 +1926,6 @@ async fn test_instance_reprov_restart_failed_impl(pool: sqlx::PgPool) {
     env.api
         .invoke_instance_power(tonic::Request::new(::rpc::forge::InstancePowerRequest {
             instance_id: tinstance.id.into(),
-            machine_id: None,
             apply_updates_on_reboot: true,
             boot_with_custom_ipxe: false,
             operation: 0,
@@ -1974,7 +1976,6 @@ async fn test_instance_reprov_restart_failed_impl(pool: sqlx::PgPool) {
         env.api
             .invoke_instance_power(tonic::Request::new(::rpc::forge::InstancePowerRequest {
                 instance_id: tinstance.id.into(),
-                machine_id: None,
                 apply_updates_on_reboot: true,
                 boot_with_custom_ipxe: false,
                 operation: 0,

@@ -27,7 +27,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	cwutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 )
@@ -101,7 +101,7 @@ func (mskg ManageSSHKeyGroup) SyncSSHKeyGroupViaSiteAgent(ctx context.Context, s
 	}
 
 	// Sync SSHKeyGroup request
-	keysetContent := &cwssaws.TenantKeysetContent{}
+	keysetContent := &corev1.TenantKeysetContent{}
 
 	tx, terr := cdb.BeginTx(ctx, mskg.dbSession, &sql.TxOptions{})
 	if terr != nil {
@@ -130,7 +130,7 @@ func (mskg ManageSSHKeyGroup) SyncSSHKeyGroupViaSiteAgent(ctx context.Context, s
 	}
 	if total > 0 {
 		for _, ska := range skas {
-			keysetContent.PublicKeys = append(keysetContent.PublicKeys, &cwssaws.TenantPublicKey{
+			keysetContent.PublicKeys = append(keysetContent.PublicKeys, &corev1.TenantPublicKey{
 				PublicKey: ska.SSHKey.PublicKey,
 				Comment:   ska.SSHKey.Fingerprint,
 			})
@@ -255,7 +255,7 @@ func (mskg ManageSSHKeyGroup) SyncSSHKeyGroupViaSiteAgent(ctx context.Context, s
 }
 
 // UpdateSSHKeyGroupsInDB takes information pushed by Site Agent for a collection of SSH Key Groups associated with the Site and updates the DB
-func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupsInDB(ctx context.Context, siteID uuid.UUID, sshKeyGroupInventory *cwssaws.SSHKeyGroupInventory) ([]string, error) {
+func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupsInDB(ctx context.Context, siteID uuid.UUID, sshKeyGroupInventory *corev1.SSHKeyGroupInventory) ([]string, error) {
 	logger := log.With().Str("Activity", "UpdateSSHKeyGroupsInDB").Str("Site ID", siteID.String()).Logger()
 
 	logger.Info().Msg("starting activity")
@@ -272,7 +272,7 @@ func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupsInDB(ctx context.Context, siteID
 		return nil, err
 	}
 
-	if sshKeyGroupInventory.InventoryStatus == cwssaws.InventoryStatus_INVENTORY_STATUS_FAILED {
+	if sshKeyGroupInventory.InventoryStatus == corev1.InventoryStatus_INVENTORY_STATUS_FAILED {
 		logger.Warn().Msg("received failed inventory status from Site Agent, skipping inventory processing")
 		return nil, nil
 	}
@@ -304,7 +304,7 @@ func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupsInDB(ctx context.Context, siteID
 		}
 	}
 
-	existingSkgsaTkMap := map[string]*cwssaws.TenantKeyset{}
+	existingSkgsaTkMap := map[string]*corev1.TenantKeyset{}
 
 	// Iterate through SSHKeyGroup Inventory and update DB
 	for _, tenantKeyset := range sshKeyGroupInventory.TenantKeysets {
@@ -505,7 +505,7 @@ func (mskg ManageSSHKeyGroup) updateSSHKeyGroupSiteAssociationStatusInDB(ctx con
 		}
 
 		statusDetailDAO := cdbm.NewStatusDetailDAO(mskg.dbSession)
-		_, err = statusDetailDAO.CreateFromParams(ctx, tx, skgsaID.String(), *status, statusMessage)
+		_, err = statusDetailDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: skgsaID.String(), Status: *status, Message: statusMessage})
 		if err != nil {
 			return err
 		}
@@ -680,7 +680,7 @@ func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupStatusInDB(ctx context.Context, s
 	}
 
 	statusDetailDAO := cdbm.NewStatusDetailDAO(mskg.dbSession)
-	_, err = statusDetailDAO.CreateFromParams(ctx, nil, skgID.String(), *sgStatus, sgMessage)
+	_, err = statusDetailDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: skgID.String(), Status: *sgStatus, Message: sgMessage})
 	if err != nil {
 		return err
 	}
@@ -693,7 +693,7 @@ func (mskg ManageSSHKeyGroup) UpdateSSHKeyGroupStatusInDB(ctx context.Context, s
 // IsSSHKeyGroupCreated is helper function to get if sshkeygroup created or not
 func (mskg ManageSSHKeyGroup) IsSSHKeyGroupCreatedOnSite(ctx context.Context, tx *cdb.Tx, sshKeyGroupSiteAssociationID uuid.UUID) (*bool, error) {
 	sdDAO := cdbm.NewStatusDetailDAO(mskg.dbSession)
-	skgsds, _, err := sdDAO.GetAllByEntityID(ctx, tx, sshKeyGroupSiteAssociationID.String(), nil, cwutil.GetPtr(cdbp.TotalLimit), nil)
+	skgsds, _, err := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{sshKeyGroupSiteAssociationID.String()}}, cdbp.PageInput{Limit: cwutil.GetPtr(cdbp.TotalLimit)})
 	if err != nil {
 		return nil, err
 	}

@@ -101,6 +101,10 @@ Enumerating a function's input variants as grouped `carbide-test-support` scenar
 or explicit cases (`check_cases` / `check_values`) is the easiest way to reach thorough coverage of parsers, validators,
 conversions, and the like.
 
+Keep test rack-profile capability counts aligned with the inventory the fixture
+actually instantiates. Use zero for unsupported component types so tests do not
+generate expected-but-absent discovery errors.
+
 ### Linting and Formatting
 
 ```bash
@@ -115,6 +119,9 @@ cargo make check-workspace-deps # Validate dependency declarations in Cargo.toml
 cargo make check-licenses      # Validate no restricted licenses introduced
 cargo make check-bans          # Check for banned dependencies
 
+# Optional maintenance check (not part of required CI or pre-commit):
+cargo make check-isolated-package-builds # Check each package with default features
+
 # Auto-fix formatting:
 cargo fmt --all
 cargo make format-nightly      # Also sort imports
@@ -124,14 +131,15 @@ cargo make format-nightly      # Also sort imports
 > `carbide-lints`. The stable toolchain pinned in `rust-toolchain.toml` is used
 > for everything else.
 
-### Top-level Makefile (rest-api entrypoint)
+### Top-level Makefile entrypoints
 
 A top-level [`Makefile`](Makefile) at the repo root provides a thin
-discoverable entrypoint for the `rest-api/` Go services. It just
-delegates to `rest-api/Makefile`.
+discoverable entrypoint for selected Core workflows and the `rest-api/` Go
+services. It delegates to cargo-make or `rest-api/Makefile`.
 
 ```bash
-make help                # default goal: list rest-* targets
+make help                # default goal: list available targets
+make core/check-isolated-package-builds # optional independent default-feature builds
 make rest-build          # build rest-api Go binaries
 make rest-test           # run rest-api unit tests
 make rest-lint           # lint rest-api
@@ -142,9 +150,6 @@ make rest-kind-reset     # spin up the local kind dev cluster (~10 min)
 make rest-api/<target>   # pass any target through to rest-api/Makefile
 ```
 
-Core (Rust) tasks are not in this Makefile; use cargo and `cargo make`
-directly as documented above.
-
 ## Coding Conventions
 
 Follow the shared [Engineering Guidelines](CONTRIBUTING.md#engineering-guidelines)
@@ -153,6 +158,54 @@ verification expectations.
 
 See [`STYLE_GUIDE.md`](STYLE_GUIDE.md) for detailed Rust coding conventions.
 Make sure to review it to ensure changes meet the expected style of the codebase.
+
+### Avoid stringly-typed values
+
+When a value has a known, finite set of possibilities, model it with an enum (or
+a struct of enums) and derive its string form via `Display`/`FromStr` — do not
+pass it around as a bare `String` or `&str` literal. Stringly-typed values are
+easy to misspell (`NICO-` vs `NICOO-`), silently break log filters and alerts,
+and can't be exhaustively checked by the compiler. See
+[`ErrorCode`](crates/api-model/src/errors.rs) for the pattern: typed
+`ErrorSystem`/`ErrorSubsystem` parts plus a `code`, rendered to the wire string
+in one place. Reserve raw strings for genuinely open-ended values.
+
+### Instrumentation: logs and metrics
+
+The decision rule:
+
+- **Just logging words?** Use plain `tracing::` macros with structured fields
+  (`warn!(%machine_id, error = %e, "...")`). Most log sites are and stay this.
+- **Does the event deserve a count, rate, or duration** (a failure you'd alert
+  on, an outcome you'd trend, a hot-path rate)? Declare it once as a
+  `carbide_instrument::Event` and `emit()` it — that produces the metric and
+  (optionally) the log line together, correlated by `span_id`:
+
+  ```rust
+  #[derive(carbide_instrument::Event)]
+  #[event(name = "carbide_power_control_total", component = "component_manager",
+          log = warn, metric = counter, message = "power control failed")]
+  struct PowerControlFailed {
+      #[label]   backend: Backend,  // bounded via LabelValue — enums, usually
+      #[context] error: String,     // high-cardinality — log line only
+  }
+  ```
+
+  `log = off, metric = counter` counts a hot-path event with no log line at
+  all; `metric = none` is a typed log. Never put `machine_id`/IPs/error text
+  in a `#[label]` — that's what `#[context]` is for, and `String` doesn't
+  implement `LabelValue` precisely to stop it. A bounded-but-not-enum value
+  (a vendor, a SKU) can get a manual `LabelValue` impl on a newtype — the
+  reviewed escape hatch — but only when the value is bounded *at the call
+  site*; anything caller-supplied stays in `#[context]`.
+- **Point-in-time state** ("how many machines are in state X") stays on the
+  existing observable-gauge / `SharedMetricsHolder` pattern — the framework models
+  occurrences, not state.
+
+New metric names are validated at compile time (`carbide_` prefix, `_total`
+counters, unit-suffixed histograms) and the name in the attribute is the
+exposed name, verbatim. Existing metric names never change. The full standard
+lives in [`docs/observability/instrumentation.md`](docs/observability/instrumentation.md).
 
 ## Further Reading
 

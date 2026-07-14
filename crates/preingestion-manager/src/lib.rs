@@ -24,10 +24,15 @@ use std::collections::HashMap;
 use std::default::Default;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use carbide_firmware::FirmwareDownloader;
+use carbide_firmware::{
+    FirmwareConfigSnapshot, FirmwareDownloader, ResolvedFirmwareArtifactSource,
+    resolve_files_firmware_artifact,
+};
+use carbide_instrument::{Outcome, emit};
 use carbide_redfish::libredfish::conv::IntoLibredfish;
 use carbide_redfish::libredfish::{RedfishClientCreationError, RedfishClientPool};
 use carbide_secrets::credentials::{
@@ -42,7 +47,7 @@ use futures_util::FutureExt;
 use libredfish::model::task::TaskState;
 use libredfish::model::update_service::TransferProtocolType;
 use libredfish::{PowerState, Redfish, RedfishError, SystemPowerControl};
-use model::firmware::{Firmware, FirmwareComponentType, FirmwareEntry};
+use model::firmware::{Firmware, FirmwareComponent, FirmwareComponentType, FirmwareEntry};
 use model::site_explorer::{
     ExploredEndpoint, InitialBmcResetPhase, InitialResetPhase, NicMode, PowerDrainState,
     PreingestionState, TimeSyncResetPhase,
@@ -57,9 +62,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bfb_rshim_copier::BfbRshimCopier;
 use crate::errors::{PreingestionManagerError, PreingestionManagerResult};
-use crate::metrics::PreingestionMetrics;
+use crate::metrics::{
+    BfbCopyFinished, BfbCopyOutcome, FirmwareComponentLabel, FirmwareUpgradeTaskFinished,
+    FirmwareUploadFinished, FirmwareUploadMethod, PowerOperation, PreingestionMetrics,
+    UpgradeTaskFinalState, count_power_op,
+};
 
 const NOT_FOUND: u16 = 404;
+const LEGACY_NO_URL_SENTINEL: &str = "file://dev/null";
 
 /// Fallback timeout for BFB copy. SSH layer has 30-min timeout that should fire first;
 /// this catches edge cases where the task dies without reporting.
@@ -262,12 +272,12 @@ impl PreingestionManager {
         }
 
         metrics.machines_in_preingestion =
-            db::explored_endpoints::find_preingest_not_waiting_not_error(&db)
+            db::explored_endpoints::count_preingest_not_waiting_not_error(&db)
                 .await?
-                .len();
-        metrics.waiting_for_installation = db::explored_endpoints::find_preingest_installing(&db)
+                .max(0) as usize;
+        metrics.waiting_for_installation = db::explored_endpoints::count_preingest_installing(&db)
             .await?
-            .len();
+            .max(0) as usize;
 
         tracing::debug!(
             "Preingestion metrics: in_preingestion {} waiting {} delayed {}",
@@ -498,18 +508,27 @@ async fn one_endpoint(
 }
 
 impl PreingestionManagerStatic {
+    async fn firmware_config_snapshot(
+        &self,
+        db: &PgPool,
+    ) -> PreingestionManagerResult<FirmwareConfigSnapshot> {
+        let host_firmware_configs = db::host_firmware_config::list_configs(db).await?;
+        Ok(self
+            .config
+            .firmware
+            .create_snapshot_with_overrides(host_firmware_configs))
+    }
+
     /// find_fw_info_for_host looks up the firmware config for the given endpoint
-    fn find_fw_info_for_host(&self, endpoint: &ExploredEndpoint) -> Option<Firmware> {
-        let vendor = match &endpoint.report.vendor {
-            Some(vendor) => vendor.to_owned(),
-            None => {
-                // No vendor found for the endpoint, we can't match firmware
-                tracing::debug!("find_fw_info_for_host: {} No vendor", endpoint.address);
-                return None;
-            }
-        };
-        let model = endpoint.report.model()?;
-        self.config.firmware.create_snapshot().find(vendor, &model)
+    async fn find_fw_info_for_host(
+        &self,
+        db: &PgPool,
+        endpoint: &ExploredEndpoint,
+    ) -> PreingestionManagerResult<Option<Firmware>> {
+        Ok(self
+            .firmware_config_snapshot(db)
+            .await?
+            .find_fw_info_for_host(endpoint))
     }
 
     /// check_firmware_versions_below_preingestion will check if we actually need to do firmware upgrades before
@@ -520,7 +539,7 @@ impl PreingestionManagerStatic {
         endpoint: &ExploredEndpoint,
     ) -> PreingestionManagerResult<bool> {
         // First, we need to check if it's appropriate to upgrade at this point or wait until later.
-        let fw_info = match self.find_fw_info_for_host(endpoint) {
+        let fw_info = match self.find_fw_info_for_host(db, endpoint).await? {
             None => {
                 tracing::debug!(
                     "check_firmware_versions_below_preingestion {}: No matching firmware info found",
@@ -611,7 +630,7 @@ impl PreingestionManagerStatic {
             return Ok(false);
         }
 
-        let fw_info = match self.find_fw_info_for_host(endpoint) {
+        let fw_info = match self.find_fw_info_for_host(db, endpoint).await? {
             None => {
                 // No desired firmware description found for this host
                 tracing::debug!(
@@ -695,16 +714,8 @@ impl PreingestionManagerStatic {
 
                     tracing::info!("Installing {:?} on {}", to_install, endpoint.address);
 
-                    initiate_update(
-                        endpoint,
-                        &self.redfish_client_pool,
-                        &to_install,
-                        &fw_type,
-                        &self.downloader,
-                        0,
-                        db,
-                    )
-                    .await?;
+                    self.initiate_update(endpoint, &to_install, &fw_type, 0, db)
+                        .await?;
 
                     // initiate_update only returned an error for database issues.  If it truly succeeded, it updated
                     // the database with a new state.  If the firmware download was not yet complete or we had a Redfish
@@ -761,17 +772,26 @@ impl PreingestionManagerStatic {
                     }
                     Some(TaskState::Completed) => {
                         // Task has completed, update is done and we can clean up.  Site explorer will ingest this next time it runs on this endpoint.
+                        //
+                        // The completion event fires only once the state moves
+                        // on (the next chain task is stored, or the transition
+                        // commits): this same Completed task is re-observed on
+                        // every pass until then, and a rolled-back transition
+                        // never happened.
 
                         // If we have multiple firmware files to be uploaded, do the next one.
-                        if let Some(fw_info) = self.find_fw_info_for_host(endpoint)
+                        if let Some(fw_info) = self.find_fw_info_for_host(db, endpoint).await?
                             && let Some(component_info) = fw_info.components.get(upgrade_type)
                             && let Some(selected_firmware) =
-                                component_info.known_firmware.iter().find(|&x| x.default)
+                                select_firmware_for_artifact_continuation(
+                                    component_info,
+                                    final_version,
+                                )
                         {
                             let firmware_number = firmware_number + 1;
-                            if firmware_number
-                                < selected_firmware.filenames.len().try_into().unwrap_or(0)
-                            {
+                            if usize::try_from(firmware_number).is_ok_and(|firmware_number| {
+                                firmware_number < selected_firmware.artifact_count()
+                            }) {
                                 tracing::info!(
                                     "Installing {:?} chain step {} on {}",
                                     selected_firmware,
@@ -779,16 +799,24 @@ impl PreingestionManagerStatic {
                                     endpoint.address
                                 );
 
-                                initiate_update(
-                                    endpoint,
-                                    &self.redfish_client_pool,
-                                    selected_firmware,
-                                    upgrade_type,
-                                    &self.downloader,
-                                    firmware_number,
-                                    db,
-                                )
-                                .await?;
+                                if self
+                                    .initiate_update(
+                                        endpoint,
+                                        selected_firmware,
+                                        upgrade_type,
+                                        firmware_number,
+                                        db,
+                                    )
+                                    .await?
+                                {
+                                    emit(FirmwareUpgradeTaskFinished {
+                                        firmware: FirmwareComponentLabel(*upgrade_type),
+                                        final_state: UpgradeTaskFinalState::Completed,
+                                        outcome: Outcome::Ok,
+                                        address: endpoint.address,
+                                        error: String::new(),
+                                    });
+                                }
                                 return Ok(());
                             }
                         }
@@ -809,6 +837,13 @@ impl PreingestionManagerStatic {
                             .boxed()
                         })
                         .await??;
+                        emit(FirmwareUpgradeTaskFinished {
+                            firmware: FirmwareComponentLabel(*upgrade_type),
+                            final_state: UpgradeTaskFinalState::Completed,
+                            outcome: Outcome::Ok,
+                            address: endpoint.address,
+                            error: String::new(),
+                        });
                         // Can immediately process as that new state
                         return self
                             .in_reset_for_new_firmware(
@@ -824,25 +859,24 @@ impl PreingestionManagerStatic {
                             )
                             .await;
                     }
-                    Some(TaskState::Exception)
-                    | Some(TaskState::Interrupted)
-                    | Some(TaskState::Killed)
-                    | Some(TaskState::Cancelled) => {
+                    Some(
+                        state @ (TaskState::Exception
+                        | TaskState::Interrupted
+                        | TaskState::Killed
+                        | TaskState::Cancelled),
+                    ) => {
+                        let task_message = task_info
+                            .messages
+                            .last()
+                            .map_or(String::new(), |m| m.message.clone());
                         let msg = format!(
                             "Failure in firmware upgrade for {}: {} {:?}",
-                            &endpoint.address,
-                            task_info.task_state.unwrap_or(TaskState::Killed),
-                            task_info
-                                .messages
-                                .last()
-                                .map_or(String::new(), |m| m.message.clone())
+                            &endpoint.address, state, task_message,
                         );
-                        tracing::warn!(msg);
 
                         db.with_txn(|txn| {
                             async move {
                                 // Wait for site explorer to refresh it then try again after that.
-                                // Someday, we should generate metrics for visiblity if something fails multiple times.
                                 db::explored_endpoints::set_preingestion_recheck_versions_reason(
                                     endpoint.address,
                                     msg,
@@ -867,6 +901,18 @@ impl PreingestionManagerStatic {
                             .boxed()
                         })
                         .await??;
+                        // The event owns the historical WARN line and counts the
+                        // failure, so an endpoint failing repeatedly is visible
+                        // as a moving error series. It fires only after the
+                        // transition commits -- a rolled-back pass re-observes
+                        // this task and retries.
+                        emit(FirmwareUpgradeTaskFinished {
+                            firmware: FirmwareComponentLabel(*upgrade_type),
+                            final_state: UpgradeTaskFinalState::from_failed_task_state(state),
+                            outcome: Outcome::Error,
+                            address: endpoint.address,
+                            error: task_message,
+                        });
                     }
                     _ => {
                         // Unexpected state
@@ -882,7 +928,7 @@ impl PreingestionManagerStatic {
                 RedfishError::HTTPErrorCode { status_code, .. } => {
                     if status_code == NOT_FOUND {
                         // Dells (maybe others) have been observed to not have report the job any more after completing a host reboot for a UEFI upgrade.  If we get a 404 but see that we're at the right version, we're done with that upgrade.
-                        if let Some(fw_info) = self.find_fw_info_for_host(endpoint)
+                        if let Some(fw_info) = self.find_fw_info_for_host(db, endpoint).await?
                             && let Some(current_version) =
                                 endpoint.find_version(&fw_info, *upgrade_type)
                             && current_version == final_version
@@ -899,6 +945,16 @@ impl PreingestionManagerStatic {
                                 .boxed()
                             })
                             .await??;
+                            // The BMC dropped the task record after finishing;
+                            // the confirmed new version is the completion
+                            // evidence, so this task still counts as completed.
+                            emit(FirmwareUpgradeTaskFinished {
+                                firmware: FirmwareComponentLabel(*upgrade_type),
+                                final_state: UpgradeTaskFinalState::Completed,
+                                outcome: Outcome::Ok,
+                                address: endpoint.address,
+                                error: String::new(),
+                            });
                         }
                     }
                 }
@@ -984,7 +1040,12 @@ impl PreingestionManagerStatic {
                             &endpoint.address,
                             *power_drains_needed
                         );
-                        if let Err(e) = redfish_client.power(SystemPowerControl::ForceOff).await {
+                        if let Err(e) = count_power_op(
+                            PowerOperation::ForceOff,
+                            redfish_client.power(SystemPowerControl::ForceOff),
+                        )
+                        .await
+                        {
                             tracing::error!("Failed to power off {}: {e}", &endpoint.address);
                             return Ok(());
                         }
@@ -1021,8 +1082,11 @@ impl PreingestionManagerStatic {
                                     %power_state,
                                     "ACPowercycle requires chassis to be Off, forcing off first"
                                 );
-                                if let Err(e) =
-                                    redfish_client.power(SystemPowerControl::ForceOff).await
+                                if let Err(e) = count_power_op(
+                                    PowerOperation::ForceOff,
+                                    redfish_client.power(SystemPowerControl::ForceOff),
+                                )
+                                .await
                                 {
                                     tracing::error!(
                                         "Failed to force off {}: {e}",
@@ -1059,7 +1123,11 @@ impl PreingestionManagerStatic {
                                 return Ok(());
                             }
                         }
-                        if let Err(e) = redfish_client.power(SystemPowerControl::ACPowercycle).await
+                        if let Err(e) = count_power_op(
+                            PowerOperation::AcPowercycle,
+                            redfish_client.power(SystemPowerControl::ACPowercycle),
+                        )
+                        .await
                         {
                             tracing::error!("Failed to power cycle {}: {e}", &endpoint.address);
                             return Ok(());
@@ -1087,7 +1155,12 @@ impl PreingestionManagerStatic {
                 }
                 Some(PowerDrainState::Powercycle) => {
                     tracing::info!("Turning back on {}", &endpoint.address);
-                    if let Err(e) = redfish_client.power(SystemPowerControl::On).await {
+                    if let Err(e) = count_power_op(
+                        PowerOperation::On,
+                        redfish_client.power(SystemPowerControl::On),
+                    )
+                    .await
+                    {
                         tracing::error!("Failed to power on {}: {e}", &endpoint.address);
                         return Ok(());
                     }
@@ -1117,7 +1190,12 @@ impl PreingestionManagerStatic {
                 "Upgrade task has completed for {} but needs reboot, initiating one",
                 &endpoint.address
             );
-            if let Err(e) = redfish_client.power(SystemPowerControl::ForceRestart).await {
+            if let Err(e) = count_power_op(
+                PowerOperation::ForceRestart,
+                redfish_client.power(SystemPowerControl::ForceRestart),
+            )
+            .await
+            {
                 tracing::error!("Failed to reboot {}: {e}", &endpoint.address);
                 return Ok(());
             }
@@ -1144,7 +1222,9 @@ impl PreingestionManagerStatic {
                 "Upgrade task has completed for {} but needs BMC reboot, initiating one",
                 &endpoint.address
             );
-            if let Err(e) = redfish_client.bmc_reset().await {
+            if let Err(e) =
+                count_power_op(PowerOperation::BmcReset, redfish_client.bmc_reset()).await
+            {
                 tracing::error!("Failed to reboot {}: {e}", &endpoint.address);
                 return Ok(());
             }
@@ -1171,12 +1251,19 @@ impl PreingestionManagerStatic {
             } else {
                 SystemPowerControl::ForceOff
             };
-            if let Err(e) = redfish_client.power(poweroff_style).await {
+            if let Err(e) =
+                count_power_op(poweroff_style.into(), redfish_client.power(poweroff_style)).await
+            {
                 tracing::error!("Failed to power off {}: {e}", &endpoint.address);
                 return Ok(());
             }
             tokio::time::sleep(self.config.hgx_bmc_gpu_reboot_delay).await;
-            if let Err(e) = redfish_client.power(SystemPowerControl::On).await {
+            if let Err(e) = count_power_op(
+                PowerOperation::On,
+                redfish_client.power(SystemPowerControl::On),
+            )
+            .await
+            {
                 tracing::error!("Failed to power on {}: {e}", &endpoint.address);
                 return Ok(());
             }
@@ -1191,9 +1278,11 @@ impl PreingestionManagerStatic {
             .await??;
             return Ok(());
         } else if *upgrade_type == FirmwareComponentType::Cec {
-            match redfish_client
-                .chassis_reset("Bluefield_ERoT", SystemPowerControl::GracefulRestart)
-                .await
+            match count_power_op(
+                PowerOperation::ChassisReset,
+                redfish_client.chassis_reset("Bluefield_ERoT", SystemPowerControl::GracefulRestart),
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.to_string().contains("is not supported") => {
@@ -1231,7 +1320,7 @@ impl PreingestionManagerStatic {
         upgrade_type: &FirmwareComponentType,
         previous_reset_time: &Option<i64>,
     ) -> PreingestionManagerResult<()> {
-        if let Some(fw_info) = self.find_fw_info_for_host(endpoint) {
+        if let Some(fw_info) = self.find_fw_info_for_host(db, endpoint).await? {
             if let Some(current_version) = endpoint.find_version(&fw_info, *upgrade_type) {
                 if current_version != final_version {
                     // Still not reporting the new version.
@@ -1324,6 +1413,21 @@ impl PreingestionManagerStatic {
                     .await
             }
             Ok(false) => {
+                // Time is not in sync. The reset sequence powers off the host
+                // and resets the BMC, which must never happen on an
+                // ingested/paired (potentially tenant-assigned) machine. This
+                // mirrors the managed-host guard site-explorer already applies
+                // before its own remediation.
+                if self.is_ingested_host(db, endpoint).await {
+                    tracing::info!(
+                        "{} BMC time is out of sync but the host is already ingested; \
+                         skipping time-sync remediation",
+                        endpoint.address
+                    );
+                    return self
+                        .check_firmware_versions_below_preingestion(db, endpoint)
+                        .await;
+                }
                 // Time is not in sync, initiate reset sequence
                 tracing::warn!(
                     "{} BMC time is out of sync, initiating reset to fix time synchronization",
@@ -1380,7 +1484,9 @@ impl PreingestionManagerStatic {
                         return Ok(false);
                     }
                 };
-                if let Err(e) = redfish_client.bmc_reset().await {
+                if let Err(e) =
+                    count_power_op(PowerOperation::BmcReset, redfish_client.bmc_reset()).await
+                {
                     let next = attempts + 1;
                     if next >= INITIAL_BMC_RESET_MAX_ATTEMPTS {
                         tracing::warn!(
@@ -1644,7 +1750,12 @@ impl PreingestionManagerStatic {
         redfish_client: &dyn libredfish::Redfish,
         endpoint: &ExploredEndpoint,
     ) -> bool {
-        match redfish_client.power(SystemPowerControl::ForceOff).await {
+        match count_power_op(
+            PowerOperation::ForceOff,
+            redfish_client.power(SystemPowerControl::ForceOff),
+        )
+        .await
+        {
             Ok(()) => {}
             Err(e) if matches!(e, RedfishError::UnnecessaryOperation) => {
                 // ignore because it is already off
@@ -1667,7 +1778,7 @@ impl PreingestionManagerStatic {
             tracing::warn!("Host {} did not turn off when requested", endpoint.address);
             return false;
         }
-        if let Err(e) = redfish_client.bmc_reset().await {
+        if let Err(e) = count_power_op(PowerOperation::BmcReset, redfish_client.bmc_reset()).await {
             tracing::warn!("Could not reset BMC on {}: {e}", endpoint.address);
             return false;
         }
@@ -1689,7 +1800,12 @@ impl PreingestionManagerStatic {
             return false;
         }
 
-        match redfish_client.power(SystemPowerControl::On).await {
+        match count_power_op(
+            PowerOperation::On,
+            redfish_client.power(SystemPowerControl::On),
+        )
+        .await
+        {
             Ok(()) => {}
             Err(e) if matches!(e, RedfishError::UnnecessaryOperation) => {
                 // ignore because it is already on
@@ -2185,6 +2301,35 @@ impl PreingestionManagerStatic {
         }
     }
 
+    /// Returns true if this endpoint's BMC IP already maps to an ingested/paired
+    /// fleet machine.
+    ///
+    /// This reuses the same managed-host predicate site-explorer uses to refuse
+    /// remediation on ingested hosts (see
+    /// `site_explorer::managed_host::is_endpoint_in_managed_host`); both resolve
+    /// to `db::machine_topology::find_machine_id_by_bmc_ip`. We intentionally do
+    /// NOT use `endpoint.report.machine_id`, which is derived from DMI during
+    /// exploration and is present even for fresh, un-ingested hosts.
+    ///
+    /// Fails closed: on a lookup error we report the host as ingested so the
+    /// caller skips the destructive time-sync remediation rather than risk power
+    /// cycling a tenant-assigned node.
+    async fn is_ingested_host(&self, db: &PgPool, endpoint: &ExploredEndpoint) -> bool {
+        match db::machine_topology::find_machine_id_by_bmc_ip(db, &endpoint.address.to_string())
+            .await
+        {
+            Ok(machine_id) => machine_id.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not determine if {} is an ingested host: {e}; \
+                     treating as ingested to skip time-sync remediation",
+                    endpoint.address
+                );
+                true
+            }
+        }
+    }
+
     /// Handler for BfbRecoveryNeeded state.
     /// Host preingestion state was already validated by the gRPC handler at trigger time.
     async fn in_bfb_recovery_needed(
@@ -2248,7 +2393,12 @@ impl PreingestionManagerStatic {
                 };
 
                 tracing::info!(%address, host_ip=%host_bmc_ip, "{label}: powering off host");
-                if let Err(e) = redfish_client.power(SystemPowerControl::ForceOff).await {
+                if let Err(e) = count_power_op(
+                    PowerOperation::ForceOff,
+                    redfish_client.power(SystemPowerControl::ForceOff),
+                )
+                .await
+                {
                     tracing::error!(%address, host_ip=%host_bmc_ip, error=%e, "{label}: failed to power off host, will retry");
                     return Ok(());
                 }
@@ -2279,7 +2429,12 @@ impl PreingestionManagerStatic {
                 };
 
                 tracing::info!(%address, host_ip=%host_bmc_ip, "{label}: powering on host");
-                if let Err(e) = redfish_client.power(SystemPowerControl::On).await {
+                if let Err(e) = count_power_op(
+                    PowerOperation::On,
+                    redfish_client.power(SystemPowerControl::On),
+                )
+                .await
+                {
                     tracing::error!(%address, host_ip=%host_bmc_ip, error=%e, "{label}: failed to power on host, will retry");
                     return Ok(());
                 }
@@ -2393,20 +2548,37 @@ impl PreingestionManagerStatic {
             let _permit = permit;
 
             tracing::info!(%address, "starting BFB copy to DPU rshim");
+            let started = std::time::Instant::now();
 
             let result = bfb_rshim_copier
                 .copy_bfb_to_dpu_rshim(bmc_addr, &bmc_credential_key)
                 .await;
 
+            // A result the poll loop no longer tracks was preempted by its
+            // timeout: the Timeout observation already counted this copy, so
+            // the late result is dropped without a second emit.
             match result {
                 Ok(()) => {
-                    tracing::info!(%address, "BFB copy completed successfully");
-                    bfb_copy_state.completed(address.to_string(), BfbCopyResult::Success);
+                    if bfb_copy_state.completed(&address.to_string(), BfbCopyResult::Success) {
+                        emit(BfbCopyFinished {
+                            outcome: BfbCopyOutcome::Ok,
+                            took: started.elapsed(),
+                            address,
+                            error: String::new(),
+                        });
+                    }
                 }
                 Err(e) => {
-                    tracing::error!(%address, error=%e, "BFB copy failed");
-                    bfb_copy_state
-                        .completed(address.to_string(), BfbCopyResult::Failed(e.to_string()));
+                    if bfb_copy_state
+                        .completed(&address.to_string(), BfbCopyResult::Failed(e.to_string()))
+                    {
+                        emit(BfbCopyFinished {
+                            outcome: BfbCopyOutcome::Error,
+                            took: started.elapsed(),
+                            address,
+                            error: e.to_string(),
+                        });
+                    }
                 }
             }
         });
@@ -2424,49 +2596,18 @@ impl PreingestionManagerStatic {
         let address = endpoint.address.to_string();
 
         let timeout_mins = BFB_COPY_TIMEOUT_MINS;
+        let elapsed = Utc::now().signed_duration_since(*started_at);
+        let elapsed_mins = elapsed.num_minutes();
 
-        let elapsed_mins = Utc::now().signed_duration_since(*started_at).num_minutes();
-        if elapsed_mins > timeout_mins {
-            self.bfb_copy_state.clear(&address);
-            tracing::error!(%address, elapsed_mins, timeout_mins, "BFB copy timed out");
-            db.with_txn(|txn| {
-                db::explored_endpoints::set_preingestion_failed(
-                    endpoint.address,
-                    format!(
-                        "BFB copy timed out after {elapsed_mins} minutes. \
-                         Re-run `site-explorer copy-bfb-to-dpu-rshim` to retry.",
-                    ),
-                    txn,
-                )
-                .boxed()
-            })
-            .await??;
-            return Ok(());
-        }
-
-        if !self.bfb_copy_state.is_tracked(&address) {
-            tracing::warn!(%address, "detected orphaned BFB copy state, restarting copy");
-            db.with_txn(|txn| {
-                db::explored_endpoints::set_preingestion_bfb_recovery_needed(
-                    endpoint.address,
-                    "Restarting after orphaned copy state detected".to_string(),
-                    *host_bmc_ip,
-                    false,
-                    txn,
-                )
-                .boxed()
-            })
-            .await??;
-            return Ok(());
-        }
-
-        match self.bfb_copy_state.state(&address) {
-            None => {
-                tracing::debug!(%address, "BFB copy still in progress");
-                Ok(())
-            }
-            Some(BfbCopyResult::Success) => {
-                self.bfb_copy_state.clear(&address);
+        // One lock-held step decides this pass: a ready result always wins
+        // over the deadline (the spawned task already counted it), and a
+        // timeout removes the tracker entry under that same lock, so a
+        // racing `completed()` finds nothing and drops its late result.
+        match self
+            .bfb_copy_state
+            .resolve_or_timeout(&address, elapsed_mins > timeout_mins)
+        {
+            BfbResolution::Ready(BfbCopyResult::Success) => {
                 tracing::info!(%address, "BFB copy completed, waiting for installation");
                 db.with_txn(|txn| {
                     db::explored_endpoints::set_preingestion_bfb_installation_wait(
@@ -2479,8 +2620,7 @@ impl PreingestionManagerStatic {
                 .await??;
                 Ok(())
             }
-            Some(BfbCopyResult::Failed(error)) => {
-                self.bfb_copy_state.clear(&address);
+            BfbResolution::Ready(BfbCopyResult::Failed(error)) => {
                 tracing::error!(%address, error=%error, "BFB copy failed");
                 db.with_txn(|txn| {
                     db::explored_endpoints::set_preingestion_failed(
@@ -2494,6 +2634,52 @@ impl PreingestionManagerStatic {
                     .boxed()
                 })
                 .await??;
+                Ok(())
+            }
+            BfbResolution::TimedOut => {
+                // No result inside the deadline: the task died without
+                // reporting, or the copy is still dragging. The entry is
+                // already gone (removed under the resolution's lock), so
+                // this Timeout stays the copy's only record.
+                emit(BfbCopyFinished {
+                    outcome: BfbCopyOutcome::Timeout,
+                    took: elapsed.to_std().unwrap_or_default(),
+                    address: endpoint.address,
+                    error: format!(
+                        "BFB copy timed out after {elapsed_mins} minutes (limit {timeout_mins} minutes)"
+                    ),
+                });
+                db.with_txn(|txn| {
+                    db::explored_endpoints::set_preingestion_failed(
+                        endpoint.address,
+                        format!(
+                            "BFB copy timed out after {elapsed_mins} minutes. \
+                             Re-run `site-explorer copy-bfb-to-dpu-rshim` to retry.",
+                        ),
+                        txn,
+                    )
+                    .boxed()
+                })
+                .await??;
+                Ok(())
+            }
+            BfbResolution::Untracked => {
+                tracing::warn!(%address, "detected orphaned BFB copy state, restarting copy");
+                db.with_txn(|txn| {
+                    db::explored_endpoints::set_preingestion_bfb_recovery_needed(
+                        endpoint.address,
+                        "Restarting after orphaned copy state detected".to_string(),
+                        *host_bmc_ip,
+                        false,
+                        txn,
+                    )
+                    .boxed()
+                })
+                .await??;
+                Ok(())
+            }
+            BfbResolution::Pending => {
+                tracing::debug!(%address, "BFB copy still in progress");
                 Ok(())
             }
         }
@@ -2611,6 +2797,22 @@ pub enum BfbCopyResult {
     Failed(String),
 }
 
+/// The poll loop's single-lock view of one copy, from
+/// [`BfbCopyManager::resolve_or_timeout`].
+#[derive(Debug)]
+enum BfbResolution {
+    /// A recorded result was taken; the entry is gone.
+    Ready(BfbCopyResult),
+    /// No result inside the deadline; the entry (if any) was removed under
+    /// the same lock, so a racing `completed()` finds nothing and its late
+    /// result is dropped.
+    TimedOut,
+    /// Tracked with no result yet, inside the deadline.
+    Pending,
+    /// Not tracked at all (inside the deadline): an orphaned copy state.
+    Untracked,
+}
+
 #[derive(Debug, Default)]
 struct BfbCopyManager {
     active: std::sync::Mutex<HashMap<String, Option<BfbCopyResult>>>,
@@ -2622,9 +2824,19 @@ impl BfbCopyManager {
         hashmap.insert(address, None);
     }
 
-    fn completed(&self, address: String, result: BfbCopyResult) {
+    /// Records the copy's result, but only while the address is still
+    /// tracked. Returns false when the poll loop already gave up on the copy
+    /// (timeout) and removed it -- the late result is dropped so the caller
+    /// doesn't count it a second time.
+    fn completed(&self, address: &str, result: BfbCopyResult) -> bool {
         let mut hashmap = self.active.lock().expect("lock poisoned");
-        hashmap.insert(address, Some(result));
+        match hashmap.get_mut(address) {
+            Some(entry) => {
+                *entry = Some(result);
+                true
+            }
+            None => false,
+        }
     }
 
     fn clear(&self, address: &str) {
@@ -2632,14 +2844,30 @@ impl BfbCopyManager {
         hashmap.remove(address);
     }
 
-    fn state(&self, address: &str) -> Option<BfbCopyResult> {
-        let hashmap = self.active.lock().expect("lock poisoned");
-        hashmap.get(address).and_then(|r| r.clone())
-    }
-
-    fn is_tracked(&self, address: &str) -> bool {
-        let hashmap = self.active.lock().expect("lock poisoned");
-        hashmap.contains_key(address)
+    /// Resolves one poll pass under a single lock, so a `completed()` racing
+    /// in between cannot be both consumed and timed out. A present result is
+    /// taken (and always wins, deadline or not); otherwise, past the deadline
+    /// the entry is removed and the copy reported [`BfbResolution::TimedOut`].
+    /// An address that was never tracked also times out past the deadline,
+    /// preserving the state machine's `started_at` SLA across restarts.
+    fn resolve_or_timeout(&self, address: &str, timed_out: bool) -> BfbResolution {
+        let mut hashmap = self.active.lock().expect("lock poisoned");
+        let Some(entry) = hashmap.get_mut(address) else {
+            return if timed_out {
+                BfbResolution::TimedOut
+            } else {
+                BfbResolution::Untracked
+            };
+        };
+        if let Some(result) = entry.take() {
+            hashmap.remove(address);
+            return BfbResolution::Ready(result);
+        }
+        if timed_out {
+            hashmap.remove(address);
+            return BfbResolution::TimedOut;
+        }
+        BfbResolution::Pending
     }
 }
 
@@ -2679,6 +2907,22 @@ struct InUpgradeFirmwareWaitArgs<'a> {
     firmware_number: u32,
 }
 
+fn select_firmware_for_artifact_continuation<'a>(
+    component_info: &'a FirmwareComponent,
+    final_version: &str,
+) -> Option<&'a FirmwareEntry> {
+    component_info
+        .known_firmware
+        .iter()
+        .find(|firmware| firmware.version == final_version)
+        .or_else(|| {
+            component_info
+                .known_firmware
+                .iter()
+                .find(|firmware| firmware.default)
+        })
+}
+
 /// need_upgrade determines if the given endpoint needs a firmware upgrade based on the description in fw_info, and if
 /// so returns the FirmwareEntry matching the desired upgrade along with the ID that Redfish uses to specify its version.
 fn need_upgrade(
@@ -2710,155 +2954,277 @@ fn need_upgrade(
         .cloned()
 }
 
-/// initiate_update will start a Redfish connection to the given address and start an update
-/// by doing an upload.  It may be unable to start it if the firmware has not been previously
-/// downloaded; if that happens it also returns success, but has not modified the state.  On Redfish
-///  errors, we return Ok but leave the state as it was, with the intention that we will retry
-///  on the next go.
-async fn initiate_update(
-    endpoint_clone: &ExploredEndpoint,
-    redfish_client_pool: &Arc<dyn RedfishClientPool>,
-    to_install: &FirmwareEntry,
-    firmware_type: &FirmwareComponentType,
-    downloader: &FirmwareDownloader,
-    firmware_number: u32,
-    db_pool: &PgPool,
-) -> Result<(), DatabaseError> {
-    if !to_install.get_filename(firmware_number).ends_with("bfb")
-        && !downloader.available(
-            &to_install.get_filename(firmware_number),
-            &to_install.get_url(),
-            &to_install.get_checksum(),
-        )
-    {
-        tracing::debug!(
-            "{} is being downloaded from {}, update deferred",
-            to_install.get_filename(firmware_number).display(),
-            to_install.get_url()
-        );
-
-        return Ok(());
-    }
-
-    // Setup the Redfish connection
-    let redfish_client = match redfish_client_pool
-        .create_client_for_ingested_host(endpoint_clone.address, db_pool)
-        .await
-    {
-        Ok(redfish_client) => redfish_client,
-        Err(e) => {
-            tracing::debug!(
-                "Failed to open redfish to {}: {e}",
-                endpoint_clone.address.to_string()
-            );
-            return Ok(());
-        }
-    };
-
-    tracing::debug!(
-        "initiate_update: Started upload of firmware to {}",
-        endpoint_clone.address
-    );
-    let redfish_component_type: libredfish::model::update_service::ComponentType =
-        match to_install.install_only_specified {
-            false => libredfish::model::update_service::ComponentType::Unknown,
-            true => firmware_type.into_libredfish(),
-        };
-    let task = if to_install.get_filename(firmware_number).ends_with("bfb") {
-        let _ = redfish_client
-            .enable_rshim_bmc()
-            .await
-            .map_err(|e| tracing::error!("initiate_update: Failed to call enable_rshim_bmc: {e}"));
-        let image_uri = format!(
-            "{}/{}",
-            to_install.get_url(),
-            to_install.get_filename(firmware_number).display()
-        );
-        tracing::debug!(
-            "initiate_update: Using simple_update with image URI: {}",
-            image_uri
-        );
-        match redfish_client
-            .update_firmware_simple_update(
-                image_uri.as_str(),
-                vec!["redfish/v1/UpdateService/FirmwareInventory/DPU_OS".to_string()],
-                TransferProtocolType::HTTP,
-            )
-            .await
-        {
-            Ok(task) => task.id,
-            Err(e) => {
-                tracing::error!(
-                    "initiate_update: Failed to call update_firmware_simple_update {}: {e}",
-                    endpoint_clone.address
-                );
-                return Ok(());
+impl PreingestionManagerStatic {
+    /// initiate_update will start a Redfish connection to the given address and start an update
+    /// by doing an upload. Returns true once the upload's Redfish task has been stored as the
+    /// new wait state. It may be unable to start the update if the firmware has not been
+    /// previously downloaded; if that happens it returns Ok(false), but has not modified the
+    /// state. On Redfish errors, we also return Ok(false) and leave the state as it was, with
+    /// the intention that we will retry on the next go.
+    async fn initiate_update(
+        &self,
+        endpoint_clone: &ExploredEndpoint,
+        to_install: &FirmwareEntry,
+        firmware_type: &FirmwareComponentType,
+        firmware_number: u32,
+        db_pool: &PgPool,
+    ) -> Result<bool, DatabaseError> {
+        let artifact = match resolve_preingestion_firmware_artifact(
+            &self.config.firmware_download_cache_directory,
+            to_install,
+            firmware_number,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::error!("Failed to resolve firmware artifact: {error}");
+                return Ok(false);
             }
-        }
-    } else {
-        match redfish_client
-            .update_firmware_multipart(
-                to_install.get_filename(firmware_number).as_path(),
-                true,
-                Duration::from_secs(120),
-                redfish_component_type,
-            )
-            .await
-        {
-            Ok(task) => task,
-            Err(RedfishError::NotSupported(err)) => {
-                tracing::warn!(
-                    "Multipart update is not supported: {err}. Trying to use HttpPushUri"
-                );
-                let file =
-                    match File::open(to_install.get_filename(firmware_number).as_path()).await {
-                        Ok(f) => f,
-                        Err(e) => {
-                            tracing::error!("Failed to open a file: {e}");
-                            return Ok(());
-                        }
-                    };
-                match redfish_client.update_firmware(file).await {
-                    Ok(task) => task.id,
-                    Err(e) => {
-                        tracing::error!(
-                            "initiate_update: Failed uploading firmware to {}: {e}",
-                            endpoint_clone.address
+        };
+
+        if !is_bfb_artifact(&artifact.local_path) {
+            match &artifact.source {
+                ResolvedFirmwareArtifactSource::Remote { url, sha256 } => {
+                    if !self.downloader.available(&artifact.local_path, url, sha256) {
+                        tracing::debug!(
+                            "{} is being downloaded from {}, update deferred",
+                            artifact.local_path.display(),
+                            url
                         );
-                        return Ok(());
+
+                        return Ok(false);
+                    }
+                }
+                ResolvedFirmwareArtifactSource::Local => {
+                    if !artifact.local_path.exists() {
+                        tracing::error!(
+                            "Firmware artifact {} is not present",
+                            artifact.local_path.display()
+                        );
+                        return Ok(false);
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    "initiate_update: Failed uploading firmware to {}: {e}",
-                    endpoint_clone.address
-                );
-                return Ok(());
-            }
         }
+
+        // Setup the Redfish connection
+        let redfish_client = match self
+            .redfish_client_pool
+            .create_client_for_ingested_host(endpoint_clone.address, db_pool)
+            .await
+        {
+            Ok(redfish_client) => redfish_client,
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to open redfish to {}: {e}",
+                    endpoint_clone.address.to_string()
+                );
+                return Ok(false);
+            }
+        };
+
+        tracing::debug!(
+            "initiate_update: Started upload of firmware to {}",
+            endpoint_clone.address
+        );
+
+        let redfish_component_type: libredfish::model::update_service::ComponentType =
+            match to_install.install_only_specified {
+                false => libredfish::model::update_service::ComponentType::Unknown,
+                true => firmware_type.into_libredfish(),
+            };
+
+        let task = if is_bfb_artifact(&artifact.local_path) {
+            let _ = redfish_client.enable_rshim_bmc().await.map_err(|e| {
+                tracing::error!("initiate_update: Failed to call enable_rshim_bmc: {e}")
+            });
+            tracing::debug!(
+                "initiate_update: Using simple_update with image URI: {}",
+                artifact.bfb_image_uri
+            );
+            match redfish_client
+                .update_firmware_simple_update(
+                    artifact.bfb_image_uri.as_str(),
+                    vec!["redfish/v1/UpdateService/FirmwareInventory/DPU_OS".to_string()],
+                    TransferProtocolType::HTTP,
+                )
+                .await
+            {
+                Ok(task) => {
+                    emit(FirmwareUploadFinished {
+                        method: FirmwareUploadMethod::SimpleUpdate,
+                        outcome: Outcome::Ok,
+                    });
+                    task.id
+                }
+                Err(e) => {
+                    emit(FirmwareUploadFinished {
+                        method: FirmwareUploadMethod::SimpleUpdate,
+                        outcome: Outcome::Error,
+                    });
+                    tracing::error!(
+                        "initiate_update: Failed to call update_firmware_simple_update {}: {e}",
+                        endpoint_clone.address
+                    );
+                    return Ok(false);
+                }
+            }
+        } else {
+            match redfish_client
+                .update_firmware_multipart(
+                    artifact.local_path.as_path(),
+                    true,
+                    Duration::from_secs(120),
+                    redfish_component_type,
+                )
+                .await
+            {
+                Ok(task) => {
+                    emit(FirmwareUploadFinished {
+                        method: FirmwareUploadMethod::Multipart,
+                        outcome: Outcome::Ok,
+                    });
+                    task
+                }
+                Err(RedfishError::NotSupported(err)) => {
+                    emit(FirmwareUploadFinished {
+                        method: FirmwareUploadMethod::Multipart,
+                        outcome: Outcome::Error,
+                    });
+                    tracing::warn!(
+                        "Multipart update is not supported: {err}. Trying to use HttpPushUri"
+                    );
+                    let file = match File::open(artifact.local_path.as_path()).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::error!("Failed to open a file: {e}");
+                            return Ok(false);
+                        }
+                    };
+                    match redfish_client.update_firmware(file).await {
+                        Ok(task) => {
+                            emit(FirmwareUploadFinished {
+                                method: FirmwareUploadMethod::HttpPush,
+                                outcome: Outcome::Ok,
+                            });
+                            task.id
+                        }
+                        Err(e) => {
+                            emit(FirmwareUploadFinished {
+                                method: FirmwareUploadMethod::HttpPush,
+                                outcome: Outcome::Error,
+                            });
+                            tracing::error!(
+                                "initiate_update: Failed uploading firmware to {}: {e}",
+                                endpoint_clone.address
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+                Err(e) => {
+                    emit(FirmwareUploadFinished {
+                        method: FirmwareUploadMethod::Multipart,
+                        outcome: Outcome::Error,
+                    });
+                    tracing::warn!(
+                        "initiate_update: Failed uploading firmware to {}: {e}",
+                        endpoint_clone.address
+                    );
+                    return Ok(false);
+                }
+            }
+        };
+
+        tracing::debug!(
+            "initiate_update: Completed upload of firmware to {}",
+            endpoint_clone.address
+        );
+
+        db_pool
+            .with_txn(|txn| {
+                Box::pin(db::explored_endpoints::set_preingestion_waittask(
+                    endpoint_clone.address,
+                    task,
+                    &to_install.version,
+                    firmware_type,
+                    to_install.power_drains_needed,
+                    firmware_number,
+                    txn,
+                ))
+            })
+            .await??;
+
+        Ok(true)
+    }
+}
+
+struct PreingestionFirmwareArtifact {
+    local_path: PathBuf,
+    source: ResolvedFirmwareArtifactSource,
+    bfb_image_uri: String,
+}
+
+fn resolve_preingestion_firmware_artifact(
+    firmware_download_cache_directory: &Path,
+    to_install: &FirmwareEntry,
+    firmware_number: u32,
+) -> Result<PreingestionFirmwareArtifact, String> {
+    if let Some(artifact) = resolve_files_firmware_artifact(
+        firmware_download_cache_directory,
+        to_install,
+        firmware_number,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        let bfb_image_uri = match &artifact.source {
+            ResolvedFirmwareArtifactSource::Remote { url, .. } => url.clone(),
+            ResolvedFirmwareArtifactSource::Local => {
+                legacy_bfb_image_uri(to_install, &artifact.local_path)
+            }
+        };
+
+        return Ok(PreingestionFirmwareArtifact {
+            local_path: artifact.local_path,
+            source: artifact.source,
+            bfb_image_uri,
+        });
+    }
+
+    let local_path = to_install.get_filename(firmware_number);
+    let bfb_image_uri = legacy_bfb_image_uri(to_install, &local_path);
+    let source = match legacy_artifact_remote_url(to_install) {
+        Some(url) => ResolvedFirmwareArtifactSource::Remote {
+            url: url.to_string(),
+            sha256: to_install.get_checksum(),
+        },
+        None => ResolvedFirmwareArtifactSource::Local,
     };
 
-    tracing::debug!(
-        "initiate_update: Completed upload of firmware to {}",
-        endpoint_clone.address
-    );
+    Ok(PreingestionFirmwareArtifact {
+        local_path,
+        source,
+        bfb_image_uri,
+    })
+}
 
-    db_pool
-        .with_txn(|txn| {
-            Box::pin(db::explored_endpoints::set_preingestion_waittask(
-                endpoint_clone.address,
-                task,
-                &to_install.version,
-                firmware_type,
-                to_install.power_drains_needed,
-                firmware_number,
-                txn,
-            ))
-        })
-        .await??;
+fn legacy_artifact_remote_url(to_install: &FirmwareEntry) -> Option<&str> {
+    to_install
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && *url != LEGACY_NO_URL_SENTINEL)
+}
 
-    Ok(())
+fn legacy_bfb_image_uri(to_install: &FirmwareEntry, local_path: &Path) -> String {
+    format!("{}/{}", to_install.get_url(), local_path.display())
+}
+
+fn is_bfb_artifact(path: &Path) -> bool {
+    path.ends_with("bfb")
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bfb"))
 }
 
 trait CreateClientForIngestedHost {
@@ -2886,5 +3252,143 @@ impl CreateClientForIngestedHost for Arc<dyn RedfishClientPool> {
                 }
                 _ => PreingestionManagerError::internal(format!("{e}")),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_test_support::value_scenarios;
+
+    use super::*;
+
+    #[test]
+    fn resolve_preingestion_firmware_artifact_preserves_legacy_local_entries() {
+        for url in [None, Some(LEGACY_NO_URL_SENTINEL.to_string())] {
+            let mut firmware =
+                FirmwareEntry::standard_filename("1.0.0", "/firmware/local-artifact.bin");
+            firmware.url = url;
+
+            let artifact =
+                resolve_preingestion_firmware_artifact(Path::new("/cache"), &firmware, 0).unwrap();
+
+            assert_eq!(
+                artifact.local_path,
+                Path::new("/firmware/local-artifact.bin")
+            );
+            assert_eq!(artifact.source, ResolvedFirmwareArtifactSource::Local);
+        }
+    }
+
+    #[test]
+    fn resolve_preingestion_firmware_artifact_preserves_legacy_remote_entries() {
+        let mut firmware = FirmwareEntry::standard_filename("1.0.0", "/firmware/artifact.bin");
+        firmware.url = Some("https://firmware.example.invalid/artifact.bin".to_string());
+        firmware.checksum = Some("abc123".to_string());
+
+        let artifact =
+            resolve_preingestion_firmware_artifact(Path::new("/cache"), &firmware, 0).unwrap();
+
+        assert_eq!(artifact.local_path, Path::new("/firmware/artifact.bin"));
+        assert_eq!(
+            artifact.source,
+            ResolvedFirmwareArtifactSource::Remote {
+                url: "https://firmware.example.invalid/artifact.bin".to_string(),
+                sha256: "abc123".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn is_bfb_artifact_matches_legacy_component_and_bfb_extension() {
+        for (path, expected) in [
+            ("/firmware/bfb", true),
+            ("/firmware/foo.bfb", true),
+            ("/firmware/foo.BFB", true),
+            ("/firmware/foo.bin", false),
+            ("/firmware/bfb.bin", false),
+        ] {
+            assert_eq!(is_bfb_artifact(Path::new(path)), expected, "{path}");
+        }
+    }
+
+    /// The poll's single-lock resolution: a ready result always wins over
+    /// the deadline, and a timeout removes the entry under that same lock,
+    /// so a racing `completed()` finds nothing and reports the late result
+    /// dropped.
+    #[test]
+    fn bfb_copy_manager_resolves_or_times_out_atomically() {
+        let manager = BfbCopyManager::default();
+
+        // A recorded result is taken even past the deadline, and taking it
+        // untracks the copy.
+        manager.started("a".to_string());
+        assert!(manager.completed("a", BfbCopyResult::Success));
+        assert!(matches!(
+            manager.resolve_or_timeout("a", true),
+            BfbResolution::Ready(BfbCopyResult::Success)
+        ));
+        assert!(matches!(
+            manager.resolve_or_timeout("a", false),
+            BfbResolution::Untracked
+        ));
+
+        // A failure result resolves the same way.
+        manager.started("b".to_string());
+        assert!(manager.completed("b", BfbCopyResult::Failed("ssh died".to_string())));
+        assert!(matches!(
+            manager.resolve_or_timeout("b", false),
+            BfbResolution::Ready(BfbCopyResult::Failed(_))
+        ));
+
+        // No result inside the deadline stays tracked and pending; past the
+        // deadline the entry is removed, and the task's racing `completed()`
+        // finds nothing -- its late result is dropped.
+        manager.started("c".to_string());
+        assert!(matches!(
+            manager.resolve_or_timeout("c", false),
+            BfbResolution::Pending
+        ));
+        assert!(matches!(
+            manager.resolve_or_timeout("c", true),
+            BfbResolution::TimedOut
+        ));
+        assert!(!manager.completed("c", BfbCopyResult::Success));
+
+        // A never-tracked address is an orphan inside the deadline and a
+        // timeout past it (the started_at SLA holds across restarts).
+        assert!(matches!(
+            manager.resolve_or_timeout("d", false),
+            BfbResolution::Untracked
+        ));
+        assert!(matches!(
+            manager.resolve_or_timeout("d", true),
+            BfbResolution::TimedOut
+        ));
+    }
+
+    #[test]
+    fn select_firmware_for_artifact_continuation_selects_requested_or_default() {
+        value_scenarios!(run = |requested_version| {
+            let component = FirmwareComponent {
+                known_firmware: vec![
+                    FirmwareEntry::standard_notdefault("6.00.30.00"),
+                    FirmwareEntry::standard("6.50.00.00"),
+                ],
+                ..FirmwareComponent::default()
+            };
+
+            select_firmware_for_artifact_continuation(&component, requested_version)
+                .unwrap()
+                .version
+                .clone()
+        };
+            "final-version preference" {
+                "6.00.30.00" => "6.00.30.00".to_string(),
+            }
+
+            "default fallback" {
+                "7.00.00.00" => "6.50.00.00".to_string(),
+            }
+        );
     }
 }

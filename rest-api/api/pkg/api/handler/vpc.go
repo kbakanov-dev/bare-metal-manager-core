@@ -34,7 +34,7 @@ import (
 	auth "github.com/NVIDIA/infra-controller/rest-api/auth/pkg/authorization"
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 )
 
@@ -307,7 +307,7 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 
 	var vpc *cdbm.Vpc
 	var ssd *cdbm.StatusDetail
-	controllerVpc := &cwssaws.Vpc{}
+	controllerVpc := &corev1.Vpc{}
 
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
@@ -356,14 +356,13 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 		vpc = updatedVpc
 
 		// Create status detail
-		createdSsd, derr := sdDAO.CreateFromParams(ctx, tx, vpc.ID.String(), cdbm.VpcStatusProvisioning,
-			cutil.GetPtr("VPC provisioning has been initiated on Site"))
+		createdSsd, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: cdbm.VpcStatusProvisioning, Message: cutil.GetPtr("VPC provisioning has been initiated on Site")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for VPC", nil)
 		}
 		if createdSsd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for VPC", nil)
 		}
 		ssd = createdSsd
@@ -452,7 +451,7 @@ func (cvh CreateVPCHandler) Handle(c echo.Context) error {
 			vpc = updatedVpc
 
 			// Best effort create status detail
-			ssd, err = sdDAO.CreateFromParams(ctx, nil, vpc.ID.String(), cdbm.VpcStatusReady, cutil.GetPtr("VPC is ready for use"))
+			ssd, err = sdDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: cdbm.VpcStatusReady, Message: cutil.GetPtr("VPC is ready for use")})
 			if err != nil {
 				logger.Error().Err(err).Msg("error creating Status Detail DB entry")
 			} else if ssd == nil {
@@ -755,13 +754,9 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 
 		clearInput := cdbm.VpcClearInput{VpcID: vpc.ID}
 		shouldClear := false
-		// If this request is attempting to clear the OS for the instance, set it.
-		if apiRequest.NetworkSecurityGroupID != nil && *apiRequest.NetworkSecurityGroupID == "" {
-			clearInput.NetworkSecurityGroupID = true
-			shouldClear = true
-		}
 
-		// If this request is attempting to clear NSG for the VPC, set it.
+		// NSG updates clear propagation details so users do not see stale status.
+		// An empty ID also clears the VPC association itself.
 		if apiRequest.NetworkSecurityGroupID != nil {
 			if *apiRequest.NetworkSecurityGroupID == "" {
 				clearInput.NetworkSecurityGroupID = true
@@ -790,7 +785,7 @@ func (uvh UpdateVPCHandler) Handle(c echo.Context) error {
 		}
 
 		// Get status details
-		fetchedSsds, _, derr := sdDAO.GetAllByEntityID(ctx, tx, vpc.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		fetchedSsds, _, derr := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{vpc.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for VPC from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for VPC", nil)
@@ -1055,7 +1050,7 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 		uv = updatedVpc
 
 		// Get status details
-		fetchedSsds, _, derr := sdDAO.GetAllByEntityID(ctx, tx, uv.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		fetchedSsds, _, derr := sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{uv.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error retrieving Status Details for VPC from DB")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve status history for VPC", nil)
@@ -1070,9 +1065,9 @@ func (uvvh UpdateVPCVirtualizationHandler) Handle(c echo.Context) error {
 		}
 
 		// VPC virtualization type can only be updated to FNN, the request validator guarantees that
-		siteVirtualizationType := cwssaws.VpcVirtualizationType_FNN
-		siteRequest := &cwssaws.VpcUpdateVirtualizationRequest{
-			Id:                        &cwssaws.VpcId{Value: vpc.GetSiteID().String()},
+		siteVirtualizationType := corev1.VpcVirtualizationType_FNN
+		siteRequest := &corev1.VpcUpdateVirtualizationRequest{
+			Id:                        &corev1.VpcId{Value: vpc.GetSiteID().String()},
 			NetworkVirtualizationType: &siteVirtualizationType,
 		}
 
@@ -1347,26 +1342,6 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, errMsg, nil)
 	}
 
-	// Get infrastructure provider ID from query param
-	var infrastructureProviderID *uuid.UUID
-	qInfrastructureProviderID := c.QueryParam("infrastructureProviderId")
-	if qInfrastructureProviderID != "" {
-		id, serr := uuid.Parse(qInfrastructureProviderID)
-		if serr != nil {
-			logger.Warn().Err(serr).Msg("error parsing infrastructureProviderId in query into uuid")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Invalid Infrastructure Provider ID in query", nil)
-		}
-		infrastructureProviderID = &id
-
-		// Check for IP existence
-		ipDAO := cdbm.NewInfrastructureProviderDAO(gavh.dbSession)
-		_, verr := ipDAO.GetByID(ctx, nil, *infrastructureProviderID, nil)
-		if verr != nil {
-			logger.Warn().Err(verr).Msg("error retrieving InfrastructureProvider from DB by ID")
-			return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, "Could not retrieve InfrastructureProvider with ID specified in query", nil)
-		}
-	}
-
 	// Get site IDs from query param
 	var siteIDs []uuid.UUID
 
@@ -1424,7 +1399,7 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 	// Get Tenant for this org
 	tnDAO := cdbm.NewTenantDAO(gavh.dbSession)
 
-	tenants, err := tnDAO.GetAllByOrg(ctx, nil, org, nil)
+	tenants, _, err := tnDAO.GetAll(ctx, nil, cdbm.TenantFilterInput{Orgs: []string{org}}, cdbp.PageInput{Limit: cutil.GetPtr(cdbp.TotalLimit)}, nil)
 	if err != nil {
 		logger.Error().Err(err).Msg("error retrieving Tenant for this org")
 		return cutil.NewAPIErrorResponse(c, http.StatusInternalServerError, "Failed to retrieve Tenant for org", nil)
@@ -1439,10 +1414,9 @@ func (gavh GetAllVPCHandler) Handle(c echo.Context) error {
 	vpcDAO := cdbm.NewVpcDAO(gavh.dbSession)
 
 	vpcFilter := cdbm.VpcFilterInput{
-		Org:                      &org,
-		InfrastructureProviderID: infrastructureProviderID,
-		SearchQuery:              searchQuery,
-		TenantIDs:                []uuid.UUID{tenant.ID},
+		Org:         &org,
+		SearchQuery: searchQuery,
+		TenantIDs:   []uuid.UUID{tenant.ID},
 	}
 
 	if len(siteIDs) > 0 {
@@ -1732,8 +1706,7 @@ func (dvh DeleteVPCHandler) Handle(c echo.Context) error {
 		}
 
 		// Create status detail (best-effort: original code only logs on error)
-		if _, derr := sdDAO.CreateFromParams(ctx, tx, vpc.ID.String(), *cutil.GetPtr(cdbm.VpcStatusDeleting),
-			cutil.GetPtr("received request for deletion, pending processing")); derr != nil {
+		if _, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: vpc.ID.String(), Status: *cutil.GetPtr(cdbm.VpcStatusDeleting), Message: cutil.GetPtr("received request for deletion, pending processing")}); derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 		}
 
@@ -1744,8 +1717,8 @@ func (dvh DeleteVPCHandler) Handle(c echo.Context) error {
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve client for Site", nil)
 		}
 
-		deleteVpcRequest := &cwssaws.VpcDeletionRequest{
-			Id: &cwssaws.VpcId{Value: vpc.GetSiteID().String()},
+		deleteVpcRequest := &corev1.VpcDeletionRequest{
+			Id: &corev1.VpcId{Value: vpc.GetSiteID().String()},
 		}
 
 		workflowOptions := temporalClient.StartWorkflowOptions{

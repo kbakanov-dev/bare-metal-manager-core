@@ -4,6 +4,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +23,9 @@ import (
 	sc "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/site"
 	authz "github.com/NVIDIA/infra-controller/rest-api/auth/pkg/authorization"
 	"github.com/NVIDIA/infra-controller/rest-api/common/pkg/coreproxy"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
+	cdbm "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/model"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 func TestCreateOrUpdateBMCCredentialHandlerClearsMacAddressForSiteWideRoot(t *testing.T) {
@@ -37,9 +40,9 @@ func TestCreateOrUpdateBMCCredentialHandlerClearsMacAddressForSiteWideRoot(t *te
 	})
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	var coreReq cwssaws.CredentialCreationRequest
+	var coreReq corev1.CredentialCreationRequest
 	require.NoError(t, protojson.Unmarshal(proxiedReq.RequestJSON, &coreReq))
-	assert.Equal(t, cwssaws.CredentialType_SiteWideBmcRoot, coreReq.GetCredentialType())
+	assert.Equal(t, corev1.CredentialType_SiteWideBmcRoot, coreReq.GetCredentialType())
 	assert.Nil(t, coreReq.MacAddress)
 	assert.NotContains(t, string(proxiedReq.RequestJSON), "macAddress")
 
@@ -95,6 +98,12 @@ func newBMCCredentialHandlerFixture(t *testing.T) bmcCredentialHandlerFixture {
 	user := common.TestBuildUser(t, dbSession, "test-starfleet-id", org, []string{authz.ProviderAdminRole})
 	ip := common.TestBuildInfrastructureProvider(t, dbSession, "Test Infrastructure Provider", org, user)
 	site := common.TestBuildSite(t, dbSession, ip, "Test Site", user)
+	sDAO := cdbm.NewSiteDAO(dbSession)
+	_, err := sDAO.Update(context.Background(), nil, cdbm.SiteUpdateInput{
+		SiteID: site.ID,
+		Status: cutil.GetPtr(cdbm.SiteStatusRegistered),
+	})
+	require.NoError(t, err)
 
 	proxiedReq := &coreproxy.Request{}
 	wrun := &tmocks.WorkflowRun{}

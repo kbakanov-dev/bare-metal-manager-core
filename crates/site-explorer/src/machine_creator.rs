@@ -36,6 +36,7 @@ use model::machine::{
     CURRENT_STATE_MODEL_VERSION, DpuDiscoveringState, DpuDiscoveringStates, Machine,
     MachineInterfaceSnapshot, ManagedHostState,
 };
+use model::machine_interface::InterfaceType;
 use model::machine_interface_address::MachineInterfaceAssociation;
 use model::network_segment::NetworkSegmentType;
 use model::predicted_machine_interface::NewPredictedMachineInterface;
@@ -155,6 +156,13 @@ impl MachineCreator {
             };
 
         let mut txn = Transaction::begin(pool).await?;
+
+        // Advisory-lock the admin segments before any machine-interface row
+        // writes (`attach_dpu_to_host` / `configure_dpu_interface`), so this
+        // transaction holds locks in the allocator order (segment advisory
+        // lock first, then interface rows) all the way to the reconcile
+        // pass -- which re-acquires the same locks as a no-op.
+        db::machine_interface::lock_all_admin_segments(txn.as_pgconn()).await?;
 
         // Zero-dpu case: If the explored host had no DPUs, we can create the machine now
         if managed_host.explored_host.dpus.is_empty() {
@@ -301,6 +309,7 @@ impl MachineCreator {
                             interface: Some(rms::NetworkInterface {
                                 ip_address: explored_host.host_bmc_ip.to_string(),
                                 mac_address: expected_machine.bmc_mac_address.to_string(),
+                                host_name: None,
                             }),
                             port: 443,
                             credentials: bmc_credentials.map(|(username, password)| {
@@ -475,9 +484,26 @@ impl MachineCreator {
             {
                 // There's already a machine_interface with this MAC...
                 if let Some(existing_machine_id) = machine_interface.machine_id {
-                    // ...If it has a MachineId, something's gone wrong. We already checked db::machine::find_by_mac()
-                    // above for all mac addresses, and returned Ok(false) if any were found. Finding an interface
-                    // with this MAC with a non-nil machine_id is a contradiction.
+                    // Same machine_id means the preallocated BMC interface row we
+                    // just attached via update_machine_topology(), not a contradiction.
+                    if existing_machine_id == *machine_id {
+                        // Reconcile its primary flag like the anonymous path
+                        // below, so a stale primary does not collide when the
+                        // real primary NIC is adopted. A BMC interface is never
+                        // primary, even when it shares the host NIC MAC.
+                        let want_primary =
+                            is_primary && machine_interface.interface_type != InterfaceType::Bmc;
+                        if machine_interface.primary_interface != want_primary {
+                            db::machine_interface::set_primary_interface(
+                                &machine_interface.id,
+                                want_primary,
+                                txn,
+                            )
+                            .await?;
+                        }
+                        continue;
+                    }
+                    // Different machine_id contradicts the find_by_mac() above.
                     tracing::error!(
                         %mac_address,
                         %machine_id,

@@ -17,13 +17,13 @@
 
 use std::sync::Arc;
 
-use prometheus::Counter;
+use prometheus::{Counter, CounterVec, Opts};
 
 use super::dedup_queue::DedupQueue;
 use super::event_mapper::RedfishEventMapper;
-use super::{CollectorEvent, DataSink, EventContext, MetricSample};
+use super::{CollectorEvent, DataSink, EventContext, LogRecord, MetricSample};
 use crate::HealthError;
-use crate::config::OtlpSinkConfig;
+use crate::config::OtlpTargetConfig;
 use crate::metrics::MetricsManager;
 use crate::otlp::drain::OtlpDrainTask;
 use crate::otlp::metrics_drain::OtlpMetricsDrainTask;
@@ -48,6 +48,7 @@ pub(crate) struct OtlpSink {
     replaced_total: Counter,
     metrics_replaced_total: Counter,
     mapper: Arc<dyn RedfishEventMapper>,
+    include_diagnostics: bool,
 }
 
 #[cfg(feature = "bench-hooks")]
@@ -57,9 +58,10 @@ pub struct OtlpSink {
     replaced_total: Counter,
     metrics_replaced_total: Counter,
     mapper: Arc<dyn RedfishEventMapper>,
+    include_diagnostics: bool,
 }
 
-/// true for events that belong in the logs drain; metrics and collection sentinels are not.
+/// Returns whether an event belongs in the logs drain.
 pub(crate) fn is_otlp_log_relevant(event: &CollectorEvent) -> bool {
     !matches!(
         event,
@@ -82,71 +84,121 @@ fn metric_queue_key(context: &EventContext, sample: &MetricSample) -> OtlpMetric
 }
 
 impl OtlpSink {
-    pub fn new(
-        config: &OtlpSinkConfig,
+    /// Creates one independently queued sink for each configured OTLP target.
+    ///
+    /// The returned order matches `configs`. Each sink starts separate log and
+    /// metric drain tasks, and its queue replacement counters use its position
+    /// in `configs` as the bounded `target_index` label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no Tokio runtime is active, or if Prometheus metrics
+    /// cannot be created, registered, or initialized for a target.
+    pub fn new_many(
+        configs: &[OtlpTargetConfig],
         mapper: Arc<dyn RedfishEventMapper>,
         metrics_manager: &MetricsManager,
         prefix: &str,
-    ) -> Result<Self, HealthError> {
+    ) -> Result<Vec<Self>, HealthError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|e| {
             HealthError::GenericError(format!("otlp sink requires active tokio runtime: {e}"))
         })?;
 
-        let queue: Arc<OtlpQueue> = Arc::new(DedupQueue::new());
-        let metrics_queue: Arc<OtlpMetricsQueue> = Arc::new(DedupQueue::new());
-
-        let replaced_total = Counter::new(
-            format!("{prefix}_otlp_sink_replaced_total"),
-            "total log events replaced in the otlp queue before drain could process them",
+        let replaced_total = CounterVec::new(
+            Opts::new(
+                format!("{prefix}_otlp_sink_replaced_total"),
+                "total log events replaced in the otlp queue before drain could process them, labeled by configured target index",
+            ),
+            &["target_index"],
         )?;
+
         metrics_manager
             .global_registry()
             .register(Box::new(replaced_total.clone()))?;
 
-        let metrics_replaced_total = Counter::new(
-            format!("{prefix}_otlp_sink_metrics_replaced_total"),
-            "total metric samples replaced in the otlp queue before drain could process them",
+        let metrics_replaced_total = CounterVec::new(
+            Opts::new(
+                format!("{prefix}_otlp_sink_metrics_replaced_total"),
+                "total metric samples replaced in the otlp queue before drain could process them, labeled by configured target index",
+            ),
+            &["target_index"],
         )?;
+
         metrics_manager
             .global_registry()
             .register(Box::new(metrics_replaced_total.clone()))?;
 
-        let drain = OtlpDrainTask::new(
-            queue.clone(),
-            config.endpoint.clone(),
-            config.batch_size,
-            config.flush_interval,
-        );
-        handle.spawn(drain.run());
+        let mut sinks = Vec::with_capacity(configs.len());
 
-        // separate drain task so metrics don't head-of-line-block the logs export and vice versa
-        let metrics_drain = OtlpMetricsDrainTask::new(
-            metrics_queue.clone(),
-            config.endpoint.clone(),
-            config.batch_size,
-            config.flush_interval,
-        );
-        handle.spawn(metrics_drain.run());
+        for (target_index, config) in configs.iter().enumerate() {
+            let queue: Arc<OtlpQueue> = Arc::new(DedupQueue::new());
+            let metrics_queue: Arc<OtlpMetricsQueue> = Arc::new(DedupQueue::new());
+            let target_index = target_index.to_string();
+            let replaced_total = replaced_total.get_metric_with_label_values(&[&target_index])?;
 
-        Ok(Self {
-            queue,
-            metrics_queue,
-            replaced_total,
-            metrics_replaced_total,
-            mapper,
-        })
+            let metrics_replaced_total =
+                metrics_replaced_total.get_metric_with_label_values(&[&target_index])?;
+
+            let drain = OtlpDrainTask::new(queue.clone(), config.clone());
+            handle.spawn(drain.run());
+
+            // Each target and signal owns a drain so a slow collector cannot
+            // block delivery to another target or signal.
+            let metrics_drain = OtlpMetricsDrainTask::new(
+                metrics_queue.clone(),
+                config.clone(),
+                prefix.to_string(),
+            );
+
+            handle.spawn(metrics_drain.run());
+
+            sinks.push(Self {
+                queue,
+                metrics_queue,
+                replaced_total,
+                metrics_replaced_total,
+                mapper: mapper.clone(),
+                include_diagnostics: config.include_diagnostics,
+            });
+        }
+
+        Ok(sinks)
+    }
+
+    /// Enqueues the emitted log record using the parent event identity.
+    fn enqueue_log_event(&self, context: &EventContext, record: &LogRecord) {
+        let key = self
+            .mapper
+            .queue_key(&context.endpoint_key, &record.attributes);
+        let record = record
+            .emitted_log_record(self.include_diagnostics)
+            .into_owned();
+        let event = CollectorEvent::Log(Box::new(record));
+
+        if self.queue.save_latest(key, (context.clone(), event)) {
+            self.replaced_total.inc();
+        }
     }
 }
 
 #[cfg(any(test, feature = "bench-hooks"))]
 impl OtlpSink {
     pub fn new_for_bench(mapper: Arc<dyn RedfishEventMapper>) -> Self {
+        Self::new_for_bench_with_diagnostics(mapper, false)
+    }
+
+    /// Builds a bench sink with diagnostic emission explicitly configured.
+    fn new_for_bench_with_diagnostics(
+        mapper: Arc<dyn RedfishEventMapper>,
+        include_diagnostics: bool,
+    ) -> Self {
         Self {
             queue: Arc::new(DedupQueue::new()),
             metrics_queue: Arc::new(DedupQueue::new()),
             replaced_total: Counter::new("bench_replaced", "bench").unwrap(),
             metrics_replaced_total: Counter::new("bench_metrics_replaced", "bench").unwrap(),
             mapper,
+            include_diagnostics,
         }
     }
 }
@@ -167,45 +219,54 @@ impl DataSink for OtlpSink {
         "otlp_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), HealthError> {
         if let CollectorEvent::Metric(sample) = event {
             let key = metric_queue_key(context, sample);
+
             if self
                 .metrics_queue
                 .save_latest(key, (context.clone(), (**sample).clone()))
             {
                 self.metrics_replaced_total.inc();
             }
-            return;
+
+            return Ok(());
         }
 
         if !is_otlp_log_relevant(event) {
-            return;
+            return Ok(());
         }
 
-        let key = match event {
-            CollectorEvent::Log(record) => self
-                .mapper
-                .queue_key(&context.endpoint_key, &record.attributes),
+        let (key, event) = match event {
+            CollectorEvent::Log(record) => {
+                self.enqueue_log_event(context, record);
+                return Ok(());
+            }
             CollectorEvent::HealthReport(report) => {
-                format!(
+                let key = format!(
                     "{}|health_report|{}",
                     context.endpoint_key,
                     report.source.as_str()
-                )
+                );
+
+                (key, event.clone())
             }
             CollectorEvent::Firmware(info) => {
-                format!("{}|firmware|{}", context.endpoint_key, info.component)
+                let key = format!("{}|firmware|{}", context.endpoint_key, info.component);
+                (key, event.clone())
             }
-            _ => return,
+            _ => return Ok(()),
         };
 
-        if self
-            .queue
-            .save_latest(key, (context.clone(), event.clone()))
-        {
+        if self.queue.save_latest(key, (context.clone(), event)) {
             self.replaced_total.inc();
         }
+
+        Ok(())
     }
 }
 
@@ -213,13 +274,12 @@ impl DataSink for OtlpSink {
 mod tests {
     use std::borrow::Cow;
     use std::str::FromStr;
-    use std::sync::Arc;
 
     use mac_address::MacAddress;
 
     use super::*;
     use crate::sink::event_mapper::OpenBmcEventMapper;
-    use crate::sink::{LogRecord, MetricSample};
+    use crate::sink::{CompositeDataSink, DiagnosticLogRecord, LogRecord, MetricSample};
 
     fn test_context() -> EventContext {
         EventContext {
@@ -236,6 +296,15 @@ mod tests {
     }
 
     fn log_event(message_id: &str, message_args: &str) -> CollectorEvent {
+        log_event_with_diagnostic_record(message_id, message_args, None)
+    }
+
+    /// Builds a log event with an optional diagnostic carrier.
+    fn log_event_with_diagnostic_record(
+        message_id: &str,
+        message_args: &str,
+        diagnostic_record: Option<DiagnosticLogRecord>,
+    ) -> CollectorEvent {
         CollectorEvent::Log(Box::new(LogRecord {
             body: "test".to_string(),
             severity: "OK".to_string(),
@@ -243,7 +312,19 @@ mod tests {
                 (Cow::Borrowed("message_id"), message_id.to_string()),
                 (Cow::Borrowed("message_args"), message_args.to_string()),
             ],
+            diagnostic_record,
         }))
+    }
+
+    /// Builds a diagnostic carrier with stable parent metadata.
+    fn diagnostic_log_record(body: &str) -> DiagnosticLogRecord {
+        DiagnosticLogRecord {
+            body: body.to_string(),
+            attributes: vec![(
+                Cow::Borrowed("redfish.parent.log_entry_id"),
+                "42".to_string(),
+            )],
+        }
     }
 
     fn metric_event() -> CollectorEvent {
@@ -411,6 +492,81 @@ mod tests {
     }
 
     #[test]
+    fn composite_fans_log_event_to_each_otlp_target_queue() {
+        let first = Arc::new(test_sink());
+        let second = Arc::new(test_sink());
+        let sinks: Vec<Arc<dyn DataSink>> = vec![first.clone(), second.clone()];
+
+        let metrics_manager = Arc::new(
+            MetricsManager::new("otlp_multi_target_test")
+                .expect("metrics manager should initialize"),
+        );
+
+        let composite = CompositeDataSink::new(sinks, metrics_manager);
+        let context = test_context();
+        let event = log_event("OpenBMC.0.1.Test", r#"["sensor1"]"#);
+
+        composite.handle_event(&context, &event);
+
+        assert!(first.queue.pop().is_some());
+        assert!(second.queue.pop().is_some());
+    }
+
+    #[tokio::test]
+    async fn new_many_labels_replacement_counters_by_target_index() {
+        let configs = vec![
+            OtlpTargetConfig {
+                endpoint: "http://first.example:4317".to_string(),
+                batch_size: 512,
+                flush_interval: std::time::Duration::from_secs(2),
+                include_diagnostics: false,
+            },
+            OtlpTargetConfig {
+                endpoint: "http://second.example:4317".to_string(),
+                batch_size: 512,
+                flush_interval: std::time::Duration::from_secs(2),
+                include_diagnostics: false,
+            },
+        ];
+
+        let metrics_manager = MetricsManager::new("otlp_replacement_manager")
+            .expect("metrics manager should initialize");
+
+        let sinks = OtlpSink::new_many(
+            &configs,
+            Arc::new(OpenBmcEventMapper),
+            &metrics_manager,
+            "otlp_replacement_test",
+        )
+        .expect("OTLP sinks should initialize");
+
+        sinks[0].replaced_total.inc();
+        sinks[1].metrics_replaced_total.inc();
+
+        let metrics = metrics_manager
+            .export_metrics()
+            .expect("metrics should export");
+
+        assert!(
+            metrics
+                .contains("otlp_replacement_test_otlp_sink_replaced_total{target_index=\"0\"} 1")
+        );
+
+        assert!(
+            metrics
+                .contains("otlp_replacement_test_otlp_sink_replaced_total{target_index=\"1\"} 0")
+        );
+
+        assert!(metrics.contains(
+            "otlp_replacement_test_otlp_sink_metrics_replaced_total{target_index=\"0\"} 0"
+        ));
+
+        assert!(metrics.contains(
+            "otlp_replacement_test_otlp_sink_metrics_replaced_total{target_index=\"1\"} 1"
+        ));
+    }
+
+    #[test]
     fn same_sensor_different_direction_deduplicates() {
         let sink = test_sink();
         let ctx = test_context();
@@ -435,6 +591,85 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1, "same sensor should dedup to one entry");
+    }
+
+    /// Verifies OTLP logs omit diagnostic payloads by default.
+    #[test]
+    fn diagnostic_log_record_is_skipped_by_default() {
+        let sink = test_sink();
+        let ctx = test_context();
+
+        sink.handle_event(
+            &ctx,
+            &log_event_with_diagnostic_record(
+                "OpenBMC.0.1.Test",
+                "[]",
+                Some(diagnostic_log_record("payload-a")),
+            ),
+        );
+
+        let mut bodies = Vec::new();
+        while let Some((_key, (_context, CollectorEvent::Log(record)))) = sink.queue.pop() {
+            bodies.push(record.body);
+        }
+
+        assert_eq!(bodies, vec!["test"]);
+        assert_eq!(sink.replaced_total.get() as u64, 0);
+    }
+
+    /// Verifies diagnostics are folded into the single latest parent log.
+    #[test]
+    fn diagnostic_log_record_uses_latest_wins_by_endpoint() {
+        let sink = OtlpSink::new_for_bench_with_diagnostics(Arc::new(OpenBmcEventMapper), true);
+        let ctx = test_context();
+
+        sink.handle_event(
+            &ctx,
+            &log_event_with_diagnostic_record(
+                "OpenBMC.0.1.Test",
+                "[]",
+                Some(diagnostic_log_record("payload-a")),
+            ),
+        );
+        sink.handle_event(
+            &ctx,
+            &log_event_with_diagnostic_record(
+                "OpenBMC.0.1.Test",
+                "[]",
+                Some(diagnostic_log_record("payload-b")),
+            ),
+        );
+        sink.handle_event(
+            &ctx,
+            &log_event_with_diagnostic_record(
+                "OpenBMC.0.1.Test",
+                "[]",
+                Some(diagnostic_log_record("payload-c")),
+            ),
+        );
+
+        let mut records = Vec::new();
+        while let Some((_key, (_context, CollectorEvent::Log(record)))) = sink.queue.pop() {
+            records.push(record);
+        }
+
+        assert_eq!(records.len(), 1);
+
+        let diagnostic_body: serde_json::Value =
+            serde_json::from_str(&records[0].body).expect("valid diagnostic body");
+        assert_eq!(diagnostic_body["message"].as_str(), Some("test"));
+        assert_eq!(
+            diagnostic_body["diagnostic_data"].as_str(),
+            Some("payload-c")
+        );
+        assert_eq!(sink.replaced_total.get() as u64, 2);
+
+        assert!(
+            records[0]
+                .attributes
+                .iter()
+                .any(|(key, _)| key.as_ref() == "redfish.parent.log_entry_id")
+        );
     }
 
     #[test]

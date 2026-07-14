@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use carbide_instrument::red;
 use carbide_secrets::credentials::Credentials;
 use model::component_manager::{FirmwareState, PowerAction, PowerShelfComponent};
 use tonic::transport::Channel;
+use trace_propagation::TraceInjectService;
 use tracing::instrument;
 
 use crate::config::BackendTlsConfig;
@@ -17,7 +19,7 @@ use crate::types::parse_mac;
 
 #[derive(Debug)]
 pub struct PsmPowerShelfBackend {
-    client: psm::powershelf_manager_client::PowershelfManagerClient<Channel>,
+    client: psm::powershelf_manager_client::PowershelfManagerClient<TraceInjectService<Channel>>,
 }
 
 impl PsmPowerShelfBackend {
@@ -73,7 +75,9 @@ fn mac_strings(endpoints: &[PowerShelfEndpoint]) -> Vec<String> {
 /// registration is primarily about ensuring PSM knows about the device and
 /// has credentials.
 async fn register_with_psm(
-    client: &mut psm::powershelf_manager_client::PowershelfManagerClient<Channel>,
+    client: &mut psm::powershelf_manager_client::PowershelfManagerClient<
+        TraceInjectService<Channel>,
+    >,
     endpoints: &[PowerShelfEndpoint],
 ) -> Result<(), ComponentManagerError> {
     let reqs: Vec<psm::RegisterPowershelfRequest> = endpoints
@@ -86,12 +90,15 @@ async fn register_with_psm(
         })
         .collect();
 
-    let response = client
-        .register_powershelves(psm::RegisterPowershelvesRequest {
+    let response = red::instrumented(
+        "psm",
+        "register_powershelves",
+        client.register_powershelves(psm::RegisterPowershelvesRequest {
             registration_requests: reqs,
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await?
+    .into_inner();
 
     let failures: Vec<_> = response
         .responses
@@ -138,21 +145,28 @@ impl PowerShelfManager for PsmPowerShelfBackend {
         };
 
         let response = match action {
-            PowerAction::On => self.client.clone().power_on(request).await?.into_inner(),
+            PowerAction::On => {
+                red::instrumented("psm", "power_on", self.client.clone().power_on(request))
+                    .await?
+                    .into_inner()
+            }
             PowerAction::ForceOff | PowerAction::GracefulShutdown => {
-                self.client.clone().power_off(request).await?.into_inner()
+                red::instrumented("psm", "power_off", self.client.clone().power_off(request))
+                    .await?
+                    .into_inner()
             }
             PowerAction::GracefulRestart
             | PowerAction::ForceRestart
             | PowerAction::AcPowercycle => {
-                let off = self
-                    .client
-                    .clone()
-                    .power_off(psm::PowershelfRequest {
+                let off = red::instrumented(
+                    "psm",
+                    "power_off",
+                    self.client.clone().power_off(psm::PowershelfRequest {
                         pmc_macs: pmc_macs.clone(),
-                    })
-                    .await?
-                    .into_inner();
+                    }),
+                )
+                .await?
+                .into_inner();
 
                 let mut results: Vec<PowerShelfComponentResult> = Vec::new();
                 let mut powered_off_macs: Vec<String> = Vec::new();
@@ -174,14 +188,15 @@ impl PowerShelfManager for PsmPowerShelfBackend {
                 }
 
                 if !powered_off_macs.is_empty() {
-                    let on = self
-                        .client
-                        .clone()
-                        .power_on(psm::PowershelfRequest {
+                    let on = red::instrumented(
+                        "psm",
+                        "power_on",
+                        self.client.clone().power_on(psm::PowershelfRequest {
                             pmc_macs: powered_off_macs,
-                        })
-                        .await?
-                        .into_inner();
+                        }),
+                    )
+                    .await?
+                    .into_inner();
 
                     for r in on.responses {
                         results.push(PowerShelfComponentResult {
@@ -253,12 +268,13 @@ impl PowerShelfManager for PsmPowerShelfBackend {
 
         let request = psm::UpdateFirmwareRequest { upgrades };
 
-        let response = self
-            .client
-            .clone()
-            .update_firmware(request)
-            .await?
-            .into_inner();
+        let response = red::instrumented(
+            "psm",
+            "update_firmware",
+            self.client.clone().update_firmware(request),
+        )
+        .await?
+        .into_inner();
 
         response
             .responses
@@ -317,12 +333,13 @@ impl PowerShelfManager for PsmPowerShelfBackend {
 
         let request = psm::GetFirmwareUpdateStatusRequest { queries };
 
-        let response = self
-            .client
-            .clone()
-            .get_firmware_update_status(request)
-            .await?
-            .into_inner();
+        let response = red::instrumented(
+            "psm",
+            "get_firmware_update_status",
+            self.client.clone().get_firmware_update_status(request),
+        )
+        .await?
+        .into_inner();
 
         response
             .statuses
@@ -353,12 +370,13 @@ impl PowerShelfManager for PsmPowerShelfBackend {
             pmc_macs: mac_strings(endpoints),
         };
 
-        let response = self
-            .client
-            .clone()
-            .list_available_firmware(request)
-            .await?
-            .into_inner();
+        let response = red::instrumented(
+            "psm",
+            "list_available_firmware",
+            self.client.clone().list_available_firmware(request),
+        )
+        .await?
+        .into_inner();
 
         response
             .upgrades
@@ -390,12 +408,13 @@ impl PowerShelfManager for PsmPowerShelfBackend {
             pmc_macs: mac_strings(endpoints),
         };
 
-        let response = self
-            .client
-            .clone()
-            .get_powershelves(request)
-            .await?
-            .into_inner();
+        let response = red::instrumented(
+            "psm",
+            "get_powershelves",
+            self.client.clone().get_powershelves(request),
+        )
+        .await?
+        .into_inner();
 
         let mut results = Vec::with_capacity(endpoints.len());
         for ep in endpoints {
@@ -485,5 +504,45 @@ mod tests {
         ];
         let macs = mac_strings(&eps);
         assert_eq!(macs, vec!["AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"]);
+    }
+
+    #[tokio::test]
+    async fn psm_call_failure_records_the_external_call_histogram() {
+        use carbide_instrument::testing::MetricsCapture;
+
+        // A lazy channel to an unroutable endpoint makes the wrapped call
+        // itself fail, exercising the RED wrap without a live PSM.
+        // A port that was just bound and released: connecting to it is refused
+        // deterministically, unlike a fixed low port something might occupy.
+        let refused_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("local addr")
+        };
+        let channel = Channel::from_shared(format!("http://{refused_addr}"))
+            .expect("endpoint")
+            .connect_lazy();
+        let backend = PsmPowerShelfBackend {
+            client: psm::powershelf_manager_client::PowershelfManagerClient::new(
+                TraceInjectService::new(channel),
+            ),
+        };
+
+        let metrics = MetricsCapture::start();
+        backend
+            .list_firmware(&[])
+            .await
+            .expect_err("unroutable PSM endpoint must fail");
+
+        assert_eq!(
+            metrics.histogram_count_delta(
+                "carbide_external_call_duration_milliseconds",
+                &[
+                    ("backend", "psm"),
+                    ("operation", "register_powershelves"),
+                    ("outcome", "error"),
+                ],
+            ),
+            1,
+        );
     }
 }

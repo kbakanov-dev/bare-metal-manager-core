@@ -51,10 +51,12 @@ impl Run for Args {
                 self.bmc_ip_address,
                 self.bmc_retain_credentials,
                 self.dpu_mode,
+                self.bmc_ip_allocation,
                 self.disable_lockdown
                     .map(|dl| ::rpc::forge::HostLifecycleProfile {
                         disable_lockdown: Some(dl),
                     }),
+                self.host_nics,
             )
             .await?;
         Ok(())

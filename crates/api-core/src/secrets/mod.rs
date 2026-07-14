@@ -53,7 +53,7 @@ pub mod routing;
 mod tests;
 
 pub use import::{import_secrets, is_vault_import_complete, mark_vault_import_complete};
-pub use metrics::{OperationTimer, SecretsMetrics};
+pub use metrics::{OperationTimer, SecretsOperation};
 pub use re_wrap::{ReWrapStaleResult, re_wrap_stale};
 pub use routing::SecretRouting;
 
@@ -62,6 +62,25 @@ pub use routing::SecretRouting;
 pub struct SecretsContext {
     pub routing: SecretRouting,
     pub kms: Arc<dyn KmsBackend>,
+}
+
+/// Reject a nonsensical `[secrets].backends` list at boot: empty (at least one
+/// backend is required -- the local-override readers alone can't be the whole
+/// credential source), or a backend named twice (dead after the first, by
+/// first-match-wins). The order of the backends is the operator's choice.
+pub fn validate_backends(backends: &[crate::cfg::file::CredentialBackend]) -> eyre::Result<()> {
+    if backends.is_empty() {
+        return Err(eyre::eyre!(
+            "[secrets].backends is empty; at least one backend (postgres or vault) is required"
+        ));
+    }
+    let unique: std::collections::HashSet<_> = backends.iter().collect();
+    if unique.len() != backends.len() {
+        return Err(eyre::eyre!(
+            "[secrets].backends names a backend more than once"
+        ));
+    }
+    Ok(())
 }
 
 /// The secret path that records vault import completion. It starts with a
@@ -144,28 +163,16 @@ pub struct PostgresCredentialManager {
     pool: PgPool,
     routing: SecretRouting,
     kms: Arc<dyn KmsBackend>,
-    metrics: Option<SecretsMetrics>,
 }
 
 impl PostgresCredentialManager {
     /// Create a manager from a pool, write routing, and KMS backend.
     pub fn new(pool: PgPool, routing: SecretRouting, kms: Arc<dyn KmsBackend>) -> Self {
-        Self {
-            pool,
-            routing,
-            kms,
-            metrics: None,
-        }
+        Self { pool, routing, kms }
     }
 
-    /// Attach metrics instruments.
-    pub fn with_metrics(mut self, metrics: SecretsMetrics) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-
-    fn timer(&self, operation: &'static str) -> OperationTimer {
-        OperationTimer::start(self.metrics.clone(), operation)
+    fn timer(&self, operation: SecretsOperation) -> OperationTimer {
+        OperationTimer::start(operation)
     }
 
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, PgSecretsError> {
@@ -332,7 +339,7 @@ impl CredentialReader for PostgresCredentialManager {
         &self,
         key: &CredentialKey,
     ) -> Result<Option<Credentials>, SecretsError> {
-        let timer = self.timer("get");
+        let timer = self.timer(SecretsOperation::Get);
         let path = key.to_key_str();
 
         let row = db::secrets::get_latest(&self.pool, &path)
@@ -373,7 +380,7 @@ impl CredentialWriter for PostgresCredentialManager {
         key: &CredentialKey,
         credentials: &Credentials,
     ) -> Result<(), SecretsError> {
-        let timer = self.timer("set");
+        let timer = self.timer(SecretsOperation::Set);
         let path = key.to_key_str();
 
         let json_bytes =
@@ -394,7 +401,7 @@ impl CredentialWriter for PostgresCredentialManager {
         key: &CredentialKey,
         credentials: &Credentials,
     ) -> Result<(), SecretsError> {
-        let timer = self.timer("create");
+        let timer = self.timer(SecretsOperation::Create);
         let path = key.to_key_str();
 
         // Encrypt before the transaction opens: the KMS call can be a
@@ -438,7 +445,7 @@ impl CredentialWriter for PostgresCredentialManager {
     }
 
     async fn delete_credentials(&self, key: &CredentialKey) -> Result<(), SecretsError> {
-        let timer = self.timer("delete");
+        let timer = self.timer(SecretsOperation::Delete);
         let path = key.to_key_str();
 
         let mut conn = self.conn().await?;
@@ -452,3 +459,32 @@ impl CredentialWriter for PostgresCredentialManager {
 }
 
 impl CredentialManager for PostgresCredentialManager {}
+
+#[cfg(test)]
+mod backend_validation_tests {
+    use super::validate_backends;
+    use crate::cfg::file::CredentialBackend;
+
+    #[test]
+    fn accepts_any_order_of_distinct_backends() {
+        assert!(validate_backends(&[CredentialBackend::Vault]).is_ok());
+        assert!(validate_backends(&[CredentialBackend::Postgres]).is_ok());
+        assert!(
+            validate_backends(&[CredentialBackend::Postgres, CredentialBackend::Vault]).is_ok()
+        );
+        // Order is the operator's choice -- vault ahead of postgres is fine.
+        assert!(
+            validate_backends(&[CredentialBackend::Vault, CredentialBackend::Postgres]).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_empty_backends() {
+        assert!(validate_backends(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_backend_named_twice() {
+        assert!(validate_backends(&[CredentialBackend::Vault, CredentialBackend::Vault]).is_err());
+    }
+}

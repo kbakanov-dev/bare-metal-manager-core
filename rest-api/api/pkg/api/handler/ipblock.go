@@ -216,14 +216,13 @@ func (cipbh CreateIPBlockHandler) Handle(c echo.Context) error {
 		// Create a status detail record for the IPBlock
 		sdDAO := cdbm.NewStatusDetailDAO(cipbh.dbSession)
 		var serr error
-		ssd, serr = sdDAO.CreateFromParams(ctx, tx, ipb.ID.String(), *cutil.GetPtr(cdbm.IPBlockStatusReady),
-			cutil.GetPtr("IP Block is ready for use"))
+		ssd, serr = sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: ipb.ID.String(), Status: *cutil.GetPtr(cdbm.IPBlockStatusReady), Message: cutil.GetPtr("IP Block is ready for use")})
 		if serr != nil {
 			logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for IPBlock", nil)
 		}
 		if ssd == nil {
-			logger.Error().Msg("Status Detail DB entry not returned from CreateFromParams")
+			logger.Error().Msg("Status Detail DB entry not returned from Create")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to get new Status Detail for IPBlock", nil)
 		}
 		return nil
@@ -266,8 +265,8 @@ func NewGetAllIPBlockHandler(dbSession *cdb.Session, tc temporalClient.Client, c
 // @Produce json
 // @Security ApiKeyAuth
 // @Param org path string true "Name of NGC organization"
-// @Param infrastructureProviderId query string true "ID of InfrastructureProvider"
-// @Param tenantId query string true "ID of Tenant"
+// @Param infrastructureProviderId query string false "Deprecated: Infrastructure Provider is now inferred from the org's membership"
+// @Param tenantId query string false "Deprecated: Tenant is now inferred from the org's membership"
 // @Param siteId query string true "ID of Site"
 // @Param status query string false "Filter by status" e.g. 'Pending', 'Error'"
 // @Param query query string false "Query input for full text search"
@@ -747,8 +746,8 @@ func NewGetIPBlockHandler(dbSession *cdb.Session, tc temporalClient.Client, cfg 
 // @Security ApiKeyAuth
 // @Param org path string true "Name of NGC organization"
 // @Param id path string true "ID of IPBlock"
-// @Param infrastructureProviderId query string true "ID of InfrastructureProvider"
-// @Param tenantId query string true "ID of Tenant"
+// @Param infrastructureProviderId query string false "Deprecated: Infrastructure Provider is now inferred from the org's membership"
+// @Param tenantId query string false "Deprecated: Tenant is now inferred from the org's membership"
 // @Param includeRelation query string false "Related entities to include in response e.g. 'InfrastructureProvider', 'Tenant', 'Site'"
 // @Param includeUsageStats query boolean false "IPBlock usage stats to include in response
 // @Success 200 {object} model.APIIPBlock
@@ -1012,7 +1011,7 @@ func (uipbh UpdateIPBlockHandler) Handle(c echo.Context) error {
 
 		sdDAO := cdbm.NewStatusDetailDAO(uipbh.dbSession)
 		var sderr error
-		ssds, _, sderr = sdDAO.GetAllByEntityID(ctx, tx, updated.ID.String(), nil, cutil.GetPtr(pagination.MaxPageSize), nil)
+		ssds, _, sderr = sdDAO.GetAll(ctx, tx, cdbm.StatusDetailFilterInput{EntityIDs: []string{updated.ID.String()}}, cdbp.PageInput{Limit: cutil.GetPtr(pagination.MaxPageSize)})
 		if sderr != nil {
 			logger.Error().Err(sderr).Msg("error retrieving Status Details for IPBlock from DB")
 			return nil, cutil.NewAPIError(http.StatusInternalServerError, "Failed to retrieve Status Details for IPBlock", nil)

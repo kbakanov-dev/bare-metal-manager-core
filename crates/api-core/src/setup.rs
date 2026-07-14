@@ -22,6 +22,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use carbide_dpa::DpaInfo;
 use carbide_dpa_manager::DpaMonitor;
+use carbide_dpf::DpuDeploymentType;
 use carbide_firmware::FirmwareDownloader;
 use carbide_health_metrics::PerObjectMetricsRegistry;
 use carbide_ib_fabric::IbFabricMonitor;
@@ -39,7 +40,7 @@ use carbide_machine_controller::io::MachineStateControllerIO;
 use carbide_network_segment_controller::context::NetworkSegmentStateHandlerServices;
 use carbide_network_segment_controller::handler::NetworkSegmentStateHandler;
 use carbide_network_segment_controller::io::NetworkSegmentStateControllerIO;
-use carbide_nvlink_manager::NvLinkManager;
+use carbide_nvlink_manager::{NvLinkManager, NvLinkManagerArgs};
 use carbide_power_shelf_controller::context::PowerShelfStateHandlerServices;
 use carbide_power_shelf_controller::handler::PowerShelfStateHandler;
 use carbide_power_shelf_controller::io::PowerShelfStateControllerIO;
@@ -53,7 +54,7 @@ use carbide_redfish::libredfish::RedfishClientPool;
 use carbide_redfish::nv_redfish::NvRedfishClientPool;
 use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{CredentialManager, CredentialReader};
-use carbide_site_explorer::SiteExplorer;
+use carbide_site_explorer::{EndpointExplorationLocks, SiteExplorer};
 use carbide_spdm_controller::context::SpdmStateHandlerServices;
 use carbide_spdm_controller::handler::SpdmAttestationStateHandler;
 use carbide_spdm_controller::io::SpdmStateControllerIO;
@@ -106,6 +107,9 @@ use crate::logging::service_health_metrics::{
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::measured_boot::metrics_collector::MeasuredBootMetricsCollector;
 use crate::mqtt_state_change_hook::hook::MqttStateChangeHook;
+use crate::mqtt_state_change_hook::republisher::{
+    ManagedHostStateRepublisher, ManagedHostStateRepublisherParams,
+};
 use crate::scout_stream::ConnectionRegistry;
 use crate::{attestation, db_init, ethernet_virtualization, listener};
 
@@ -191,11 +195,18 @@ pub fn parse_carbide_config(
     // Validate that admin-UI tool entries have unique names.
     config.validate_web_ui_sidebar_tools()?;
 
+    if let Some(config) = &config.dsx_exchange_event_bus {
+        config.periodic_state_republish.validate()?;
+    }
+
     // Publish the configured tool list so the admin-UI sidebar and per-machine
     // "Logs" deep link can read it back via `crate::configured_tools`. The list
     // is owned here (not in `carbide-api-web`) because it is derived from the
     // parsed config, before the web layer exists.
     crate::init_tools(config.web_ui_sidebar_tools.clone());
+
+    // Publish the site name the same way, for the admin-UI sidebar header.
+    crate::init_site_name(config.sitename.clone());
 
     // Publish the deployment-wide host naming policy so the DB layer can read it
     // wherever an interface is [re]named (same way we do it w/ `init_tools` above).
@@ -262,6 +273,25 @@ pub fn create_ipmi_tool(
 pub(crate) async fn create_and_connect_postgres_pool(
     config: &CarbideConfig,
 ) -> eyre::Result<PgPool> {
+    for (name, value) in [
+        (
+            "database_pool_acquire_timeout",
+            config.database_pool_acquire_timeout,
+        ),
+        (
+            "database_pool_idle_timeout",
+            config.database_pool_idle_timeout,
+        ),
+        (
+            "database_pool_max_lifetime",
+            config.database_pool_max_lifetime,
+        ),
+    ] {
+        if value.is_zero() {
+            eyre::bail!("{name} must be greater than zero");
+        }
+    }
+
     // We need logs to be enabled at least at `INFO` level. Otherwise
     // our global logging filter would reject the logs before they get injected
     // into the `SqlxQueryTracing` layer.
@@ -280,6 +310,12 @@ pub(crate) async fn create_and_connect_postgres_pool(
     }
     Ok(sqlx::pool::PoolOptions::new()
         .max_connections(config.max_database_connections)
+        // Lifecycle settings are operator-configurable; each `database_pool_*`
+        // config field documents what it bounds. The defaults are sqlx's own,
+        // so exposing them changes no behavior -- tuning belongs to the site.
+        .acquire_timeout(config.database_pool_acquire_timeout)
+        .idle_timeout(Some(config.database_pool_idle_timeout))
+        .max_lifetime(Some(config.database_pool_max_lifetime))
         .connect_with(database_connect_options)
         .await?)
 }
@@ -392,6 +428,10 @@ pub async fn start_api(
         // lockdown key without operator action. No-op once seeded or if the BMC
         // root is not yet configured.
         crate::dpa::lockdown::ensure_lockdown_ikm_seeded(&*credential_manager).await?;
+
+        // Initial credential-rotation bookkeeping is backfilled by the
+        // `*_credential_rotation_backfill` data migration (see its header for the
+        // ordering invariants), not seeded here.
     };
 
     let common_pools =
@@ -471,7 +511,11 @@ pub async fn start_api(
             .rotate_switch_nvos_credentials
             .clone(),
         carbide_config.site_explorer.explore_mode,
+        db_pool.clone(),
     );
+    // Shared between the API's `RefreshEndpointReport` handler and the site-explorer loop so they
+    // never probe the same endpoint at once. In-process only; see `EndpointExplorationLocks`.
+    let endpoint_exploration_locks = EndpointExplorationLocks::default();
 
     let nvlink_config = carbide_config.nvlink_config.clone().unwrap_or_default();
 
@@ -484,59 +528,13 @@ pub async fn start_api(
         .map_err(|e| eyre::eyre!("Failed to build NMX-C client pool: {e}"))?;
     let shared_nmxc_pool: Arc<dyn libnmxc::NmxcPool> = Arc::new(nmxc_client_pool);
 
-    // Create DPF SDK and initialize CRs if enabled
-    // If we end up having static DPUDeployments, we could move the static CRs outside of the API.
-    let dpf_sdk: Option<Arc<dyn DpfOperations>> = if carbide_config.dpf.enabled {
-        tracing::info!("Initializing DPF SDK");
-        let repo = carbide_dpf::KubeRepository::new()
-            .await
-            .map_err(|e| eyre::eyre!("Failed to create DPF repository: {e}"))?;
-
-        let provider = CarbideBmcPasswordProvider::new(credential_manager.clone());
-
-        let mandatory_services = carbide_config.dpf.resolved_mandatory_services();
-        let dpf_mandatory_services = vec![
-            crate::dpf_services::dts_service(&mandatory_services.dts),
-            crate::dpf_services::doca_hbn_service(&mandatory_services.doca_hbn),
-            crate::dpf_services::dhcp_server_service(&mandatory_services.dhcp_server),
-            crate::dpf_services::dpu_agent_service(&mandatory_services.dpu_agent),
-            crate::dpf_services::fmds_service(&mandatory_services.fmds),
-            crate::dpf_services::otelcol_service(&mandatory_services.otel),
-        ];
-
-        // This is just temparary code until we make v2 only option. (just 2 weeks)
-        // Soon v2 flag will be removed and will become only mode for dpf handling.
-        let init_config = carbide_dpf::InitDpfResourcesConfig {
-            bfb_url: carbide_config.dpf.bfb_url.clone(),
-            flavor_name: carbide_config.dpf.flavor_name.clone(),
-            deployment_name: carbide_config.dpf.deployment_name.clone(),
-            services: dpf_mandatory_services,
-            proxy: carbide_config.dpf.proxy.clone(),
-        };
-
-        let sdk = carbide_dpf::DpfSdkBuilder::new(repo, carbide_dpf::NAMESPACE, provider)
-            .with_labeler(CarbideDPFLabeler::new(
-                carbide_config.dpf.node_label_key.clone(),
-            ))
-            .with_bmc_password_refresh_interval(std::time::Duration::from_secs(60))
-            .with_join_set(join_set)
-            .initialize(&init_config)
-            .await
-            .map_err(|err| eyre::eyre!("Failed to initialize DPF SDK: {err}"))?;
-
-        Some(Arc::new(DpfSdkOps::new(
-            Arc::new(sdk),
-            db_pool.clone(),
-            join_set,
-        )?))
-    } else {
-        tracing::warn!(
-            removed_in = "v2.1",
-            docs = "https://docs.nvidia.com/infra-controller/documentation/getting-started/installation-options/dpf-setup",
-            "iPXE provisioning strategy (internally) is deprecated; enable DPF management for DPUs to migrate"
-        );
-        None
-    };
+    let dpf_sdk = initialize_dpf_sdk(
+        &carbide_config,
+        credential_manager.clone(),
+        db_pool.clone(),
+        join_set,
+    )
+    .await?;
 
     let component_manager = if let Some(cd_config) = &carbide_config.component_manager {
         match component_manager::component_manager::build_component_manager(
@@ -602,6 +600,7 @@ pub async fn start_api(
         rms_client: rms_client.clone(),
         nmxc_client_pool: shared_nmxc_pool.clone(),
         work_lock_manager_handle,
+        endpoint_exploration_locks: endpoint_exploration_locks.clone(),
         dpf_sdk: dpf_sdk.clone(),
         machine_state_handler_enqueuer: Enqueuer::new(db_pool),
         metric_emitter: ApiMetricsEmitter::new(&meter),
@@ -659,6 +658,146 @@ pub async fn start_api(
         .ok();
 
     Ok(())
+}
+
+/// Initialize the DPF SDK and create all required Kubernetes CRs.
+///
+/// Returns `None` (with a deprecation warning) when DPF is disabled.
+async fn initialize_dpf_sdk(
+    carbide_config: &CarbideConfig,
+    credential_manager: Arc<dyn CredentialManager>,
+    db_pool: PgPool,
+    join_set: &mut JoinSet<()>,
+) -> eyre::Result<Option<Arc<dyn DpfOperations>>> {
+    if !carbide_config.dpf.enabled {
+        tracing::warn!(
+            removed_in = "v2.1",
+            docs = "https://docs.nvidia.com/infra-controller/documentation/getting-started/installation-options/dpf-setup",
+            "iPXE provisioning strategy (internally) is deprecated; enable DPF management for DPUs to migrate"
+        );
+        return Ok(None);
+    }
+
+    tracing::info!("Initializing DPF SDK");
+
+    let repo = carbide_dpf::KubeRepository::new()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to create DPF repository: {e}"))?;
+
+    let provider = CarbideBmcPasswordProvider::new(credential_manager, db_pool.clone());
+
+    carbide_config
+        .dpf
+        .deployments
+        .validate_unique_identifiers()
+        .map_err(|err| eyre::eyre!("Invalid DPF deployment configuration: {err}"))?;
+
+    carbide_config
+        .dpf
+        .deployments
+        .validate_provisioning_sources()
+        .map_err(|err| eyre::eyre!("Invalid DPF deployment configuration: {err}"))?;
+
+    // This is just temporary code until we make v2 only option. (just 2 weeks)
+    // Soon v2 flag will be removed and will become only mode for dpf handling.
+    let deployment_type_labels = build_deployment_type_labels(carbide_config);
+
+    let sdk = carbide_dpf::DpfSdkBuilder::new(repo, carbide_dpf::NAMESPACE, provider)
+        .with_labeler(
+            CarbideDPFLabeler::new(carbide_config.dpf.deployments.bf3.node_label_key.clone())
+                .with_deployment_type_labels(deployment_type_labels),
+        )
+        .with_bmc_password_refresh_interval(std::time::Duration::from_secs(60))
+        .with_join_set(join_set)
+        .build_without_resources()
+        .await
+        .map_err(|err| eyre::eyre!("Failed to initialize DPF SDK: {err}"))?;
+
+    // Builds the SDK init config for one DPUDeployment. BF4 uses a single
+    // `BlueFieldSoftware` source (the CR itself carries the PSID→PLDM mapping);
+    // config validation guarantees exactly one PSID entry.
+    let make_init_config =
+        |deployment: &crate::cfg::file::DpfDeploymentConfig,
+         deployment_type: DpuDeploymentType,
+         bluefield_software: Option<carbide_dpf::BlueFieldSoftwareParams>| {
+            let services = carbide_config.dpf.resolved_services_for(deployment);
+            carbide_dpf::InitDpfResourcesConfig {
+                bfb_url: deployment.bfb_url.clone().unwrap_or_default(),
+                bluefield_software,
+                flavor_name: deployment.flavor_name.clone(),
+                deployment_name: deployment.deployment_name.clone(),
+                services: crate::dpf_services::mandatory_services(&services),
+                proxy: carbide_config.dpf.proxy.clone(),
+                deployment_type,
+            }
+        };
+
+    let bf3 = &carbide_config.dpf.deployments.bf3;
+    sdk.create_initialization_objects(&make_init_config(bf3, DpuDeploymentType::Bf3, None))
+        .await
+        .map_err(|err| eyre::eyre!("Failed to initialize bf3 DPF deployment: {err}"))?;
+
+    if let Some(bf4) = &carbide_config.dpf.deployments.bf4_generic {
+        // Validation guarantees `bluefield_software` is set with exactly one PSID
+        // entry for a BF4 deployment.
+        let bfs = bf4.bluefield_software.as_ref().ok_or_else(|| {
+            eyre::eyre!("bf4_generic DPF deployment is missing bluefield_software")
+        })?;
+        let pldm_url =
+            bfs.pldm_fw_bundle.values().next().ok_or_else(|| {
+                eyre::eyre!("bf4_generic DPF deployment has an empty pldm_fw_bundle")
+            })?;
+        let params = carbide_dpf::BlueFieldSoftwareParams {
+            os_iso: bfs.os_iso.clone(),
+            pldm_fw_bundle: Some(pldm_url.clone()),
+        };
+        sdk.create_initialization_objects(&make_init_config(
+            bf4,
+            DpuDeploymentType::Bf4Generic,
+            Some(params),
+        ))
+        .await
+        .map_err(|err| eyre::eyre!("Failed to initialize bf4_generic DPF deployment: {err}"))?;
+    }
+
+    Ok(Some(Arc::new(DpfSdkOps::new(
+        Arc::new(sdk),
+        db_pool,
+        join_set,
+    )?)))
+}
+
+/// Build per-deployment-type node selector labels for the DPF labeler registry.
+///
+/// Each deployment gets two labels: the shared `dpu-enabled` marker and its
+/// own deployment-specific key. BF3 is always included;
+/// BF4Generic is added when configured.
+fn build_deployment_type_labels(
+    carbide_config: &CarbideConfig,
+) -> std::collections::BTreeMap<DpuDeploymentType, std::collections::BTreeMap<String, String>> {
+    let make_labels = |key: &str| {
+        std::collections::BTreeMap::from([
+            (
+                "feature.node.kubernetes.io/dpu-enabled".to_string(),
+                "true".to_string(),
+            ),
+            (key.to_string(), "true".to_string()),
+        ])
+    };
+
+    let mut map = std::collections::BTreeMap::from([(
+        DpuDeploymentType::Bf3,
+        make_labels(&carbide_config.dpf.deployments.bf3.node_label_key),
+    )]);
+
+    if let Some(bf4) = &carbide_config.dpf.deployments.bf4_generic {
+        map.insert(
+            DpuDeploymentType::Bf4Generic,
+            make_labels(&bf4.node_label_key),
+        );
+    }
+
+    map
 }
 
 #[derive(Debug)]
@@ -863,6 +1002,7 @@ async fn initialize_and_start_controllers<'a>(
         ib_fabric_manager,
         redfish_pool: shared_redfish_pool,
         work_lock_manager_handle,
+        endpoint_exploration_locks,
         rms_client,
         component_manager,
         dpf_sdk,
@@ -1051,6 +1191,7 @@ async fn initialize_and_start_controllers<'a>(
             client.connect().await.map_err(|e| {
                 eyre::eyre!("Failed to connect DSX Exchange Event Bus MQTT client: {e}")
             })?;
+            client.register_metrics(&meter, "dsx_event_bus");
 
             tracing::info!(
                 "DSX Exchange Event Bus enabled, publishing to {}:{}",
@@ -1073,6 +1214,21 @@ async fn initialize_and_start_controllers<'a>(
                 .bms_client
                 .set(bms_client)
                 .map_err(|_| eyre::eyre!("BMS DSX Exchange handle already initialized"))?;
+
+            // Periodically re-publish current managed host state so consumers
+            // that miss change events can reconcile. A no-op unless enabled.
+            ManagedHostStateRepublisher::new(
+                client.clone(),
+                ManagedHostStateRepublisherParams {
+                    db_pool: db_pool.clone(),
+                    work_lock_manager_handle: work_lock_manager_handle.clone(),
+                    topic_prefix: config.topic_prefix.clone(),
+                    publish_timeout: config.publish_timeout,
+                    config: config.periodic_state_republish.clone(),
+                    host_health_config: carbide_config.host_health,
+                },
+            )
+            .start(join_set, cancel_token.clone())?;
 
             emitter_builder = emitter_builder.hook(Box::new(MqttStateChangeHook::new(
                 client,
@@ -1338,6 +1494,10 @@ async fn initialize_and_start_controllers<'a>(
                 .into(),
                 switch_system_image_rms_client,
                 credential_manager: credential_manager.clone(),
+                component_manager: component_manager.clone().map(Arc::new),
+                nmx_cluster_switch_mtls_services: carbide_config
+                    .rack_state_controller
+                    .effective_nmx_cluster_switch_mtls_services_as_i32(),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
             }
             .into(),
@@ -1355,6 +1515,9 @@ async fn initialize_and_start_controllers<'a>(
                 db_pool: db_pool.clone(),
                 component_manager: component_manager.clone().map(Arc::new),
                 credential_manager: credential_manager.clone(),
+                switch_mtls_services: carbide_config
+                    .switch_state_controller
+                    .effective_switch_mtls_services_as_i32(),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
             }
             .into(),
@@ -1378,19 +1541,24 @@ async fn initialize_and_start_controllers<'a>(
     )
     .start(join_set, cancel_token.clone())?;
 
-    NvLinkManager::new(
-        db_pool.clone(),
-        api_service.nmxc_client_pool.clone(),
-        meter.clone(),
-        carbide_config.nvlink_config.clone().unwrap_or_default(),
-        carbide_config.host_health,
-        work_lock_manager_handle.clone(),
-    )
+    NvLinkManager::new(NvLinkManagerArgs {
+        db_pool: db_pool.clone(),
+        nmxc_client_pool: api_service.nmxc_client_pool.clone(),
+        meter: meter.clone(),
+        config: carbide_config.nvlink_config.clone().unwrap_or_default(),
+        host_health: carbide_config.host_health,
+        rms_client: api_service.rms_client.clone(),
+        credential_manager: api_service.credential_manager.clone(),
+        rack_profiles: carbide_config.rack_profiles.clone(),
+        work_lock_manager_handle: work_lock_manager_handle.clone(),
+    })
     .start(join_set, cancel_token.clone())?;
 
     if carbide_config.is_dpa_enabled() {
-        let mqtt_client =
-            Some(start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?);
+        let dpa_mqtt_client =
+            start_dpa_handler(join_set, api_service.clone(), cancel_token.clone()).await?;
+        dpa_mqtt_client.register_metrics(&meter, "dpa");
+        let mqtt_client = Some(dpa_mqtt_client);
 
         let subnet_ip = carbide_config.get_dpa_subnet_ip()?;
 
@@ -1442,6 +1610,7 @@ async fn initialize_and_start_controllers<'a>(
         Arc::new(carbide_config.get_firmware_config()),
         common_pools.clone(),
         work_lock_manager_handle.clone(),
+        endpoint_exploration_locks.clone(),
         carbide_config.rack_profiles.clone(),
         rms_client.clone(),
         credential_manager.clone(),
@@ -2096,5 +2265,34 @@ mod tests {
 
         assert!(msg.contains("alpha"), "expected `alpha` in {msg}");
         assert!(msg.contains("beta"), "expected `beta` in {msg}");
+    }
+
+    /// The pool builder rejects zero-valued lifecycle settings before it
+    /// touches the database, naming the offending field.
+    #[tokio::test]
+    async fn zero_database_pool_durations_are_rejected_at_startup() {
+        type ZeroOut = fn(&mut CarbideConfig);
+        let cases: [(&str, ZeroOut); 3] = [
+            ("database_pool_acquire_timeout", |config| {
+                config.database_pool_acquire_timeout = std::time::Duration::ZERO
+            }),
+            ("database_pool_idle_timeout", |config| {
+                config.database_pool_idle_timeout = std::time::Duration::ZERO
+            }),
+            ("database_pool_max_lifetime", |config| {
+                config.database_pool_max_lifetime = std::time::Duration::ZERO
+            }),
+        ];
+        for (field, zero_out) in cases {
+            let mut config = crate::test_support::default_config::get();
+            zero_out(&mut config);
+            let err = create_and_connect_postgres_pool(&config)
+                .await
+                .expect_err("a zero-valued pool duration must be rejected");
+            assert!(
+                err.to_string().contains(field),
+                "error must name `{field}`, got: {err}"
+            );
+        }
     }
 }

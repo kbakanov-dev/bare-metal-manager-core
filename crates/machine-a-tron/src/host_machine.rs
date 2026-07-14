@@ -38,6 +38,7 @@ use crate::dhcp_wrapper::{DhcpRelayResult, DhcpResponseInfo, DpuDhcpRelay};
 use crate::dpu_machine::{DpuMachine, DpuMachineHandle};
 use crate::machine_state_machine::{LiveState, MachineStateMachine, PersistedMachine};
 use crate::saturating_add_duration_to_instant;
+use crate::status::{BmcStatus, EndpointStatus, MachineStatus, MachineStatusConfig};
 use crate::tui::{HostDetails, UiUpdate};
 
 pub struct HostMachine {
@@ -339,9 +340,29 @@ impl HostMachine {
             return Duration::MAX;
         }
 
+        self.maybe_converge_after_dpu_flip();
+
         let sleep_duration = self.state_machine.advance().await;
         tracing::trace!("state_machine.advance end");
         sleep_duration
+    }
+
+    /// When a managed DPU flips to NIC mode it becomes a plain NIC, so this host
+    /// must stop relaying its data-plane DHCP through the DPU and instead DHCP
+    /// directly (on the same former-DPU host MAC, so a retained boot interface
+    /// still matches). Detect the flip through the DPU handle and detach the
+    /// relay once; the host then re-ingests as a zero-managed-DPU NIC-mode
+    /// machine on its next power cycle.
+    fn maybe_converge_after_dpu_flip(&mut self) {
+        if self.state_machine.has_dpu_dhcp_relay()
+            && self.dpus.iter().any(|dpu| dpu.flipped_to_nic_mode())
+        {
+            tracing::info!(
+                "a managed DPU flipped to NIC mode; converging the host to zero managed DPUs (detaching its DPU DHCP relay and dropping the DPU from its reported inventory) so it re-ingests as a NIC-mode host"
+            );
+            self.state_machine.detach_dpu_dhcp_relay();
+            self.state_machine.drop_managed_dpus();
+        }
     }
 
     async fn handle_actor_message(&mut self, message: HostMachineMessage) -> HandleMessageResult {
@@ -372,7 +393,8 @@ impl HostMachine {
                 HandleMessageResult::ContinuePolling
             }
             HostMachineMessage::SetApiState(api_state) => {
-                self.api_state = api_state;
+                self.api_state = api_state.clone();
+                self.live_state.write().unwrap().api_state = api_state;
                 HandleMessageResult::ContinuePolling
             }
         }
@@ -580,6 +602,27 @@ impl HostMachineHandle {
 
     pub fn machine_config_section(&self) -> &str {
         &self.0.machine_config_section
+    }
+
+    pub fn status(&self, config: &MachineStatusConfig) -> MachineStatus {
+        let live_state = self.0.live_state.read().unwrap();
+        MachineStatus {
+            mat_id: self.0.mat_id.to_string(),
+            machine_id: live_state
+                .observed_machine_id
+                .as_ref()
+                .map(ToString::to_string),
+            hardware_type: Some(self.0.host_info.hw_type),
+            mat_state: live_state.state_string.map(ToOwned::to_owned),
+            api_state: live_state.api_state.clone(),
+            power_state: live_state.power_state.to_string(),
+            machine_ip: live_state.machine_ip.map(|ip| ip.to_string()),
+            bmc: BmcStatus {
+                ip: live_state.bmc_ip.map(|ip| ip.to_string()),
+                redfish: EndpointStatus::redfish(config),
+            },
+            dpus: self.0.dpus.iter().map(|dpu| dpu.status(config)).collect(),
+        }
     }
 
     pub fn persisted(&self) -> PersistedHostMachine {

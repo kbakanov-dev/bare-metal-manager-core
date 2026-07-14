@@ -19,9 +19,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use ::rpc::forge::{self as rpc, IsBmcInManagedHostResponse};
-use carbide_site_explorer::{endpoint_exploration_work_key, enrich_endpoint_exploration_report};
+use carbide_site_explorer::enrich_endpoint_exploration_report;
 use config_version::ConfigVersion;
-use db::work_lock_manager::AcquireLockError;
 use model::expected_entity::ExpectedEntity;
 use tokio::net::lookup_host;
 use tonic::{Request, Response, Status};
@@ -149,6 +148,21 @@ pub(crate) async fn get_site_exploration_report(
     let report = db::site_exploration_report::fetch(&mut api.db_reader()).await?;
 
     Ok(tonic::Response::new(report.into()))
+}
+
+pub(crate) async fn get_site_explorer_last_run(
+    api: &Api,
+    request: tonic::Request<()>,
+) -> Result<Response<::rpc::site_explorer::SiteExplorerLastRunResponse>, Status> {
+    log_request_data(&request);
+
+    let last_run = db::site_explorer_run_status::fetch(&mut api.db_reader()).await?;
+
+    Ok(tonic::Response::new(
+        ::rpc::site_explorer::SiteExplorerLastRunResponse {
+            last_run: last_run.map(Into::into),
+        },
+    ))
 }
 
 pub(crate) async fn find_explored_mlx_device_host_ids(
@@ -310,6 +324,7 @@ pub(crate) async fn refresh_endpoint_report(
     request: Request<rpc::RefreshEndpointReportRequest>,
 ) -> Result<Response<::rpc::site_explorer::ExploredEndpoint>, tonic::Status> {
     log_request_data(&request);
+
     let req = request.into_inner();
 
     let bmc_ip = IpAddr::from_str(&req.ip_address).map_err(CarbideError::from)?;
@@ -352,38 +367,28 @@ pub(crate) async fn refresh_endpoint_report(
             .map(ExpectedEntity::PowerShelf)
     };
 
-    // Acquire the per-endpoint work lock before probing. If the periodic site-explorer
-    // loop (or another concurrent refresh) is already probing this endpoint, return an
-    // error immediately rather than running a redundant Redfish call.
-    let work_lock = match api
-        .work_lock_manager_handle
-        .try_acquire_lock(endpoint_exploration_work_key(bmc_ip))
-        .await
-    {
-        Ok(lock) => lock,
-        Err(AcquireLockError::WorkAlreadyLocked(_)) => {
+    // Claim the per-endpoint exploration lock before probing. If the periodic site-explorer loop or
+    // another concurrent refresh is already probing this endpoint, return immediately rather than
+    // running a redundant Redfish call.
+    let endpoint_guard = match api.endpoint_exploration_locks.try_claim(bmc_ip) {
+        Some(guard) => guard,
+        None => {
             return Err(CarbideError::AlreadyInProgress(format!(
                 "Endpoint refresh already in progress for {bmc_ip}"
             ))
             .into());
         }
-        Err(e) => {
-            return Err(CarbideError::internal(format!(
-                "Failed to acquire endpoint work lock for {bmc_ip}: {e}"
-            ))
-            .into());
-        }
     };
 
-    // Run the probe + persist on a detached tokio task that owns the work lock.
-    // Awaiting the JoinHandle preserves the synchronous UX. Even if the caller navigates
-    // away mid-fetch, the probe will still run to completion.
+    // Run the probe + persist on a detached tokio task that owns the endpoint guard. Awaiting the
+    // JoinHandle preserves the synchronous UX. Even if the caller navigates away mid-fetch, the
+    // probe will still run to completion.
     let endpoint_explorer = api.endpoint_explorer.clone();
     let database_connection = api.database_connection.clone();
     let runtime_config = api.runtime_config.clone();
 
     let join_handle = tokio::spawn(async move {
-        let _work_lock = work_lock;
+        let _endpoint_guard = endpoint_guard;
 
         let start = std::time::Instant::now();
         let result = endpoint_explorer
@@ -399,7 +404,11 @@ pub(crate) async fn refresh_endpoint_report(
         let report = match result {
             Ok(mut report) => {
                 report.last_exploration_latency = Some(start.elapsed());
-                let fw_config_snapshot = runtime_config.get_firmware_config().create_snapshot();
+                let host_firmware_configs =
+                    db::host_firmware_config::list_configs(&database_connection).await?;
+                let fw_config_snapshot = runtime_config
+                    .get_firmware_config()
+                    .create_snapshot_with_overrides(host_firmware_configs);
                 enrich_endpoint_exploration_report(&mut report, &fw_config_snapshot);
                 report
             }

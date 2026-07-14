@@ -35,7 +35,9 @@ use lazy_static::lazy_static;
 use mac_address::MacAddress;
 use model::controller_outcome::PersistentStateHandlerOutcome;
 use model::expected_machine::ExpectedMachineData;
-use model::hardware_info::{MachineInventory, MachineNvLinkInfo};
+use model::hardware_info::{
+    MachineInventory, MachineNvLinkInfo, mnnvl_gpu_name_sql_like_conditions,
+};
 use model::machine::infiniband::MachineInfinibandStatusObservation;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::network::{
@@ -158,21 +160,46 @@ pub async fn find_existing_machine(
     macaddr: MacAddress,
     relay: IpAddr,
 ) -> Result<Option<MachineId>, DatabaseError> {
+    // Exact DHCPv6 link-address matches are authoritative. Prefix containment
+    // is only valid when no segment claims the relay by exact link-address.
     let query = "
+    -- Start from machines already associated with the observed MAC.
     SELECT m.id FROM
     machines m
     INNER JOIN machine_interfaces mi
         ON m.id = mi.machine_id
     INNER JOIN network_segments ns
         ON mi.segment_id = ns.id
-    INNER JOIN network_prefixes np
-        ON np.segment_id = ns.id
     WHERE
         mi.mac_address = $1::macaddr
         AND
+        -- BMC interfaces are not host identity for DHCP discovery.
         mi.interface_type != 'Bmc'
         AND
-        $2::inet <<= np.prefix";
+        -- Keep segments that own the relay address.
+        EXISTS (
+            SELECT 1
+            FROM network_prefixes np
+            WHERE np.segment_id = ns.id
+            AND (
+                -- Accept this candidate segment when one of its own prefixes
+                -- has the exact DHCPv6 relay link-address.
+                np.dhcpv6_link_address = $2::inet
+                OR (
+                    -- This check is intentionally global, not redundant:
+                    -- prefix fallback is allowed only when no segment anywhere
+                    -- has an exact DHCPv6 link-address claim for this relay.
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM network_prefixes exact_np
+                        WHERE exact_np.dhcpv6_link_address = $2::inet
+                    )
+                    -- With no exact claim, IPv4/v6 prefix containment can match
+                    -- the segment that owns the relay address.
+                    AND $2::inet <<= np.prefix
+                )
+            )
+        )";
 
     let id: Option<MachineId> = sqlx::query_as(query)
         .bind(macaddr)
@@ -1334,6 +1361,57 @@ pub async fn try_update_network_config(
     }
 }
 
+/// Sets or clears the `use_admin_network_changed` flag on a single machine
+/// row without bumping `network_config_version` or fanning out to the group.
+pub async fn set_use_admin_network_changed(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+    value: bool,
+) -> Result<(), DatabaseError> {
+    let query = r#"
+        UPDATE machines
+        SET network_config = jsonb_set(COALESCE(network_config, '{}'::jsonb), '{use_admin_network_changed}', $1::jsonb)
+        WHERE id = $2
+    "#;
+    let result = sqlx::query(query)
+        .bind(sqlx::types::Json(value))
+        .bind(machine_id)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+    if result.rows_affected() == 0 {
+        return Err(DatabaseError::NotFoundError {
+            kind: "machine",
+            id: machine_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Clears the `use_admin_network_changed` flag only if the machine is still at
+/// the expected network config version.
+pub async fn clear_use_admin_network_changed_if_version_matches(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+    expected_version: &ConfigVersion,
+) -> Result<bool, DatabaseError> {
+    let query = r#"
+        UPDATE machines
+        SET network_config = jsonb_set(COALESCE(network_config, '{}'::jsonb), '{use_admin_network_changed}', 'false'::jsonb)
+        WHERE id = $1
+          AND network_config_version = $2
+          AND network_config -> 'use_admin_network_changed' = 'true'::jsonb
+    "#;
+    let result = sqlx::query(query)
+        .bind(machine_id)
+        .bind(expected_version)
+        .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Replaces predicted host id with stable host id.
 /// Once forge receives DiscoveryData from Host, forge can create StableMachineId.
 /// This StableMachineId must replace existing PredictedHostId in db.
@@ -1955,9 +2033,20 @@ pub async fn find_machine_ids(
         qb.push("->'alerts') > 0");
     }
     if search_config.mnnvl_only {
-        qb.push(
-            " AND mt.topology->'discovery_data'->'Info'->'dmi_data'->>'product_name' LIKE '%GB200%'",
-        );
+        qb.push(format!(
+            " AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(
+                    COALESCE(mt.topology->'discovery_data'->'Info'->'gpus', '[]'::jsonb)
+                ) AS gpu
+                WHERE gpu->'platform_info' IS NOT NULL
+                  AND gpu->'platform_info' <> 'null'::jsonb
+                  AND (
+                      {}
+                  )
+            )",
+            mnnvl_gpu_name_sql_like_conditions()
+        ));
     }
 
     if let Some(id) = search_config.instance_type_id {
@@ -2727,11 +2816,122 @@ pub fn count_healthy_unhealthy_host_machines(
 
 #[cfg(test)]
 mod test {
+    use std::net::IpAddr;
     use std::str::FromStr;
 
-    use carbide_uuid::machine::MachineId;
+    use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+    use carbide_uuid::network::NetworkSegmentId;
+    use model::allocation_type::AllocationType;
+    use model::bmc_info::BmcInfo;
+    use model::hardware_info::HardwareInfo;
     use model::machine::ManagedHostState;
     use model::machine::machine_search_config::MachineSearchConfig;
+    use model::machine::topology::{DiscoveryData, TopologyData};
+
+    /// The machine snapshot reports the BMC IP from the *live* `machine_interface_addresses`
+    /// row, and reports `None` once that address is gone -- it must never fall back to the
+    /// stale copy cached in `machine_topologies.topology.bmc_info.ip`.
+    ///
+    /// Exercises the BMC subquery in `machine_snapshots.sql.template`, which now reads
+    /// `host(bmc_addr.address)` directly instead of coalescing onto the topology copy.
+    #[crate::sqlx_test]
+    async fn test_snapshot_bmc_ip_follows_live_interface_not_stale_topology(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut txn = pool.begin().await?;
+
+        let live_bmc_ip: IpAddr = "10.1.2.3".parse()?;
+        // A different value in the topology copy makes a fallback observable: if the
+        // snapshot ever read the stale copy we'd see this instead of the live address.
+        let stale_topology_ip: IpAddr = "10.9.9.9".parse()?;
+
+        let machine_id =
+            MachineId::from_str("fm100htes3rn1npvbtm5qd57dkilaag7ljugl1llmm7rfuq1ov50i0rpl30")?;
+        super::create(
+            txn.as_mut(),
+            None,
+            &machine_id,
+            ManagedHostState::Ready,
+            None,
+            2,
+        )
+        .await?;
+
+        // A BMC interface attached to the machine, plus its live address (a DHCP lease).
+        let segment_id: NetworkSegmentId = sqlx::query_scalar(
+            "INSERT INTO network_segments (name, version) VALUES ($1, 'V1-T0') RETURNING id",
+        )
+        .bind("bmc-live-vs-stale")
+        .fetch_one(txn.as_mut())
+        .await?;
+        let bmc_interface_id: MachineInterfaceId = sqlx::query_scalar(
+            "INSERT INTO machine_interfaces
+                 (machine_id, association_type, segment_id, mac_address,
+                  primary_interface, hostname, interface_type)
+             VALUES ($1, 'Machine', $2, $3::macaddr, false, 'bmc-live-vs-stale', 'Bmc')
+             RETURNING id",
+        )
+        .bind(machine_id)
+        .bind(segment_id)
+        .bind("02:00:00:00:00:01")
+        .fetch_one(txn.as_mut())
+        .await?;
+        crate::machine_interface_address::insert(
+            txn.as_mut(),
+            bmc_interface_id,
+            live_bmc_ip,
+            AllocationType::Dhcp,
+        )
+        .await?;
+
+        // A topology row that *also* carries a (stale) BMC IP -- the removed fallback.
+        let topology = TopologyData {
+            discovery_data: DiscoveryData {
+                info: HardwareInfo::default(),
+            },
+            bmc_info: BmcInfo {
+                ip: Some(stale_topology_ip),
+                ..Default::default()
+            },
+        };
+        sqlx::query("INSERT INTO machine_topologies (machine_id, topology) VALUES ($1, $2::jsonb)")
+            .bind(machine_id)
+            .bind(sqlx::types::Json(&topology))
+            .execute(txn.as_mut())
+            .await?;
+
+        // With a live address present, the snapshot reports it.
+        let machine = super::find_one(txn.as_mut(), &machine_id, MachineSearchConfig::default())
+            .await?
+            .expect("machine snapshot should load");
+        assert_eq!(machine.bmc_info.ip, Some(live_bmc_ip));
+
+        // Release the lease: drop the live address but keep the interface and the topology
+        // row (with its stale bmc_info.ip) intact.
+        crate::machine_interface_address::delete(txn.as_mut(), &bmc_interface_id).await?;
+
+        // The key assertion: with no live address, the snapshot reports None rather than
+        // falling back to the stale topology copy.
+        let machine = super::find_one(txn.as_mut(), &machine_id, MachineSearchConfig::default())
+            .await?
+            .expect("machine snapshot should load");
+        assert_eq!(machine.bmc_info.ip, None);
+
+        // Now drop the BMC interface row entirely; the topology row (with its stale
+        // bmc_info.ip) stays. Even with no live BMC interface at all, the snapshot must
+        // still report None -- it must not fall back to the stale copy via the outer COALESCE.
+        sqlx::query("DELETE FROM machine_interfaces WHERE id = $1")
+            .bind(bmc_interface_id)
+            .execute(txn.as_mut())
+            .await?;
+        let machine = super::find_one(txn.as_mut(), &machine_id, MachineSearchConfig::default())
+            .await?
+            .expect("machine snapshot should load");
+        assert_eq!(machine.bmc_info.ip, None);
+
+        txn.rollback().await?;
+        Ok(())
+    }
 
     #[crate::sqlx_test]
 

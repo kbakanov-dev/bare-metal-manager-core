@@ -150,7 +150,7 @@ impl Bluefield3<'_> {
                     .uefi_device_path(&format!("MAC({mocked_mac_no_colons},0x1)/IPv4(0.0.0.0,0x0,DHCP,0.0.0.0,0.0.0.0,0.0.0.0)/Uri()"))
                     .build(),
             ]
-        })).collect();
+        })).collect::<Vec<_>>();
 
         redfish::computer_system::Config {
             systems: vec![redfish::computer_system::SingleSystemConfig {
@@ -185,6 +185,7 @@ impl Bluefield3<'_> {
                 })),
                 storage: None,
                 processors: None,
+                serial_console: None,
                 secure_boot_available: true,
             }],
         }
@@ -203,6 +204,7 @@ impl Bluefield3<'_> {
                     .build(),
                 ]),
                 host_interfaces: None,
+                serial_interfaces: None,
                 firmware_version: Some("BF-23.10-4"),
                 oem: None,
             }],

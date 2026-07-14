@@ -11,7 +11,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/api/internal/config"
 	apiHandler "github.com/NVIDIA/infra-controller/rest-api/api/pkg/api/handler"
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 
 	sc "github.com/NVIDIA/infra-controller/rest-api/api/pkg/client/site"
 )
@@ -36,6 +36,13 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/credential/bmc",
 			Method:  http.MethodPut,
 			Handler: apiHandler.NewCreateOrUpdateBMCCredentialHandler(dbSession, scp, cfg),
+		},
+		// Site-default UEFI credential endpoint (Provider Admin); equivalent to
+		// the admin CLI `credential add-uefi` command.
+		{
+			Path:    apiPathPrefix + "/credential/uefi",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewCreateUEFICredentialHandler(dbSession, scp),
 		},
 		// User endpoint
 		{
@@ -562,6 +569,42 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Method:  http.MethodGet,
 			Handler: apiHandler.NewGetMachineStatusDetailsHandler(dbSession),
 		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/dpu",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllDpuMachineHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/dpu/reprovision",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewReprovisionMachineDpuHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/bmc/reset",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewResetMachineBMCHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetAllMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report",
+			Method:  http.MethodPut,
+			Handler: apiHandler.NewCreateOrUpdateMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/health-report/:source",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteMachineHealthReportHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/power",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewMachinePowerControlHandler(dbSession, scp, cfg),
+		},
+
 		// Machine GPU Stats endpoint
 		{
 			Path:    apiPathPrefix + "/machine/gpu/stats",
@@ -1065,6 +1108,18 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Method:  http.MethodDelete,
 			Handler: apiHandler.NewDeleteTenantIdentityTokenDelegationHandler(dbSession, scp),
 		},
+		// Host Firmware Config endpoint (Provider Admin). Proxied to Core via
+		// UpsertHostFirmwareConfig.
+		{
+			Path:    apiPathPrefix + "/firmware-config/host",
+			Method:  http.MethodPut,
+			Handler: apiHandler.NewCreateOrUpdateHostFirmwareConfigHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/firmware-config/host",
+			Method:  http.MethodDelete,
+			Handler: apiHandler.NewDeleteHostFirmwareConfigHandler(dbSession, scp),
+		},
 	}
 
 	return apiRoutes
@@ -1080,7 +1135,7 @@ func NewWellKnownRoutes(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/jwks.json",
 			Method:  http.MethodGet,
-			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, cwssaws.JwksKind_Oidc),
+			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, corev1.JwksKind_Oidc),
 		},
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/openid-configuration",
@@ -1090,7 +1145,7 @@ func NewWellKnownRoutes(dbSession *cdb.Session, scp *sc.ClientPool, cfg *config.
 		{
 			Path:    apiPathPrefix + "/site/:siteID/.well-known/spiffe/jwks.json",
 			Method:  http.MethodGet,
-			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, cwssaws.JwksKind_Spiffe),
+			Handler: apiHandler.NewGetJWKSHandler(dbSession, scp, corev1.JwksKind_Spiffe),
 		},
 	}
 }

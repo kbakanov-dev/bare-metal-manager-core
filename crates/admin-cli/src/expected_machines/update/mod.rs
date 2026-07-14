@@ -69,11 +69,15 @@ impl Run for Args {
                 expected_machine.bmc_ip_address,
                 expected_machine.bmc_retain_credentials,
                 expected_machine.dpu_mode,
+                expected_machine.bmc_ip_allocation,
                 expected_machine.host_lifecycle_profile.map(|hlp| {
                     ::rpc::forge::HostLifecycleProfile {
                         disable_lockdown: hlp.disable_lockdown,
                     }
                 }),
+                // TODO: file-based update preserves existing host_nics; wire in
+                // expected_machine.host_nics to honor the file's list
+                None,
             )
             .await?;
         Ok(())

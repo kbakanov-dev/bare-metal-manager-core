@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use mac_address::MacAddress;
@@ -30,12 +30,15 @@ use crate::json::{JsonExt, JsonPatch};
 use crate::{http, redfish};
 
 #[derive(Clone)]
-pub struct BluefieldState {
-    mode: Arc<Mutex<ModeState>>,
-    base_mac: MacAddress,
+pub enum BluefieldState {
+    Bluefield3 {
+        mode: Arc<Mutex<ModeState>>,
+        base_mac: MacAddress,
+    },
+    Bluefield4,
 }
 
-struct ModeState {
+pub struct ModeState {
     nic_mode: bool,
     /// A `Mode.Set` queues the requested mode here. A real BlueField applies it
     /// only after the host power-cycles, so it lands on `nic_mode` on the next
@@ -44,8 +47,8 @@ struct ModeState {
 }
 
 impl BluefieldState {
-    pub fn new(nic_mode: bool, base_mac: MacAddress) -> Self {
-        Self {
+    pub fn new_bf3(nic_mode: bool, base_mac: MacAddress) -> Self {
+        Self::Bluefield3 {
             mode: Arc::new(Mutex::new(ModeState {
                 nic_mode,
                 pending_nic_mode: None,
@@ -54,29 +57,46 @@ impl BluefieldState {
         }
     }
 
+    pub fn new_bf4() -> Self {
+        Self::Bluefield4
+    }
+
     /// Whether the BlueField currently reports NIC mode.
-    fn nic_mode(&self) -> bool {
-        self.mode.lock().unwrap().nic_mode
+    pub fn nic_mode(&self) -> bool {
+        match self {
+            Self::Bluefield3 { mode, .. } => mode.lock().unwrap().nic_mode,
+            Self::Bluefield4 => false,
+        }
     }
 
     /// Queue a `Mode.Set`; it takes effect on the next power cycle.
     fn stage_mode(&self, nic_mode: bool) {
-        self.mode.lock().unwrap().pending_nic_mode = Some(nic_mode);
+        match self {
+            Self::Bluefield3 { mode, .. } => {
+                mode.lock().unwrap().pending_nic_mode = Some(nic_mode);
+            }
+            Self::Bluefield4 => (),
+        }
     }
 
     /// Apply a queued `Mode.Set`, if any -- called on power-on, the point at
     /// which a real BlueField picks up a staged mode change.
     pub fn apply_pending_mode(&self) {
-        let mut mode = self.mode.lock().unwrap();
-        if let Some(pending) = mode.pending_nic_mode.take() {
-            mode.nic_mode = pending;
+        match self {
+            Self::Bluefield3 { mode, .. } => {
+                let mut mode = mode.lock().unwrap();
+                if let Some(pending) = mode.pending_nic_mode.take() {
+                    mode.nic_mode = pending;
+                }
+            }
+            Self::Bluefield4 => (),
         }
     }
 }
 
-pub fn resource() -> redfish::Resource<'static> {
+pub fn resource(system_id: &str) -> redfish::Resource<'static> {
     redfish::Resource {
-        odata_id: Cow::Borrowed("/redfish/v1/Systems/Bluefield/Oem/Nvidia"),
+        odata_id: Cow::Owned(format!("/redfish/v1/Systems/{system_id}/Oem/Nvidia")),
         odata_type: Cow::Borrowed("#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem"),
         // Neither BF2 nor BF-3 provide Id & Name in the resource We
         // simulate this behavior by removing these fields from final answer.
@@ -84,51 +104,73 @@ pub fn resource() -> redfish::Resource<'static> {
         name: Cow::Borrowed(""),
     }
 }
+
 const SYSTEMS_OEM_RESOURCE_DELETE_FIELDS: &[&str] = &["Id", "Name"];
 
 pub fn add_routes(r: Router<BmcState>) -> Router<BmcState> {
-    r.route(&resource().odata_id, get(get_oem_nvidia))
-        .route(
-            // TODO: This is BF-3 only.
-            &format!("{}/Actions/HostRshim.Set", resource().odata_id),
-            post(hostrshim_set),
-        )
-        .route(
-            // BF-3 OEM mode flip. Staged here and applied on the next power
-            // cycle, the same as real hardware.
-            &format!("{}/Actions/Mode.Set", resource().odata_id),
-            post(mode_set),
-        )
-        .route(
-            "/redfish/v1/Managers/Bluefield_BMC/Oem/Nvidia",
-            patch(patch_managers_oem_nvidia),
-        )
+    r.route(
+        "/redfish/v1/Systems/{system_id}/Oem/Nvidia",
+        get(get_oem_nvidia),
+    )
+    .route(
+        // TODO: This is BF-3 only.
+        "/redfish/v1/Systems/{system_id}/Oem/Nvidia/Actions/HostRshim.Set",
+        post(hostrshim_set),
+    )
+    .route(
+        // BF-3 OEM mode flip. Staged here and applied on the next power
+        // cycle, the same as real hardware.
+        "/redfish/v1/Systems/{system_id}/Oem/Nvidia/Actions/Mode.Set",
+        post(mode_set),
+    )
+    .route(
+        "/redfish/v1/Managers/{manager_id}/Oem/Nvidia",
+        patch(patch_managers_oem_nvidia),
+    )
 }
 
 async fn hostrshim_set() -> Response {
     json!({}).into_ok_response()
 }
 
-async fn get_oem_nvidia(State(state): State<BmcState>) -> Response {
+async fn get_oem_nvidia(
+    State(state): State<BmcState>,
+    axum::extract::Path(system_id): axum::extract::Path<String>,
+) -> Response {
     let redfish::oem::State::NvidiaBluefield(state) = state.oem_state else {
         return http::not_found();
     };
-    let mode = if state.nic_mode() {
-        "NicMode"
-    } else {
-        "DpuMode"
-    };
-    resource()
-        .json_patch()
-        .patch(json!({
-            "Mode": mode,
-            "BaseMAC": state.base_mac.to_string().replace(":", ""),
-        }))
-        .delete_fields(SYSTEMS_OEM_RESOURCE_DELETE_FIELDS)
-        .into_ok_response()
+    match &state {
+        BluefieldState::Bluefield3 { base_mac, .. } => {
+            let mode = if state.nic_mode() {
+                "NicMode"
+            } else {
+                "DpuMode"
+            };
+            resource(&system_id)
+                .json_patch()
+                .patch(json!({
+                    "Mode": mode,
+                    "BaseMAC": base_mac.to_string().replace(":", ""),
+                }))
+                .delete_fields(SYSTEMS_OEM_RESOURCE_DELETE_FIELDS)
+                .into_ok_response()
+        }
+        BluefieldState::Bluefield4 => resource(&system_id)
+            .json_patch()
+            .delete_fields(SYSTEMS_OEM_RESOURCE_DELETE_FIELDS)
+            .into_ok_response(),
+    }
 }
 
-async fn patch_managers_oem_nvidia() -> Response {
+async fn patch_managers_oem_nvidia(
+    State(state): State<BmcState>,
+    Path(manager_id): Path<String>,
+) -> Response {
+    if state.manager.find(&manager_id).is_none() {
+        return http::not_found();
+    }
+
     // This is used by enable_rshim_bmc() of libredfish client.
     json!({}).into_ok_response()
 }
@@ -172,7 +214,7 @@ mod tests {
     #[test]
     fn mode_set_is_staged_and_applied_on_power_on() {
         // Starts in DPU mode.
-        let bf = BluefieldState::new(false, MacAddress::new([0, 0, 0, 0, 0, 1]));
+        let bf = BluefieldState::new_bf3(false, MacAddress::new([0, 0, 0, 0, 0, 1]));
         assert!(!bf.nic_mode());
 
         // A `Mode.Set` to NIC mode is staged, not applied immediately -- a

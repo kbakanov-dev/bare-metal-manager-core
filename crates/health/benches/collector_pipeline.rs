@@ -39,9 +39,14 @@ impl DataSink for CountingSink {
         "counting_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), carbide_health::HealthError> {
         black_box(context);
         black_box(event);
+        Ok(())
     }
 }
 
@@ -60,6 +65,7 @@ fn event_context() -> EventContext {
             slot_number: None,
             tray_index: None,
             nvlink_domain_uuid: None,
+            driver_version: None,
         })),
         rack_id: None,
     }
@@ -122,6 +128,7 @@ fn build_log_event(idx: usize) -> CollectorEvent {
                 (Cow::Borrowed("entry_id"), idx.to_string()),
                 (Cow::Borrowed("service_id"), "logservice-1".to_string()),
             ],
+            diagnostic_record: None,
         }
         .into(),
     )

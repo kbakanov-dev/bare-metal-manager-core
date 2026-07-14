@@ -38,6 +38,7 @@ carbide-rpc-utils = { path = "../rpc-utils" }
 carbide-uuid = { path = "../uuid", features = ["sqlx"] }
 carbide-version = { path = "../version" }
 config-version = { path = "../config-version", features = ["sqlx"] }
+trace-propagation = { path = "../trace-propagation" }
 
 # External dependencies. PLEASE KEEP ALPHABETIZED ORDER.
 ansi-to-html = { workspace = true }
@@ -60,6 +61,7 @@ itertools = { workspace = true }
 lazy_static = { workspace = true }
 mac_address = { workspace = true }
 oauth2 = { workspace = true, default-features = false }
+regex = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = [
   "rustls",
   "stream",
@@ -105,6 +107,7 @@ workspace = true
 carbide-macros = { path = "../macros" }
 carbide-sqlx-testing = { path = "../sqlx-testing", default-features = false }
 carbide-test-harness = { path = "../test-harness" }
+carbide-test-support = { path = "../test-support" }
 http-body-util = { workspace = true }
 sqlx = { workspace = true, features = [
   "runtime-tokio",

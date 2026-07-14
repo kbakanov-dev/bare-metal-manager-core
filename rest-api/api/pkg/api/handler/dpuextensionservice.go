@@ -28,7 +28,7 @@ import (
 	"github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 
-	cwssaws "github.com/NVIDIA/infra-controller/rest-api/workflow-schema/schema/site-agent/workflows/v1"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 )
 
 // ~~~~~ Create Handler ~~~~~ //
@@ -176,7 +176,7 @@ func (cdesh CreateDpuExtensionServiceHandler) Handle(c echo.Context) error {
 	// needed for the post-commit best-effort update and the response.
 	var dpuExtensionService *cdbm.DpuExtensionService
 	var statusDetails []cdbm.StatusDetail
-	var controllerDpuExtensionService *cwssaws.DpuExtensionService
+	var controllerDpuExtensionService *corev1.DpuExtensionService
 
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
@@ -206,8 +206,7 @@ func (cdesh CreateDpuExtensionServiceHandler) Handle(c echo.Context) error {
 		dpuExtensionService = des
 
 		// Create a status detail record for the DPU Extension Service
-		statusDetail, derr := sdDAO.CreateFromParams(ctx, tx, dpuExtensionService.ID.String(), cdbm.DpuExtensionServiceStatusPending,
-			cutil.GetPtr("Received DPU Extension Service creation request, pending processing"))
+		statusDetail, derr := sdDAO.Create(ctx, tx, cdbm.StatusDetailCreateInput{EntityID: dpuExtensionService.ID.String(), Status: cdbm.DpuExtensionServiceStatusPending, Message: cutil.GetPtr("Received DPU Extension Service creation request, pending processing")})
 		if derr != nil {
 			logger.Error().Err(derr).Msg("error creating Status Detail DB entry")
 			return cutil.NewAPIError(http.StatusInternalServerError, "Failed to create Status Detail for DPU Extension Service", nil)
@@ -308,10 +307,11 @@ func (cdesh CreateDpuExtensionServiceHandler) Handle(c echo.Context) error {
 			logger.Error().Err(err).Msg("error updating DPU Extension Service record in DB")
 			// Don't fail the request, the service will get updated on next inventory sync
 		} else {
-			statusDetail, serr := sdDAO.CreateFromParams(ctx, nil, dpuExtensionService.ID.String(), cdbm.DpuExtensionServiceStatusReady,
-				cutil.GetPtr("DPU Extension Service is ready for deployment"))
+			statusDetail, serr := sdDAO.Create(ctx, nil, cdbm.StatusDetailCreateInput{EntityID: dpuExtensionService.ID.String(), Status: cdbm.DpuExtensionServiceStatusReady, Message: cutil.GetPtr("DPU Extension Service is ready for deployment")})
 			if serr != nil {
 				logger.Error().Err(serr).Msg("error creating Status Detail DB entry")
+			} else if statusDetail == nil {
+				logger.Error().Msg("Status detail not returned from Create call")
 			} else {
 				statusDetails = append(statusDetails, *statusDetail)
 			}
@@ -778,7 +778,7 @@ func (udesh UpdateDpuExtensionServiceHandler) Handle(c echo.Context) error {
 	// Outer-scope values populated inside the transaction closure that are
 	// needed for the post-commit best-effort update and the response.
 	var updatedDpuExtensionService *cdbm.DpuExtensionService
-	var controllerDpuExtensionService *cwssaws.DpuExtensionService
+	var controllerDpuExtensionService *corev1.DpuExtensionService
 
 	// timeoutResp lets the closure signal a post-rollback handler — the
 	// TerminateWorkflow call has to run after the closure returns so that
@@ -1224,7 +1224,7 @@ func (gdesvh GetDpuExtensionServiceVersionHandler) Handle(c echo.Context) error 
 	}
 
 	// Get version info from Site DPU Extension Service
-	getDpuVersionInfoRequest := &cwssaws.GetDpuExtensionServiceVersionsInfoRequest{
+	getDpuVersionInfoRequest := &corev1.GetDpuExtensionServiceVersionsInfoRequest{
 		ServiceId: dpuExtensionService.ID.String(),
 		Versions:  []string{versionID},
 	}
@@ -1261,7 +1261,7 @@ func (gdesvh GetDpuExtensionServiceVersionHandler) Handle(c echo.Context) error 
 	logger.Info().Msg("executing sync Temporal workflow on Site")
 
 	// Execute sync workflow on Site
-	var versionInfos *cwssaws.DpuExtensionServiceVersionInfoList
+	var versionInfos *corev1.DpuExtensionServiceVersionInfoList
 	err = workflowRun.Get(ctxWithTimeout, &versionInfos)
 	if err != nil {
 		var timeoutErr *tp.TimeoutError
@@ -1591,7 +1591,7 @@ func (ddesvh DeleteDpuExtensionServiceVersionHandler) Handle(c echo.Context) err
 			ctxWithTimeout, cancel := context.WithTimeout(ctx, cutil.WorkflowContextTimeout)
 			defer cancel()
 
-			getDpuVersionInfoRequest := &cwssaws.GetDpuExtensionServiceVersionsInfoRequest{
+			getDpuVersionInfoRequest := &corev1.GetDpuExtensionServiceVersionsInfoRequest{
 				ServiceId: dpuExtensionService.ID.String(),
 				Versions:  []string{remainingVersions[0]},
 			}
@@ -1607,7 +1607,7 @@ func (ddesvh DeleteDpuExtensionServiceVersionHandler) Handle(c echo.Context) err
 
 			logger.Info().Msg("executing sync Temporal workflow on Site")
 
-			var controllerVersionInfos *cwssaws.DpuExtensionServiceVersionInfoList
+			var controllerVersionInfos *corev1.DpuExtensionServiceVersionInfoList
 			wferr = workflowRun.Get(ctxWithTimeout, &controllerVersionInfos)
 			if wferr != nil {
 				var timeoutErr *tp.TimeoutError

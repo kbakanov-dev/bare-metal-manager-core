@@ -45,9 +45,14 @@ impl DataSink for CountingSink {
         "counting_sink"
     }
 
-    fn handle_event(&self, context: &EventContext, event: &CollectorEvent) {
+    fn try_handle_event(
+        &self,
+        context: &EventContext,
+        event: &CollectorEvent,
+    ) -> Result<(), carbide_health::HealthError> {
         std::hint::black_box(context);
         std::hint::black_box(event);
+        Ok(())
     }
 }
 
@@ -70,6 +75,7 @@ fn event_context_for_machine(machine_id: &str) -> EventContext {
             slot_number: None,
             tray_index: None,
             nvlink_domain_uuid: None,
+            driver_version: None,
         })),
         rack_id: None,
     }
@@ -345,6 +351,7 @@ fn log_events_with_attrs(count: usize, unique_sensors: usize) -> Vec<CollectorEv
                         format!(r#"["{sensor}","3.96","-0.05"]"#),
                     ),
                 ],
+                diagnostic_record: None,
             }))
         })
         .collect()
