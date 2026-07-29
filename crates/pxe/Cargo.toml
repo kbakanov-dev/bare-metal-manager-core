@@ -21,6 +21,7 @@ description = "Carbide is a Bare Metal Provisioning system with auto-discovery a
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "carbide"
@@ -53,6 +54,7 @@ pin-project-lite = { workspace = true }
 prometheus = { workspace = true }
 rand = { workspace = true }
 serde = { features = ["derive"], workspace = true }
+serde_yaml = { workspace = true }
 tera = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

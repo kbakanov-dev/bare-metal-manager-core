@@ -34,6 +34,7 @@ pub mod operating_system;
 pub mod power_shelf;
 pub mod rack;
 pub mod secret;
+pub mod site_prefix;
 pub mod spx;
 pub mod switch;
 pub mod typed_uuids;
@@ -64,11 +65,11 @@ pub trait DbTable {
 
 #[derive(thiserror::Error, Debug)]
 pub enum UuidConversionError {
-    #[error("Invalid UUID for {ty}: {value}")]
+    #[error("invalid UUID for {ty}: {value}")]
     InvalidUuid { ty: &'static str, value: String },
-    #[error("Missing ID for {0}")]
+    #[error("missing ID for {0}")]
     MissingId(&'static str),
-    #[error("Invalid MachineId: {0}")]
+    #[error("invalid MachineId: {0}")]
     InvalidMachineId(String),
     #[error("UUID parse error: {0}")]
     UuidError(#[from] uuid::Error),

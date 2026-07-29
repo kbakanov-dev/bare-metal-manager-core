@@ -18,8 +18,9 @@ use std::net::IpAddr;
 
 use mac_address::MacAddress;
 use model::expected_machine::{
-    BmcIpAllocationType, DpuMode, ExpectedHostNic, ExpectedMachine, ExpectedMachineData,
-    ExpectedMachineRequest, HostLifecycleProfile, LinkedExpectedMachine, UnexpectedMachine,
+    BmcIpAllocationType, ExpectedHostNic, ExpectedInterfaceIpAllocation, ExpectedInterfaceRole,
+    ExpectedMachine, ExpectedMachineData, ExpectedMachineRequest, HostDpuPolicy,
+    HostLifecycleProfile, LinkedExpectedMachine, UnexpectedMachine,
 };
 use model::metadata::Metadata;
 use model::network_segment::NetworkSegmentType;
@@ -29,28 +30,163 @@ use crate as rpc;
 use crate::errors::RpcDataConversionError;
 use crate::model::RpcTryFrom;
 
-impl From<DpuMode> for rpc::forge::DpuMode {
-    fn from(mode: DpuMode) -> Self {
-        match mode {
-            DpuMode::DpuMode => rpc::forge::DpuMode::DpuMode,
-            DpuMode::NicMode => rpc::forge::DpuMode::NicMode,
-            DpuMode::NoDpu => rpc::forge::DpuMode::NoDpu,
+impl From<HostDpuPolicy> for rpc::forge::DpuMode {
+    fn from(policy: HostDpuPolicy) -> Self {
+        match policy {
+            HostDpuPolicy::Manage => rpc::forge::DpuMode::DpuMode,
+            HostDpuPolicy::Nic => rpc::forge::DpuMode::NicMode,
+            HostDpuPolicy::Ignore => rpc::forge::DpuMode::NoDpu,
         }
     }
 }
 
-impl From<rpc::forge::DpuMode> for DpuMode {
+impl From<rpc::forge::DpuMode> for HostDpuPolicy {
     fn from(mode: rpc::forge::DpuMode) -> Self {
         match mode {
-            rpc::forge::DpuMode::DpuMode => DpuMode::DpuMode,
-            rpc::forge::DpuMode::NicMode => DpuMode::NicMode,
-            rpc::forge::DpuMode::NoDpu => DpuMode::NoDpu,
-            // Unspecified (0) or any unknown value means "use the default",
-            // which preserves behavior for old clients that don't send the
-            // field at all.
-            rpc::forge::DpuMode::Unspecified => DpuMode::default(),
+            rpc::forge::DpuMode::DpuMode => HostDpuPolicy::Manage,
+            rpc::forge::DpuMode::NicMode => HostDpuPolicy::Nic,
+            rpc::forge::DpuMode::NoDpu => HostDpuPolicy::Ignore,
+            // Unspecified means "use the default", which preserves behavior
+            // for clients that omit the compatibility field.
+            rpc::forge::DpuMode::Unspecified => HostDpuPolicy::default(),
         }
     }
+}
+
+fn host_dpu_policy_from_rpc(dpu_mode: Option<i32>) -> HostDpuPolicy {
+    dpu_mode
+        .and_then(|value| rpc::forge::DpuMode::try_from(value).ok())
+        .map(HostDpuPolicy::from)
+        .unwrap_or_default()
+}
+
+fn host_dpu_policy_to_rpc(policy: HostDpuPolicy) -> Option<i32> {
+    match policy {
+        HostDpuPolicy::Manage => None,
+        policy => Some(rpc::forge::DpuMode::from(policy) as i32),
+    }
+}
+
+/// Convert the model role to its concrete protobuf value.
+///
+/// Optional-field omission is handled separately so this conversion never
+/// needs to treat Host as an absent role.
+impl From<ExpectedInterfaceRole> for rpc::forge::ExpectedInterfaceRole {
+    fn from(role: ExpectedInterfaceRole) -> Self {
+        match role {
+            ExpectedInterfaceRole::Host => Self::Host,
+            ExpectedInterfaceRole::DpuOs => Self::DpuOs,
+            ExpectedInterfaceRole::DpuBmc => Self::DpuBmc,
+        }
+    }
+}
+
+/// Convert a concrete protobuf role to its model role.
+///
+/// `Unspecified` maps to Host for clients that predate the role field.
+impl From<rpc::forge::ExpectedInterfaceRole> for ExpectedInterfaceRole {
+    fn from(role: rpc::forge::ExpectedInterfaceRole) -> Self {
+        match role {
+            rpc::forge::ExpectedInterfaceRole::Unspecified
+            | rpc::forge::ExpectedInterfaceRole::Host => Self::Host,
+            rpc::forge::ExpectedInterfaceRole::DpuOs => Self::DpuOs,
+            rpc::forge::ExpectedInterfaceRole::DpuBmc => Self::DpuBmc,
+        }
+    }
+}
+
+/// Decode the optional role field while preserving its compatibility default.
+///
+/// Both a missing field and `Unspecified` become Host. Unknown protobuf values
+/// remain errors so a newer role is not silently treated as a Host interface.
+fn expected_interface_role_from_rpc(
+    role: Option<i32>,
+) -> Result<ExpectedInterfaceRole, RpcDataConversionError> {
+    let Some(role) = role else {
+        return Ok(ExpectedInterfaceRole::default());
+    };
+    rpc::forge::ExpectedInterfaceRole::try_from(role)
+        .map(Into::into)
+        .map_err(|_| {
+            RpcDataConversionError::InvalidArgument(format!(
+                "invalid expected interface role: {role}"
+            ))
+        })
+}
+
+/// Encode a role without adding the default Host field to legacy responses.
+///
+/// DPU roles must remain explicit because they select different endpoint
+/// behavior.
+fn expected_interface_role_to_rpc(role: ExpectedInterfaceRole) -> Option<i32> {
+    match role {
+        ExpectedInterfaceRole::Host => None,
+        role => Some(rpc::forge::ExpectedInterfaceRole::from(role) as i32),
+    }
+}
+
+/// Convert a resolved model allocation policy to its protobuf value.
+impl From<ExpectedInterfaceIpAllocation> for rpc::forge::ExpectedInterfaceIpAllocation {
+    fn from(policy: ExpectedInterfaceIpAllocation) -> Self {
+        match policy {
+            ExpectedInterfaceIpAllocation::Dynamic => Self::Dynamic,
+            ExpectedInterfaceIpAllocation::Fixed => Self::Fixed,
+            ExpectedInterfaceIpAllocation::Retained => Self::Retained,
+        }
+    }
+}
+
+/// Convert a concrete protobuf allocation policy to its resolved model value.
+///
+/// `Unspecified` has no resolved value on its own: the containing interface
+/// needs `fixed_ip` to infer whether the legacy policy is Fixed or Dynamic.
+impl TryFrom<rpc::forge::ExpectedInterfaceIpAllocation> for ExpectedInterfaceIpAllocation {
+    type Error = RpcDataConversionError;
+
+    fn try_from(policy: rpc::forge::ExpectedInterfaceIpAllocation) -> Result<Self, Self::Error> {
+        match policy {
+            rpc::forge::ExpectedInterfaceIpAllocation::Unspecified => {
+                Err(RpcDataConversionError::InvalidArgument(
+                    "expected interface IP allocation is unspecified".into(),
+                ))
+            }
+            rpc::forge::ExpectedInterfaceIpAllocation::Dynamic => Ok(Self::Dynamic),
+            rpc::forge::ExpectedInterfaceIpAllocation::Fixed => Ok(Self::Fixed),
+            rpc::forge::ExpectedInterfaceIpAllocation::Retained => Ok(Self::Retained),
+        }
+    }
+}
+
+/// Decode the optional allocation field without resolving an omitted policy.
+///
+/// Missing and `Unspecified` both remain `None`. That distinction matters
+/// because omission plus `fixed_ip` means Fixed, while explicit Dynamic rejects
+/// `fixed_ip`.
+fn expected_interface_ip_allocation_from_rpc(
+    policy: Option<i32>,
+) -> Result<Option<ExpectedInterfaceIpAllocation>, RpcDataConversionError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let policy = rpc::forge::ExpectedInterfaceIpAllocation::try_from(policy).map_err(|_| {
+        RpcDataConversionError::InvalidArgument(format!(
+            "invalid expected interface IP allocation: {policy}"
+        ))
+    })?;
+    match policy {
+        rpc::forge::ExpectedInterfaceIpAllocation::Unspecified => Ok(None),
+        policy => ExpectedInterfaceIpAllocation::try_from(policy).map(Some),
+    }
+}
+
+/// Encode only explicitly configured allocation policies.
+///
+/// An omitted model policy stays absent so old `fixed_ip` declarations keep
+/// their Fixed inference instead of being rewritten as explicit Dynamic.
+fn expected_interface_ip_allocation_to_rpc(
+    policy: Option<ExpectedInterfaceIpAllocation>,
+) -> Option<i32> {
+    policy.map(|policy| rpc::forge::ExpectedInterfaceIpAllocation::from(policy) as i32)
 }
 
 impl From<BmcIpAllocationType> for rpc::forge::BmcIpAllocationType {
@@ -118,6 +254,8 @@ impl From<ExpectedHostNic> for rpc::forge::ExpectedHostNic {
             network_segment_type: expected_host_nic
                 .network_segment_type
                 .map(|segment_type| segment_type as i32),
+            role: expected_interface_role_to_rpc(expected_host_nic.role),
+            ip_allocation: expected_interface_ip_allocation_to_rpc(expected_host_nic.ip_allocation),
         }
     }
 }
@@ -151,6 +289,10 @@ impl TryFrom<rpc::forge::ExpectedHostNic> for ExpectedHostNic {
                 .network_segment_type
                 .map(NetworkSegmentType::rpc_try_from)
                 .transpose()?,
+            role: expected_interface_role_from_rpc(expected_host_nic.role)?,
+            ip_allocation: expected_interface_ip_allocation_from_rpc(
+                expected_host_nic.ip_allocation,
+            )?,
         })
     }
 }
@@ -189,12 +331,9 @@ impl From<ExpectedMachine> for rpc::forge::ExpectedMachine {
                 .bmc_ip_address
                 .map(|ip| ip.to_string()),
             bmc_retain_credentials: expected_machine.data.bmc_retain_credentials.filter(|&v| v),
-            // Only emit `dpu_mode` when it's non-default (which matches the
-            // bmc_retain_credentials filter pattern above).
-            dpu_mode: match expected_machine.data.dpu_mode {
-                DpuMode::DpuMode => None,
-                other => Some(rpc::forge::DpuMode::from(other) as i32),
-            },
+            // Forge retains `dpu_mode` as its stable compatibility field. The
+            // default policy remains represented by absence on the wire.
+            dpu_mode: host_dpu_policy_to_rpc(expected_machine.data.dpu_policy),
             // Only emit `bmc_ip_allocation` when it's non-default (Auto), so an
             // unset field round-trips and older clients keep falling back to Auto.
             bmc_ip_allocation: match expected_machine.data.bmc_ip_allocation {
@@ -265,14 +404,10 @@ impl TryFrom<rpc::forge::ExpectedMachine> for ExpectedMachineData {
                 })?),
             },
             bmc_retain_credentials: em.bmc_retain_credentials,
-            // `dpu_mode` is optional on the wire; missing / ::Unspecified
-            // both fall back to `DpuMode::default()`, which is ::DpuMode,
-            // so old clients continue to behave as before.
-            dpu_mode: em
-                .dpu_mode
-                .map(|i| rpc::forge::DpuMode::try_from(i).unwrap_or_default())
-                .map(DpuMode::from)
-                .unwrap_or_default(),
+            // Translate the stable Forge compatibility field immediately into
+            // the internal policy model. Missing, Unspecified, and unknown raw
+            // values retain the historical default behavior.
+            dpu_policy: host_dpu_policy_from_rpc(em.dpu_mode),
             // `bmc_ip_allocation` is optional on the wire; an unset field (and the
             // ::Unspecified discriminant) falls back to `BmcIpAllocationType::default()`
             // (::Auto), so old clients continue to behave as before. An unknown
@@ -324,42 +459,235 @@ fn metadata_from_request(
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::{scenarios, value_scenarios};
+    use carbide_test_support::{Check, check_values, scenarios, value_scenarios};
+    use prost::Message;
 
     use super::*;
 
-    /// `DpuMode::from(rpc::forge::DpuMode)` maps each named variant onto its
-    /// model twin, and Unspecified (what old clients send) onto the default —
-    /// which keeps existing deployments behaving as before. The named rows also
-    /// stand in for the model -> rpc -> model round trip, since the rpc input is
-    /// exactly what `rpc::forge::DpuMode::from(model)` produces.
+    /// The stable protobuf boundary maps directly onto the internal policy.
     #[test]
     fn rpc_dpu_mode_maps_to_model() {
         value_scenarios!(
-            run = DpuMode::from;
+            run = HostDpuPolicy::from;
             "unspecified maps to default" {
-                rpc::forge::DpuMode::Unspecified => DpuMode::default(),
+                rpc::forge::DpuMode::Unspecified => HostDpuPolicy::default(),
             }
 
-            "dpu mode round trips" {
-                rpc::forge::DpuMode::DpuMode => DpuMode::DpuMode,
+            "DPU mode maps to manage" {
+                rpc::forge::DpuMode::DpuMode => HostDpuPolicy::Manage,
             }
 
-            "nic mode round trips" {
-                rpc::forge::DpuMode::NicMode => DpuMode::NicMode,
+            "NIC mode maps to NIC policy" {
+                rpc::forge::DpuMode::NicMode => HostDpuPolicy::Nic,
             }
 
-            "no dpu round trips" {
-                rpc::forge::DpuMode::NoDpu => DpuMode::NoDpu,
+            "no DPU maps to ignore" {
+                rpc::forge::DpuMode::NoDpu => HostDpuPolicy::Ignore,
             }
         );
     }
 
-    /// The DpuMode default is DpuMode, which is what the Unspecified mapping above
-    /// relies on.
+    /// The host DPU policy default is Manage, which is what the Unspecified mapping
+    /// above relies on.
     #[test]
-    fn dpu_mode_default_is_dpu_mode() {
-        assert_eq!(DpuMode::default(), DpuMode::DpuMode);
+    fn host_dpu_policy_default_is_manage() {
+        assert_eq!(HostDpuPolicy::default(), HostDpuPolicy::Manage);
+    }
+
+    /// The policy refactor must not change the protobuf bytes consumed by
+    /// existing clients: field 16 remains a varint and values 0 through 3 retain
+    /// their legacy meanings.
+    #[test]
+    fn host_dpu_policy_preserves_legacy_wire_encoding() {
+        check_values(
+            [
+                Check {
+                    scenario: "unspecified remains 0",
+                    input: rpc::forge::DpuMode::Unspecified,
+                    expect: vec![0x80, 0x01, 0x00],
+                },
+                Check {
+                    scenario: "manage remains DPU_MODE 1",
+                    input: rpc::forge::DpuMode::DpuMode,
+                    expect: vec![0x80, 0x01, 0x01],
+                },
+                Check {
+                    scenario: "NIC policy remains NIC_MODE 2",
+                    input: rpc::forge::DpuMode::NicMode,
+                    expect: vec![0x80, 0x01, 0x02],
+                },
+                Check {
+                    scenario: "ignore remains NO_DPU 3",
+                    input: rpc::forge::DpuMode::NoDpu,
+                    expect: vec![0x80, 0x01, 0x03],
+                },
+            ],
+            |policy| {
+                rpc::forge::ExpectedMachine {
+                    dpu_mode: Some(policy as i32),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            },
+        );
+    }
+
+    /// Reflection-backed clients continue to see only the pre-existing field,
+    /// enum type, and value names. `HostDpuPolicy` remains an internal model.
+    #[test]
+    fn host_dpu_policy_descriptor_retains_compatibility_surface() {
+        let descriptor_set =
+            prost_types::FileDescriptorSet::decode(rpc::REFLECTION_API_SERVICE_DESCRIPTOR).unwrap();
+        let forge = descriptor_set
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("forge"))
+            .unwrap();
+        let expected_machine = forge
+            .message_type
+            .iter()
+            .find(|message| message.name.as_deref() == Some("ExpectedMachine"))
+            .unwrap();
+        let policy_field = expected_machine
+            .field
+            .iter()
+            .find(|field| field.number == Some(16))
+            .unwrap();
+
+        assert_eq!(policy_field.name.as_deref(), Some("dpu_mode"));
+        assert_eq!(policy_field.json_name.as_deref(), Some("dpuMode"));
+        assert_eq!(policy_field.type_name.as_deref(), Some(".forge.DpuMode"));
+        assert_eq!(
+            policy_field
+                .options
+                .as_ref()
+                .and_then(|options| options.deprecated),
+            None
+        );
+        assert!(
+            expected_machine.field.iter().all(
+                |field| field.name.as_deref() != Some("dpu_policy") && field.number != Some(19)
+            )
+        );
+
+        let policy_enum = forge
+            .enum_type
+            .iter()
+            .find(|enumeration| enumeration.name.as_deref() == Some("DpuMode"))
+            .unwrap();
+        let names_and_numbers = policy_enum
+            .value
+            .iter()
+            .map(|value| (value.name.as_deref().unwrap(), value.number.unwrap()))
+            .collect::<Vec<_>>();
+        for legacy_value in [
+            ("DPU_MODE_UNSPECIFIED", 0),
+            ("DPU_MODE", 1),
+            ("NIC_MODE", 2),
+            ("NO_DPU", 3),
+        ] {
+            assert!(names_and_numbers.contains(&legacy_value));
+        }
+
+        assert!(
+            forge
+                .enum_type
+                .iter()
+                .all(|enumeration| enumeration.name.as_deref() != Some("HostDpuPolicy"))
+        );
+        assert_eq!(rpc::forge::DpuMode::DpuMode.as_str_name(), "DPU_MODE");
+    }
+
+    #[test]
+    fn expected_machine_translates_rpc_dpu_mode_to_policy() {
+        value_scenarios!(
+            run = host_dpu_policy_from_rpc;
+            "missing field defaults to manage" {
+                None => HostDpuPolicy::Manage,
+            }
+            "unspecified defaults to manage" {
+                Some(rpc::forge::DpuMode::Unspecified as i32) => HostDpuPolicy::Manage,
+            }
+            "DPU mode maps to manage" {
+                Some(rpc::forge::DpuMode::DpuMode as i32) => HostDpuPolicy::Manage,
+            }
+            "NIC mode maps to NIC policy" {
+                Some(rpc::forge::DpuMode::NicMode as i32) => HostDpuPolicy::Nic,
+            }
+            "no DPU maps to ignore" {
+                Some(rpc::forge::DpuMode::NoDpu as i32) => HostDpuPolicy::Ignore,
+            }
+            "unknown value preserves the historical default" {
+                Some(i32::MAX) => HostDpuPolicy::Manage,
+            }
+        );
+    }
+
+    #[test]
+    fn expected_machine_emits_policy_through_compatibility_field() {
+        scenarios!(
+            run = |policy| {
+                let expected_machine = ExpectedMachine {
+                    id: None,
+                    bmc_mac_address: "AA:BB:CC:DD:EE:FF".parse().map_err(drop)?,
+                    data: ExpectedMachineData {
+                        dpu_policy: policy,
+                        ..Default::default()
+                    },
+                };
+                let rpc_machine = rpc::forge::ExpectedMachine::from(expected_machine);
+                Ok::<_, ()>(rpc_machine.dpu_mode)
+            };
+            "default manage remains absent" {
+                HostDpuPolicy::Manage => Yields(None),
+            }
+
+            "NIC policy uses NIC_MODE" {
+                HostDpuPolicy::Nic =>
+                    Yields(Some(rpc::forge::DpuMode::NicMode as i32)),
+            }
+
+            "ignore uses NO_DPU" {
+                HostDpuPolicy::Ignore =>
+                    Yields(Some(rpc::forge::DpuMode::NoDpu as i32)),
+            }
+        );
+    }
+
+    #[test]
+    fn rpc_dpu_mode_serializes_and_round_trips_legacy_values() {
+        scenarios!(
+            run = |mode| {
+                let json = serde_json::to_string(&mode).map_err(drop)?;
+                let recovered =
+                    serde_json::from_str::<rpc::forge::DpuMode>(&json).map_err(drop)?;
+                Ok::<_, ()>((json, recovered))
+            };
+            "unspecified" {
+                rpc::forge::DpuMode::Unspecified => Yields((
+                    r#""Unspecified""#.to_string(),
+                    rpc::forge::DpuMode::Unspecified,
+                )),
+            }
+            "DPU mode" {
+                rpc::forge::DpuMode::DpuMode => Yields((
+                    r#""DpuMode""#.to_string(),
+                    rpc::forge::DpuMode::DpuMode,
+                )),
+            }
+            "NIC mode" {
+                rpc::forge::DpuMode::NicMode => Yields((
+                    r#""NicMode""#.to_string(),
+                    rpc::forge::DpuMode::NicMode,
+                )),
+            }
+            "no DPU" {
+                rpc::forge::DpuMode::NoDpu => Yields((
+                    r#""NoDpu""#.to_string(),
+                    rpc::forge::DpuMode::NoDpu,
+                )),
+            }
+        );
     }
 
     /// `BmcIpAllocationType::from(rpc::forge::BmcIpAllocationType)` maps each
@@ -394,24 +722,454 @@ mod tests {
         );
     }
 
-    /// The BmcIpAllocationType default is Auto, which is what the Unspecified
-    /// mapping above relies on.
-    #[test]
-    fn bmc_ip_allocation_default_is_auto() {
-        assert_eq!(BmcIpAllocationType::default(), BmcIpAllocationType::Auto);
+    struct ExpectedHostNicInput {
+        mac_address: &'static str,
+        fixed_ip: Option<&'static str>,
+        fixed_gateway: Option<&'static str>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ExpectedHostNicConversion {
+        Converted {
+            fixed_ip: Option<IpAddr>,
+            fixed_gateway: Option<IpAddr>,
+        },
+        InvalidMac(String),
+        InvalidArgument(String),
     }
 
     #[test]
-    fn expected_host_nic_rejects_invalid_mac_address() {
+    fn expected_host_nic_converts_wire_addresses() {
+        check_values(
+            [
+                Check {
+                    scenario: "invalid MAC address is rejected",
+                    input: ExpectedHostNicInput {
+                        mac_address: "not-a-mac",
+                        fixed_ip: None,
+                        fixed_gateway: None,
+                    },
+                    expect: ExpectedHostNicConversion::InvalidMac("not-a-mac".to_string()),
+                },
+                Check {
+                    scenario: "IPv6 fixed IP is parsed",
+                    input: ExpectedHostNicInput {
+                        mac_address: "5A:5B:5C:5D:5E:66",
+                        fixed_ip: Some("2001:db8::66"),
+                        fixed_gateway: None,
+                    },
+                    expect: ExpectedHostNicConversion::Converted {
+                        fixed_ip: Some("2001:db8::66".parse().unwrap()),
+                        fixed_gateway: None,
+                    },
+                },
+                Check {
+                    scenario: "invalid fixed IP is rejected",
+                    input: ExpectedHostNicInput {
+                        mac_address: "5A:5B:5C:5D:5E:66",
+                        fixed_ip: Some("not-a-valid-ip"),
+                        fixed_gateway: None,
+                    },
+                    expect: ExpectedHostNicConversion::InvalidArgument(
+                        "Invalid fixed IP: not-a-valid-ip".to_string(),
+                    ),
+                },
+                Check {
+                    scenario: "IPv6 fixed gateway is parsed",
+                    input: ExpectedHostNicInput {
+                        mac_address: "5A:5B:5C:5D:5E:66",
+                        fixed_ip: None,
+                        fixed_gateway: Some("2001:db8::1"),
+                    },
+                    expect: ExpectedHostNicConversion::Converted {
+                        fixed_ip: None,
+                        fixed_gateway: Some("2001:db8::1".parse().unwrap()),
+                    },
+                },
+                Check {
+                    scenario: "invalid fixed gateway is rejected",
+                    input: ExpectedHostNicInput {
+                        mac_address: "5A:5B:5C:5D:5E:66",
+                        fixed_ip: None,
+                        fixed_gateway: Some("not-a-valid-ip"),
+                    },
+                    expect: ExpectedHostNicConversion::InvalidArgument(
+                        "Invalid fixed gateway: not-a-valid-ip".to_string(),
+                    ),
+                },
+                Check {
+                    scenario: "empty fixed addresses are treated as absent",
+                    input: ExpectedHostNicInput {
+                        mac_address: "5A:5B:5C:5D:5E:66",
+                        fixed_ip: Some(""),
+                        fixed_gateway: Some(""),
+                    },
+                    expect: ExpectedHostNicConversion::Converted {
+                        fixed_ip: None,
+                        fixed_gateway: None,
+                    },
+                },
+            ],
+            |input| match ExpectedHostNic::try_from(rpc::forge::ExpectedHostNic {
+                mac_address: input.mac_address.to_string(),
+                fixed_ip: input.fixed_ip.map(str::to_string),
+                fixed_gateway: input.fixed_gateway.map(str::to_string),
+                ..Default::default()
+            }) {
+                Ok(nic) => ExpectedHostNicConversion::Converted {
+                    fixed_ip: nic.fixed_ip,
+                    fixed_gateway: nic.fixed_gateway,
+                },
+                Err(RpcDataConversionError::InvalidMacAddress(mac)) => {
+                    ExpectedHostNicConversion::InvalidMac(mac)
+                }
+                Err(RpcDataConversionError::InvalidArgument(argument)) => {
+                    ExpectedHostNicConversion::InvalidArgument(argument)
+                }
+                Err(error) => panic!("unexpected conversion error: {error}"),
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_uses_optional_wire_field() {
+        struct WireDeclaration {
+            policy: Option<i32>,
+            fixed_ip: Option<String>,
+        }
+
+        check_values(
+            [
+                Check {
+                    scenario: "missing policy without fixed IP infers dynamic and stays absent",
+                    input: WireDeclaration {
+                        policy: None,
+                        fixed_ip: None,
+                    },
+                    expect: (None, ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "missing policy with fixed IP infers fixed and stays absent",
+                    input: WireDeclaration {
+                        policy: None,
+                        fixed_ip: Some("192.0.2.10".into()),
+                    },
+                    expect: (None, ExpectedInterfaceIpAllocation::Fixed, None),
+                },
+                Check {
+                    scenario: "unspecified policy becomes absent",
+                    input: WireDeclaration {
+                        policy: Some(rpc::forge::ExpectedInterfaceIpAllocation::Unspecified as i32),
+                        fixed_ip: None,
+                    },
+                    expect: (None, ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "dynamic round trips",
+                    input: WireDeclaration {
+                        policy: Some(rpc::forge::ExpectedInterfaceIpAllocation::Dynamic as i32),
+                        fixed_ip: None,
+                    },
+                    expect: (
+                        Some(ExpectedInterfaceIpAllocation::Dynamic),
+                        ExpectedInterfaceIpAllocation::Dynamic,
+                        Some(rpc::forge::ExpectedInterfaceIpAllocation::Dynamic as i32),
+                    ),
+                },
+                Check {
+                    scenario: "fixed round trips",
+                    input: WireDeclaration {
+                        policy: Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed as i32),
+                        fixed_ip: Some("192.0.2.10".into()),
+                    },
+                    expect: (
+                        Some(ExpectedInterfaceIpAllocation::Fixed),
+                        ExpectedInterfaceIpAllocation::Fixed,
+                        Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed as i32),
+                    ),
+                },
+                Check {
+                    scenario: "retained round trips",
+                    input: WireDeclaration {
+                        policy: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                        fixed_ip: None,
+                    },
+                    expect: (
+                        Some(ExpectedInterfaceIpAllocation::Retained),
+                        ExpectedInterfaceIpAllocation::Retained,
+                        Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+                    ),
+                },
+            ],
+            |declaration| {
+                let model = ExpectedHostNic::try_from(rpc::forge::ExpectedHostNic {
+                    mac_address: "AA:BB:CC:DD:EE:FF".into(),
+                    fixed_ip: declaration.fixed_ip,
+                    ip_allocation: declaration.policy,
+                    ..Default::default()
+                })
+                .unwrap();
+                let resolved = model.resolved_ip_allocation();
+                let emitted = rpc::forge::ExpectedHostNic::from(model.clone());
+                (model.ip_allocation, resolved, emitted.ip_allocation)
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_json_accepts_names_and_numbers() {
+        scenarios!(
+            run = |value: serde_json::Value| {
+                serde_json::from_value::<rpc::forge::ExpectedHostNic>(serde_json::json!({
+                    "mac_address": "AA:BB:CC:DD:EE:FF",
+                    "ip_allocation": value,
+                }))
+                .map(|interface| {
+                    interface.ip_allocation.map(|value| {
+                        rpc::forge::ExpectedInterfaceIpAllocation::try_from(value).unwrap()
+                    })
+                })
+                .map_err(|error| error.to_string())
+            };
+            "short names" {
+                serde_json::json!("unspecified") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Unspecified)),
+                serde_json::json!("dynamic") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Dynamic)),
+                serde_json::json!("fixed") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed)),
+                serde_json::json!("retained") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained)),
+            }
+            "fully-qualified aliases" {
+                serde_json::json!("expected_interface_ip_allocation_unspecified") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Unspecified)),
+                serde_json::json!("expected_interface_ip_allocation_dynamic") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Dynamic)),
+                serde_json::json!("expected_interface_ip_allocation_fixed") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed)),
+                serde_json::json!("expected_interface_ip_allocation_retained") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained)),
+            }
+            "normalized and numeric values" {
+                serde_json::json!(" EXPECTED-INTERFACE-IP-ALLOCATION-RETAINED ") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained)),
+                serde_json::json!(2) =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceIpAllocation::Fixed)),
+            }
+            "optional and invalid values" {
+                serde_json::Value::Null => Yields(None),
+                serde_json::json!("automatic") => FailsWith(
+                    "unknown expected interface IP allocation \"automatic\"".to_string()
+                ),
+            }
+        );
+
+        let interface = rpc::forge::ExpectedHostNic {
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            ip_allocation: Some(rpc::forge::ExpectedInterfaceIpAllocation::Retained as i32),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&interface).unwrap();
+        assert!(json.contains(r#""ip_allocation":"retained""#), "{json}");
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_rejects_unknown_rpc_value() {
         let err = ExpectedHostNic::try_from(rpc::forge::ExpectedHostNic {
-            mac_address: "not-a-mac".into(),
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            ip_allocation: Some(i32::MAX),
             ..Default::default()
         })
         .unwrap_err();
 
-        assert!(
-            matches!(err, RpcDataConversionError::InvalidMacAddress(mac) if mac == "not-a-mac")
+        assert!(matches!(err, RpcDataConversionError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn expected_interface_role_uses_optional_wire_field() {
+        scenarios!(
+            run = |role| {
+                let model = ExpectedHostNic::try_from(rpc::forge::ExpectedHostNic {
+                    mac_address: "AA:BB:CC:DD:EE:FF".into(),
+                    role,
+                    ..Default::default()
+                })
+                .map_err(drop)?;
+                let emitted = rpc::forge::ExpectedHostNic::from(model.clone());
+                Ok::<_, ()>((model.role, emitted.role))
+            };
+            "missing field is legacy Host and remains omitted" {
+                None => Yields((ExpectedInterfaceRole::Host, None)),
+            }
+            "Unspecified is legacy Host and remains omitted" {
+                Some(rpc::forge::ExpectedInterfaceRole::Unspecified as i32) =>
+                    Yields((ExpectedInterfaceRole::Host, None)),
+            }
+            "explicit Host remains wire-compatible" {
+                Some(rpc::forge::ExpectedInterfaceRole::Host as i32) =>
+                    Yields((ExpectedInterfaceRole::Host, None)),
+            }
+            "DPU OS round trips" {
+                Some(rpc::forge::ExpectedInterfaceRole::DpuOs as i32) => Yields((
+                    ExpectedInterfaceRole::DpuOs,
+                    Some(rpc::forge::ExpectedInterfaceRole::DpuOs as i32),
+                )),
+            }
+            "DPU BMC round trips" {
+                Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32) => Yields((
+                    ExpectedInterfaceRole::DpuBmc,
+                    Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+                )),
+            }
         );
+    }
+
+    #[test]
+    fn expected_interface_role_json_accepts_names_and_numbers() {
+        scenarios!(
+            run = |value: serde_json::Value| {
+                serde_json::from_value::<rpc::forge::ExpectedHostNic>(serde_json::json!({
+                    "mac_address": "AA:BB:CC:DD:EE:FF",
+                    "role": value,
+                }))
+                .map(|interface| {
+                    interface
+                        .role
+                        .map(|value| rpc::forge::ExpectedInterfaceRole::try_from(value).unwrap())
+                })
+                .map_err(|error| error.to_string())
+            };
+            "short names" {
+                serde_json::json!("unspecified") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::Unspecified)),
+                serde_json::json!("host") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::Host)),
+                serde_json::json!("dpu_os") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuOs)),
+                serde_json::json!("dpu_bmc") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuBmc)),
+            }
+            "fully-qualified aliases" {
+                serde_json::json!("expected_interface_role_unspecified") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::Unspecified)),
+                serde_json::json!("expected_interface_role_host") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::Host)),
+                serde_json::json!("expected_interface_role_dpu_os") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuOs)),
+                serde_json::json!("expected_interface_role_dpu_bmc") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuBmc)),
+            }
+            "normalized and numeric values" {
+                serde_json::json!(" DPU-OS ") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuOs)),
+                serde_json::json!("dpubmc") =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::DpuBmc)),
+                serde_json::json!(1) =>
+                    Yields(Some(rpc::forge::ExpectedInterfaceRole::Host)),
+            }
+            "optional and invalid values" {
+                serde_json::Value::Null => Yields(None),
+                serde_json::json!("sidecar") =>
+                    FailsWith("unknown expected interface role \"sidecar\"".to_string()),
+            }
+        );
+
+        let interface = rpc::forge::ExpectedHostNic {
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            role: Some(rpc::forge::ExpectedInterfaceRole::DpuBmc as i32),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&interface).unwrap();
+        assert!(json.contains(r#""role":"dpu_bmc""#), "{json}");
+
+        let legacy_interface = rpc::forge::ExpectedHostNic {
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            role: None,
+            ..Default::default()
+        };
+        let legacy_json = serde_json::to_string(&legacy_interface).unwrap();
+        assert!(!legacy_json.contains(r#""role""#), "{legacy_json}");
+        assert!(!legacy_json.contains(r#""ip_allocation""#), "{legacy_json}");
+    }
+
+    #[test]
+    fn expected_interface_role_rejects_unknown_rpc_value() {
+        let err = ExpectedHostNic::try_from(rpc::forge::ExpectedHostNic {
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            role: Some(i32::MAX),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, RpcDataConversionError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn expected_interface_fields_are_additive() {
+        let descriptor_set =
+            prost_types::FileDescriptorSet::decode(rpc::REFLECTION_API_SERVICE_DESCRIPTOR).unwrap();
+        let forge = descriptor_set
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("forge"))
+            .unwrap();
+        let expected_host_nic = forge
+            .message_type
+            .iter()
+            .find(|message| message.name.as_deref() == Some("ExpectedHostNic"))
+            .unwrap();
+        let field_numbers = expected_host_nic
+            .field
+            .iter()
+            .map(|field| (field.name.as_deref().unwrap(), field.number.unwrap()))
+            .collect::<Vec<_>>();
+
+        for expected in [
+            ("mac_address", 1),
+            ("nic_type", 2),
+            ("fixed_ip", 3),
+            ("fixed_mask", 4),
+            ("fixed_gateway", 5),
+            ("primary", 6),
+            ("network_segment_type", 7),
+            ("role", 8),
+            ("ip_allocation", 9),
+        ] {
+            assert!(field_numbers.contains(&expected));
+        }
+
+        let role_field = expected_host_nic
+            .field
+            .iter()
+            .find(|field| field.name.as_deref() == Some("role"))
+            .unwrap();
+        assert_eq!(
+            role_field.type_name.as_deref(),
+            Some(".forge.ExpectedInterfaceRole")
+        );
+
+        let allocation_field = expected_host_nic
+            .field
+            .iter()
+            .find(|field| field.name.as_deref() == Some("ip_allocation"))
+            .unwrap();
+        assert_eq!(
+            allocation_field.type_name.as_deref(),
+            Some(".forge.ExpectedInterfaceIpAllocation")
+        );
+
+        let expected_machine = forge
+            .message_type
+            .iter()
+            .find(|message| message.name.as_deref() == Some("ExpectedMachine"))
+            .unwrap();
+        let host_nics = expected_machine
+            .field
+            .iter()
+            .find(|field| field.name.as_deref() == Some("host_nics"))
+            .unwrap();
+        assert_eq!(host_nics.number, Some(9));
     }
 
     #[test]

@@ -165,7 +165,8 @@ type APIExpectedMachineUpdateRequest struct {
 	SkuID *string `json:"skuId"`
 	// RackID is the optional rack identifier
 	RackID *string `json:"rackId"`
-	// BmcIpAddress is the optional BMC IP address of the expected machine
+	// BmcIpAddress is the optional BMC IP address of the expected machine.
+	// An empty string is the PATCH clear sentinel; nil preserves the stored value.
 	BmcIpAddress *string `json:"bmcIpAddress"`
 	// Name is the optional name of the expected machine
 	Name *string `json:"name"`
@@ -229,7 +230,6 @@ func (emur *APIExpectedMachineUpdateRequest) Validate() error {
 		validation.Field(&emur.RackID,
 			validation.NilOrNotEmpty.Error("RackID cannot be empty")),
 		validation.Field(&emur.BmcIpAddress,
-			validation.NilOrNotEmpty.Error("BmcIpAddress cannot be empty"),
 			validation.When(emur.BmcIpAddress != nil && *emur.BmcIpAddress != "",
 				validationis.IP.Error("BmcIpAddress must be a valid IPv4 or IPv6 address"))),
 		validation.Field(&emur.Name,

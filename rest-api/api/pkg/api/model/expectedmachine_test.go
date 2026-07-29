@@ -500,6 +500,54 @@ func TestNewAPIExpectedMachineWithNilFields(t *testing.T) {
 	assert.Nil(t, got.Labels)
 }
 
+func TestAPIExpectedMachineUpdateRequest_BmcIpAddressJSONSemantics(t *testing.T) {
+	tests := []struct {
+		name               string
+		body               string
+		wantValue          *string
+		wantUnmarshalError bool
+		wantValidateError  bool
+	}{
+		{
+			name: "omitted",
+			body: `{}`,
+		},
+		{
+			name: "explicit null",
+			body: `{"bmcIpAddress":null}`,
+		},
+		{
+			name:      "address",
+			body:      `{"bmcIpAddress":"192.0.2.10"}`,
+			wantValue: cutil.GetPtr("192.0.2.10"),
+		},
+		{
+			name:      "empty string",
+			body:      `{"bmcIpAddress":""}`,
+			wantValue: cutil.GetPtr(""),
+		},
+		{
+			name:               "wrong JSON type",
+			body:               `{"bmcIpAddress":42}`,
+			wantUnmarshalError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got APIExpectedMachineUpdateRequest
+			err := json.Unmarshal([]byte(tc.body), &got)
+			assert.Equal(t, tc.wantUnmarshalError, err != nil)
+			if err != nil {
+				return
+			}
+
+			assert.Equal(t, tc.wantValue, got.BmcIpAddress)
+			assert.Equal(t, tc.wantValidateError, got.Validate() != nil)
+		})
+	}
+}
+
 func TestAPIExpectedMachineUpdateRequest_Validate(t *testing.T) {
 	emptyString := ""
 	validChassisSerial := "CHASSIS123"
@@ -746,12 +794,12 @@ func TestAPIExpectedMachineUpdateRequest_Validate(t *testing.T) {
 			expectErr: true,
 		},
 		{
-			desc: "empty BmcIpAddress (pointer set, value empty)",
+			desc: "empty BmcIpAddress clears the value",
 			obj: APIExpectedMachineUpdateRequest{
 				ChassisSerialNumber: &validChassisSerial,
 				BmcIpAddress:        &emptyString,
 			},
-			expectErr: true,
+			expectErr: false,
 		},
 		{
 			desc: "nil BmcIpAddress (default)",

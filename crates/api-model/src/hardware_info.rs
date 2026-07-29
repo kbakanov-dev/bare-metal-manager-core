@@ -107,6 +107,12 @@ pub struct NvmeDevice {
     pub firmware_rev: String,
     #[serde(default)]
     pub serial: String,
+    /// Total capacity of the drive in MB, when discoverable.
+    #[serde(default)]
+    pub size_mb: Option<u32>,
+    /// Full sysfs device path (DEVPATH), used for SKU PCI-location validation.
+    #[serde(default)]
+    pub pci_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,13 +287,13 @@ pub struct TpmDescription {
 
 #[derive(thiserror::Error, Debug)]
 pub enum HardwareInfoError {
-    #[error("DPU Info is missing.")]
+    #[error("DPU info is missing")]
     MissingDpuInfo,
 
-    #[error("Mac address conversion error: {0}")]
+    #[error("mac address conversion error: {0}")]
     MacAddressConversionError(#[from] MacParseError),
 
-    #[error("Missing hardware info: {0}")]
+    #[error("missing hardware info: {0}")]
     MissingHardwareInfo(#[from] MissingHardwareInfo),
 }
 
@@ -339,6 +345,15 @@ impl HardwareInfo {
         self.dmi_data
             .as_ref()
             .is_some_and(|dmi| dmi.sys_vendor == "NVIDIA" && dmi.product_name == "DGXH100")
+    }
+
+    /// Chassis serial from the first GPU `platform_info`, when present and non-empty.
+    pub fn first_gpu_platform_chassis_serial(&self) -> Option<&str> {
+        self.gpus
+            .first()
+            .and_then(|gpu| gpu.platform_info.as_ref())
+            .map(|platform_info| platform_info.chassis_serial.as_str())
+            .filter(|serial| !serial.trim().is_empty())
     }
 }
 
@@ -863,23 +878,11 @@ mod tests {
         );
     }
 
-    // `bmc_vendor()` maps the DMI `sys_vendor` string through `from_udev_dmi`, and
-    // falls back to `Unknown` when there is no DMI data at all.
     #[test]
     fn hardware_info_bmc_vendor() {
         value_scenarios!(
             run = |info| info.bmc_vendor();
-            "lenovo sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Lenovo".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Lenovo,
-            }
-
-            "dell sys vendor" {
+            "DMI data delegates to BMCVendor" {
                 info_with_dmi(
                     CpuArchitecture::X86_64,
                     DmiData {
@@ -889,73 +892,60 @@ mod tests {
                 ) => bmc_vendor::BMCVendor::Dell,
             }
 
-            "nvidia sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::Aarch64,
-                    DmiData {
-                        sys_vendor: "NVIDIA".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Nvidia,
-            }
-
-            "mellanox url maps to nvidia" {
-                info_with_dmi(
-                    CpuArchitecture::Aarch64,
-                    DmiData {
-                        sys_vendor: "https://www.mellanox.com".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Nvidia,
-            }
-
-            "supermicro sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Supermicro".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Supermicro,
-            }
-
-            "hpe sys vendor" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "HPE".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Hpe,
-            }
-
-            "unrecognized sys vendor is unknown" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "Acme Corp".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Unknown,
-            }
-
-            "case-sensitive: lowercase dell is unknown" {
-                info_with_dmi(
-                    CpuArchitecture::X86_64,
-                    DmiData {
-                        sys_vendor: "dell inc.".to_string(),
-                        ..Default::default()
-                    },
-                ) => bmc_vendor::BMCVendor::Unknown,
-            }
-
-            "no dmi data is unknown" {
+            "missing DMI data falls back to unknown" {
                 HardwareInfo::default() => bmc_vendor::BMCVendor::Unknown,
             }
         );
     }
 
-    fn gpu_with_platform_info(name: &str) -> Gpu {
+    #[test]
+    fn first_gpu_platform_chassis_serial() {
+        value_scenarios!(
+            run = |info| info.first_gpu_platform_chassis_serial().map(str::to_string);
+            "no GPUs" {
+                HardwareInfo::default() => None,
+            }
+
+            "GPU with missing platform_info" {
+                hardware_info_with_gpu(gpu_without_platform_info("NVIDIA GB200")) => None,
+            }
+
+            "blank chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "")) => None,
+            }
+
+            "whitespace-only chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "   \t  ")) => None,
+            }
+
+            "valid chassis serial" {
+                hardware_info_with_gpu(gpu_with_platform_info("NVIDIA GB200", "chassis-1"))
+                    => Some("chassis-1".to_string()),
+            }
+        );
+    }
+
+    fn hardware_info_with_gpu(gpu: Gpu) -> HardwareInfo {
+        let mut info = HardwareInfo::default();
+        info.gpus.push(gpu);
+        info
+    }
+
+    fn gpu_without_platform_info(name: &str) -> Gpu {
+        Gpu {
+            name: name.to_string(),
+            serial: String::new(),
+            driver_version: String::new(),
+            vbios_version: String::new(),
+            inforom_version: String::new(),
+            total_memory: String::new(),
+            frequency: String::new(),
+            pci_bus_id: String::new(),
+            platform_info: None,
+        }
+    }
+
+    fn gpu_with_platform_info(name: &str, chassis_serial: &str) -> Gpu {
         Gpu {
             name: name.to_string(),
             serial: String::new(),
@@ -966,7 +956,7 @@ mod tests {
             frequency: String::new(),
             pci_bus_id: String::new(),
             platform_info: Some(GpuPlatformInfo {
-                chassis_serial: "chassis-1".to_string(),
+                chassis_serial: chassis_serial.to_string(),
                 slot_number: 1,
                 tray_index: 1,
                 host_id: 1,
@@ -982,7 +972,7 @@ mod tests {
             run = |(gpu_name, has_platform_info)| {
                 let mut info = HardwareInfo::default();
                 if has_platform_info {
-                    info.gpus.push(gpu_with_platform_info(gpu_name));
+                    info.gpus.push(gpu_with_platform_info(gpu_name, "chassis-1"));
                 } else {
                     info.gpus.push(Gpu {
                         name: gpu_name.to_string(),
@@ -1029,7 +1019,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        info.gpus.push(gpu_with_platform_info("NVIDIA H100 PCIe"));
+        info.gpus
+            .push(gpu_with_platform_info("NVIDIA H100 PCIe", "chassis-1"));
         assert!(info.is_mnnvl_capable());
     }
 

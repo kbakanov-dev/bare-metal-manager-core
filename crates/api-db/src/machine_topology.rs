@@ -128,8 +128,9 @@ pub async fn create_or_update_with_bom_validation(
         let age = Utc::now() - topology.updated;
         if bom_validation_enabled && age > TimeDelta::days(1) {
             tracing::debug!(
-                "Received inventory update from {}, bom_validation is enabled, existing data is old, updating",
-                machine_id
+                machine_id = %machine_id,
+                inventory_age_days = age.num_days(),
+                "Received stale inventory update while BOM validation is enabled",
             );
             set_topology_update_needed(txn, machine_id, true).await?;
         }
@@ -162,6 +163,25 @@ pub async fn update_firmware_version_by_machine_id(
         .bind(sqlx::types::Json(bmc_version))
         .bind(sqlx::types::Json(bios_version))
         .execute(txn)
+        .await
+        .map_err(|e| DatabaseError::query(query, e))?;
+
+    Ok(())
+}
+
+/// Lock every topology row for a machine.
+///
+/// Site Explorer updates topology rows before the corresponding
+/// `explored_endpoints` row. Callers that touch both tables must acquire them
+/// in the same order to avoid deadlocks.
+pub async fn lock_by_machine_id(
+    txn: &mut PgConnection,
+    machine_id: &MachineId,
+) -> DatabaseResult<()> {
+    let query = "SELECT machine_id FROM machine_topologies WHERE machine_id = $1 FOR UPDATE";
+    sqlx::query(query)
+        .bind(machine_id)
+        .fetch_all(txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 

@@ -29,6 +29,54 @@ use reqwest_middleware::ClientWithMiddleware as Client;
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 
+/// `ArtifactUnavailableReason` names the bounded blocker that kept an
+/// artifact from reaching the download path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
+pub(crate) enum ArtifactUnavailableReason {
+    MissingUrl,
+    StaleCacheRemovalFailed,
+}
+
+// Both failures increment the same counter, but their existing log fields
+// differ. Separate Event types keep each record intact instead of adding empty
+// context. Their descriptions must stay identical so OpenTelemetry treats them
+// as one instrument.
+#[derive(Event)]
+#[event(
+    event_name = "firmware_artifact_missing_url",
+    metric_name = "carbide_firmware_artifact_unavailable_total",
+    component = "carbide-firmware",
+    log = error,
+    metric = counter,
+    message = "Firmware artifact is missing and has no URL",
+    describe = "Number of firmware artifacts unavailable before download, by reason."
+)]
+pub(crate) struct FirmwareArtifactMissingUrl {
+    #[label]
+    pub reason: ArtifactUnavailableReason,
+    #[context]
+    pub firmware_path: String,
+}
+
+#[derive(Event)]
+#[event(
+    event_name = "firmware_stale_cached_artifact_removal_failed",
+    metric_name = "carbide_firmware_artifact_unavailable_total",
+    component = "carbide-firmware",
+    log = error,
+    metric = counter,
+    message = "Failed to remove stale cached firmware artifact",
+    describe = "Number of firmware artifacts unavailable before download, by reason."
+)]
+pub(crate) struct FirmwareStaleCachedArtifactRemovalFailed {
+    #[label]
+    pub reason: ArtifactUnavailableReason,
+    #[context]
+    pub filename: String,
+    #[context]
+    pub error: String,
+}
+
 /// How a background firmware download attempt ended, as a bounded metric
 /// label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
@@ -54,7 +102,8 @@ pub(crate) enum DownloadOutcome {
 /// records the attempt's duration.
 #[derive(Event)]
 #[event(
-    name = "carbide_firmware_download_duration_seconds",
+    event_name = "firmware_download_finished",
+    metric_name = "carbide_firmware_download_duration_seconds",
     component = "carbide-firmware",
     log = dynamic,
     metric = histogram,
@@ -159,7 +208,10 @@ impl FirmwareDownloader {
         }
 
         if url.is_empty() {
-            tracing::error!("Firmware with file not present has no URL: {filename:?}");
+            emit(FirmwareArtifactMissingUrl {
+                reason: ArtifactUnavailableReason::MissingUrl,
+                firmware_path: format!("{filename:?}"),
+            });
             return false;
         }
 
@@ -237,13 +289,13 @@ async fn download_and_publish(
     download(filename, url, dst_filename, client, fake_sleep).await?;
     verify_sha256(dst_filename, sha256)
         .wrap_err(format!(
-            "Downloaded artifact from {} failed verification",
+            "downloaded artifact from {} failed verification",
             loggable_url(url)
         ))
         .map_err(fail(DownloadOutcome::Checksum))?;
     std::fs::rename(dst_filename, filename)
         .wrap_err(format!(
-            "Unable to rename {dst_filename} to {}",
+            "unable to rename {dst_filename} to {}",
             filename.display()
         ))
         .map_err(fail(DownloadOutcome::Io))?;
@@ -273,15 +325,17 @@ fn cached_file_status(filename: &Path, sha256: &str) -> CachedFileStatus {
         Ok(()) => CachedFileStatus::Available,
         Err(err) => {
             tracing::warn!(
-                "Cached firmware artifact {} failed checksum verification: {err}",
-                filename.display()
+                filename = %filename.display(),
+                error = %err,
+                "Cached firmware artifact failed checksum verification",
             );
 
             if let Err(err) = std::fs::remove_file(filename) {
-                tracing::error!(
-                    "Failed to remove stale cached firmware artifact {}: {err}",
-                    filename.display()
-                );
+                emit(FirmwareStaleCachedArtifactRemovalFailed {
+                    reason: ArtifactUnavailableReason::StaleCacheRemovalFailed,
+                    filename: filename.display().to_string(),
+                    error: err.to_string(),
+                });
                 return CachedFileStatus::Unusable;
             }
 
@@ -302,18 +356,18 @@ async fn download(
         Some(x) => x,
         None => {
             return Err(fail(DownloadOutcome::Io)(eyre!(
-                "Could not find dirname of {}",
+                "could not find dirname of {}",
                 filename.to_string_lossy()
             )));
         }
     };
 
     std::fs::create_dir_all(dirname)
-        .wrap_err(format!("Unable to create directory {}", dirname.display()))
+        .wrap_err(format!("unable to create directory {}", dirname.display()))
         .map_err(fail(DownloadOutcome::Io))?;
     let mut dst_file = File::create(dst_filename)
         .await
-        .wrap_err(format!("Unable to create file {dst_filename}"))
+        .wrap_err(format!("unable to create file {dst_filename}"))
         .map_err(fail(DownloadOutcome::Io))?;
 
     if let Some(duration) = fake_sleep {
@@ -409,7 +463,7 @@ fn verify_sha256(filename: &str, checksum: &str) -> Result<(), Report> {
 
     if checksum_actual != checksum {
         return Err(eyre!(
-            "Checksum mismatch: Expected {checksum} downloaded {checksum_actual}"
+            "checksum mismatch: expected {checksum} downloaded {checksum_actual}"
         ));
     }
     Ok(())

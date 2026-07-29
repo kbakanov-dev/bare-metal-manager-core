@@ -1,12 +1,24 @@
-# Mac Local Development — NICo API
+# Mac Local Development — NICo API (core) and NICo REST API (rest)
 
-Runs `nico-api` natively on macOS (no Docker for the binary itself).
-Docker Desktop is used only for Vault and Postgres.
-This NICo API instance is usable by NICo REST stack.
+## Summary
+
+For local development on macOS, this setup runs the full stack (core+rest) on macOS:
+- core: dependencies in docker but `nico-api` runs natively on macOS
+- rest: everything runs in docker
+
+**Usage:**
+- start NICo API (core) with `dev/mac-local-dev/run-nico-api.sh`<br>
+  You can access `nico-api` admin at https://localhost:1079/admin
+- start NICo REST API (rest) with `cd rest-api && make kind-reset LOCAL_CORE=true`<br>
+  `make` will display all relevant URLs and credentials for the REST API, Temporal, and Keycloak.
+- you can test the full-stack integration (REST API client -> REST API -> NICo API) by running `dev/mac-local-dev/check-rest-core-integration.sh`.
 
 > **Limitations**
 > - TPM / attestation features require Linux and a physical TPM — they are disabled in this setup.
-> - `machine-a-tron` relies on Linux-specific features and is unusable on macOS.
+> - `machine-a-tron` relies on Linux-specific features and is unusable on macOS (can build).
+
+**Evolution:**<br>
+Having `nico-api` run into a Linux VM alongside with machine-a-tron would provide more value (fully functional core, virtual TPM available).
 
 ## Prerequisites
 
@@ -55,21 +67,23 @@ grpcurl -insecure localhost:1079 list
 open https://localhost:1079/admin
 ```
 
-### RMS node type resolution
+### RMS node descriptors
 
-When testing RMS component-manager backends, configure the local rack profile so
-`product_family` is set to `gb200` or `gb300`. This field is required for
-RMS-backed operations and must exactly match the lowercase value; it is not
-normalized. The component-manager backend fields default to `rms`, so set any
-role you are not testing to a non-RMS backend. When a backend is set to `rms`,
-the matching vendor field in each configured profile is required for startup
-validation.
+When testing RMS component-manager backends, configure a non-empty
+`product_family` in each local rack profile and a non-empty vendor for each role
+using RMS. NICo trims outer whitespace and preserves the remaining identifier.
+It sends `role`, `vendor`, and `product_family` in an RMS `NodeDescriptor`
+on every request. For exact combinations represented by the current RMS
+`NodeType` enum, NICo also sends that enum and legacy firmware-filter entries
+for compatibility with older RMS servers. Other combinations, including
+VRNVL72 power shelves, remain descriptor-only. Legacy mapping is best effort
+and does not participate in startup validation; RMS evaluates descriptor support
+when an operation runs.
 
-Recommended vendor values are `NVIDIA` or `Lenovo` for compute, `NVIDIA` for
-switches, and `LiteOn` or `Delta` for power shelves. Vendor matching is
-case-insensitive and ignores spaces, hyphens, and underscores, so values like
-`nvidia`, `Lite-On`, and `lite_on` are accepted. The rack's `rack_profile_id`
-must match a key in `[rack_profiles]`.
+The component-manager backend fields default to `rms`, so set any role you are
+not testing to a non-RMS backend. The rack's `rack_profile_id` must match a key
+in `[rack_profiles]`. Descriptor-based requests require an RMS version that
+supports `NodeDescriptor`.
 
 The examples below only show the component-manager and rack-profile fields.
 Configure local `[rms]` settings separately when NICo needs to call RMS.
@@ -225,7 +239,7 @@ this ensures Vault and Postgres are initialised and the token file exists.
 Retrieve the environment variables for the run configuration:
 
 ```bash
-echo "NICO_WEB_AUTH_TYPE=basic"
+echo "CARBIDE_WEB_AUTH_TYPE=none  # local development only"
 echo "DATABASE_URL=postgresql://postgres:admin@localhost"
 echo "VAULT_ADDR=http://localhost:8201"
 echo "VAULT_KV_MOUNT_LOCATION=secrets"

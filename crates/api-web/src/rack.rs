@@ -74,7 +74,7 @@ pub async fn show_html(state: AxumState<Arc<Api>>) -> Response {
     let racks = match fetch_racks(&state).await {
         Ok(racks) => racks,
         Err(err) => {
-            tracing::error!(%err, "fetch_racks");
+            tracing::error!(error = %err, "fetch_racks");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading racks").into_response();
         }
     };
@@ -90,7 +90,7 @@ pub async fn show_json(state: AxumState<Arc<Api>>) -> Response {
     let racks = match fetch_racks(&state).await {
         Ok(racks) => racks,
         Err(err) => {
-            tracing::error!(%err, "fetch_racks");
+            tracing::error!(error = %err, "fetch_racks");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Error loading racks").into_response();
         }
     };
@@ -150,7 +150,7 @@ pub async fn fetch_rack(
             return Ok(None);
         }
         Err(err) => {
-            tracing::error!(%err, %rack_id, "find_racks_by_ids");
+            tracing::error!(error = %err, %rack_id, "find_racks_by_ids");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, Html(err.to_string())).into_response());
         }
     };
@@ -174,19 +174,22 @@ pub async fn detail(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let maybe_rack = match fetch_rack(&api, &rack_id).await {
-        Ok(maybe_rack) => maybe_rack,
+    let rack = match fetch_rack(&api, &rack_id).await {
+        Ok(Some(rack)) => rack,
+        Ok(None) => {
+            return super::not_found_response(rack_id.to_string());
+        }
         Err(response) => return response,
     };
 
     if show_json {
-        return (StatusCode::OK, Json(maybe_rack)).into_response();
+        return (StatusCode::OK, Json(rack)).into_response();
     };
 
     let associated_machines = match fetch_machine_ids(api.clone(), rack_id.clone()).await {
         Ok(m) => m,
         Err(err) => {
-            tracing::error!(%err, "fetch_machine_ids");
+            tracing::error!(error = %err, "fetch_machine_ids");
             vec![]
         }
     };
@@ -194,7 +197,7 @@ pub async fn detail(
     let associated_switches = match fetch_switch_ids(&api, &rack_id).await {
         Ok(ids) => ids,
         Err(err) => {
-            tracing::error!(%err, "fetch_switch_ids");
+            tracing::error!(error = %err, "fetch_switch_ids");
             vec![]
         }
     };
@@ -202,31 +205,25 @@ pub async fn detail(
     let associated_power_shelves = match fetch_power_shelf_ids(&api, &rack_id).await {
         Ok(ids) => ids,
         Err(err) => {
-            tracing::error!(%err, "fetch_power_shelf_ids");
+            tracing::error!(error = %err, "fetch_power_shelf_ids");
             vec![]
         }
     };
 
-    let version = maybe_rack
-        .as_ref()
-        .map(|r| r.version.clone())
-        .unwrap_or_default();
+    let version = rack.version.clone();
 
-    let lifecycle = maybe_rack
+    let lifecycle = rack
+        .status
         .as_ref()
-        .and_then(|r| r.status.as_ref())
         .and_then(|s| s.lifecycle.clone())
         .unwrap_or_default();
 
     let metadata_detail = super::MetadataDetail {
-        metadata: maybe_rack
-            .as_ref()
-            .and_then(|r| r.metadata.clone())
-            .unwrap_or_default(),
+        metadata: rack.metadata.clone().unwrap_or_default(),
         metadata_version: version.clone(),
     };
 
-    let rack_status = maybe_rack.as_ref().and_then(|rack| rack.status.as_ref());
+    let rack_status = rack.status.as_ref();
     let health_url = format!("/admin/rack/{rack_id}/health");
     let health_detail = super::HealthDetail::new(
         health_url,
@@ -247,7 +244,7 @@ pub async fn detail(
             records: records.into_iter().map(Into::into).collect(),
         },
         Err((code, err)) => {
-            tracing::error!(%code, %err, %rack_id, "fetch_rack_state_history_records");
+            tracing::error!(http_status = %code, error = %err, %rack_id, "fetch_rack_state_history_records");
             StateHistoryTable { records: vec![] }
         }
     };

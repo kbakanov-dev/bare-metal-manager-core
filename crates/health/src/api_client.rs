@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+// The deprecated fields on `rpc::forge::Machine` must still be read here for
+// backwards-compat. See https://github.com/NVIDIA/infra-controller/issues/2793
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::net::IpAddr;
@@ -35,7 +39,7 @@ use crate::HealthError;
 use crate::bmc::{BmcClient, BoxFuture, CredentialProvider};
 use crate::endpoint::{
     BmcAddr, BmcCredentials, BmcEndpoint, EndpointMetadata, EndpointSource, MachineData,
-    PowerShelfData, SwitchData, SwitchEndpointRole,
+    PowerShelfData, SharedSystemUuid, SwitchData, SwitchEndpointRole,
 };
 
 /// [`ApiEndpointSource`].
@@ -150,6 +154,42 @@ impl ApiClientWrapper {
 
         Ok(())
     }
+    /// Fetch SKU manifests by id — the expected-hardware source of truth used
+    /// to validate out-of-band GPU count against the assigned SKU.
+    pub async fn find_skus_by_ids(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<Vec<rpc::forge::Sku>, HealthError> {
+        let request = rpc::forge::SkusByIdsRequest { ids };
+
+        let response = self
+            .client
+            .find_skus_by_ids(request)
+            .await
+            .map_err(HealthError::ApiInvocationError)?;
+
+        Ok(response.skus)
+    }
+
+    /// Fetch a machine's currently-assigned SKU id, re-read live each call so SKU
+    /// assignments/changes after a collector starts are picked up (no caching).
+    pub async fn machine_hw_sku(
+        &self,
+        machine_id: carbide_uuid::machine::MachineId,
+    ) -> Result<Option<String>, HealthError> {
+        let request = rpc::forge::MachinesByIdsRequest {
+            machine_ids: vec![machine_id],
+            ..Default::default()
+        };
+
+        let response = self
+            .client
+            .find_machines_by_ids(request)
+            .await
+            .map_err(HealthError::ApiInvocationError)?;
+
+        Ok(response.machines.into_iter().next().and_then(|m| m.hw_sku))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,9 +290,11 @@ pub struct ApiEndpointSource {
     bmc_client_cache: Mutex<HashMap<MacAddress, CachedBmcClient>>,
 }
 
+#[derive(Clone)]
 struct CachedBmcClient {
     client: Arc<BmcClient>,
     kind: ApiCredentialKind,
+    system_uuid: SharedSystemUuid,
 }
 
 impl ApiEndpointSource {
@@ -278,7 +320,7 @@ impl ApiEndpointSource {
 
         self.prune_bmc_client_cache(&endpoints);
 
-        tracing::info!("Prepared total {} endpoints", endpoints.len());
+        tracing::info!(endpoint_count = endpoints.len(), "Prepared endpoints");
 
         Ok(endpoints)
     }
@@ -291,8 +333,8 @@ impl ApiEndpointSource {
         let removed = before - cache.len();
         if removed > 0 {
             tracing::info!(
-                removed,
-                remaining = cache.len(),
+                removed_bmc_client_count = removed,
+                remaining_bmc_client_count = cache.len(),
                 "Pruned stale BmcClient cache entries"
             );
         }
@@ -309,7 +351,10 @@ impl ApiEndpointSource {
             .await
             .map_err(HealthError::ApiInvocationError)?;
 
-        tracing::info!("Found {} machines", machine_ids.machine_ids.len(),);
+        tracing::info!(
+            machine_count = machine_ids.machine_ids.len(),
+            "Found machines"
+        );
 
         let mut endpoints = Vec::new();
 
@@ -325,8 +370,9 @@ impl ApiEndpointSource {
                 .await
                 .map_err(HealthError::ApiInvocationError)?;
             tracing::debug!(
-                "Fetched details for {} machines with chunk size of 100",
-                machines.machines.len(),
+                machine_count = machines.machines.len(),
+                requested_machine_count = ids_chunk.len(),
+                "Fetched machine details"
             );
 
             for machine in machines.machines {
@@ -375,7 +421,10 @@ impl ApiEndpointSource {
                     }
                 }
 
-                tracing::debug!(count = endpoints.len(), "Fetched switch endpoints");
+                tracing::debug!(
+                    switch_endpoint_count = endpoints.len(),
+                    "Fetched switch endpoints"
+                );
                 endpoints
             }
             Err(error) => {
@@ -406,7 +455,10 @@ impl ApiEndpointSource {
                     }
                 }
 
-                tracing::debug!(count = endpoints.len(), "Fetched power shelf endpoints");
+                tracing::debug!(
+                    power_shelf_endpoint_count = endpoints.len(),
+                    "Fetched power shelf endpoints"
+                );
                 endpoints
             }
             Err(error) => {
@@ -428,12 +480,13 @@ impl ApiEndpointSource {
         let addr = BmcAddr::try_from(bmc_info)?;
         let metadata = machine.id.map(|machine_id| {
             EndpointMetadata::Machine(MachineData {
-                machine_id,
+                machine_id: Some(machine_id),
                 machine_serial: machine
                     .discovery_info
                     .as_ref()
                     .and_then(|info| info.dmi_data.as_ref())
                     .map(|dmi| dmi.chassis_serial.clone()),
+                system_uuid: SharedSystemUuid::default(),
                 slot_number: machine
                     .placement_in_rack
                     .as_ref()
@@ -538,7 +591,7 @@ impl ApiEndpointSource {
         rack_id: Option<RackId>,
         credential_kind: ApiCredentialKind,
     ) -> Result<Arc<BmcEndpoint>, HealthError> {
-        let bmc = {
+        let cached = {
             let mut cache = self.bmc_client_cache.lock().expect("cache mutex poisoned");
             cache_or_create_bmc_client(&mut cache, addr.mac, credential_kind, |kind| {
                 let provider: Arc<dyn CredentialProvider> = Arc::new(ApiCredentialProvider {
@@ -554,11 +607,16 @@ impl ApiEndpointSource {
                 )?))
             })?
         };
+        let mut metadata = metadata;
+        if let Some(EndpointMetadata::Machine(machine)) = metadata.as_mut() {
+            machine.system_uuid = cached.system_uuid;
+        }
         Ok(Arc::new(BmcEndpoint {
             addr,
             metadata,
             rack_id,
-            bmc,
+            labels: Default::default(),
+            bmc: cached.client,
         }))
     }
 }
@@ -568,7 +626,7 @@ fn cache_or_create_bmc_client(
     mac: MacAddress,
     credential_kind: ApiCredentialKind,
     make_client: impl FnOnce(ApiCredentialKind) -> Result<Arc<BmcClient>, HealthError>,
-) -> Result<Arc<BmcClient>, HealthError> {
+) -> Result<CachedBmcClient, HealthError> {
     if let Some(existing) = cache.get(&mac) {
         if existing.kind != credential_kind {
             return Err(HealthError::GenericError(format!(
@@ -579,18 +637,17 @@ fn cache_or_create_bmc_client(
                 credential_kind.tag(),
             )));
         }
-        return Ok(existing.client.clone());
+        return Ok(existing.clone());
     }
 
     let client = make_client(credential_kind.clone())?;
-    cache.insert(
-        mac,
-        CachedBmcClient {
-            client: client.clone(),
-            kind: credential_kind,
-        },
-    );
-    Ok(client)
+    let cached = CachedBmcClient {
+        client,
+        kind: credential_kind,
+        system_uuid: SharedSystemUuid::default(),
+    };
+    cache.insert(mac, cached.clone());
+    Ok(cached)
 }
 
 /// Returns the machine-level GPU driver version derived from discovery data.
@@ -790,8 +847,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cache_returns_existing_client_on_matching_kind() {
+    #[tokio::test]
+    async fn cache_returns_existing_client_on_matching_kind() {
         let mut cache: HashMap<MacAddress, CachedBmcClient> = HashMap::new();
         let factory_calls = AtomicUsize::new(0);
 
@@ -810,9 +867,20 @@ mod tests {
             .expect("cache hit");
 
         assert!(
-            Arc::ptr_eq(&first, &second),
+            Arc::ptr_eq(&first.client, &second.client),
             "cache hit must reuse the same BmcClient Arc — otherwise every \
              iteration of discovery rebuilds the session and re-fetches creds"
+        );
+        let system_uuid = uuid::uuid!("4c4c4544-0044-4710-8052-cac04f4b4632");
+        first
+            .system_uuid
+            .get_or_try_init(|| async { Ok::<_, std::convert::Infallible>(Some(system_uuid)) })
+            .await
+            .expect("infallible UUID initialization");
+        assert_eq!(
+            second.system_uuid.get(),
+            Some(system_uuid),
+            "cache hit must reuse machine UUID state across discovery iterations"
         );
         assert_eq!(
             factory_calls.load(Ordering::SeqCst),

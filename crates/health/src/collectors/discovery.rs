@@ -106,7 +106,12 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             Ok(value) => Some(value),
             Err(error) => {
                 fetch_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(?error, context, bmc_addr = ?self.endpoint.addr, "Discovery fetch failed");
+                tracing::warn!(
+                    ?error,
+                    context,
+                    bmc_address = ?self.endpoint.addr,
+                    "Discovery fetch failed"
+                );
                 None
             }
         }
@@ -168,19 +173,22 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
         let discovered: Vec<_> = stream::iter(processors)
             .map(|processor| async move {
                 let processor = Arc::new(processor);
-                let env = processor
-                    .environment_sensor_links()
-                    .await
-                    .unwrap_or_default();
-                let metric = processor.metrics_sensor_links().await.unwrap_or_default();
-                let sensors: Vec<_> = env.into_iter().chain(metric).collect();
-                (processor, sensors)
+                let env = processor.environment_sensor_links().await;
+                let metric = processor.metrics_sensor_links().await;
+                (processor, env, metric)
             })
             .buffer_unordered(self.discovery_concurrency)
             .collect()
             .await;
 
-        for (entity, sensors) in discovered {
+        for (entity, env, metric) in discovered {
+            let env = self
+                .record_failure(env, "get processor environment sensors", fetch_failures)
+                .unwrap_or_default();
+            let metric = self
+                .record_failure(metric, "get processor metric sensors", fetch_failures)
+                .unwrap_or_default();
+            let sensors: Vec<_> = env.into_iter().chain(metric).collect();
             for sensor in &sensors {
                 sensor_ids.insert(sensor.odata_id().to_string());
             }
@@ -211,7 +219,7 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
         let discovered: Vec<_> = stream::iter(memory_modules)
             .map(|memory| async move {
                 let memory = Arc::new(memory);
-                let sensors = memory.environment_sensor_links().await.unwrap_or_default();
+                let sensors = memory.environment_sensor_links().await;
                 (memory, sensors)
             })
             .buffer_unordered(self.discovery_concurrency)
@@ -219,6 +227,9 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             .await;
 
         for (entity, sensors) in discovered {
+            let sensors = self
+                .record_failure(sensors, "get memory environment sensors", fetch_failures)
+                .unwrap_or_default();
             for sensor in &sensors {
                 sensor_ids.insert(sensor.odata_id().to_string());
             }
@@ -256,7 +267,7 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             let discovered: Vec<_> = stream::iter(drives)
                 .map(|drive| async move {
                     let drive = Arc::new(drive);
-                    let sensors = drive.environment_sensor_links().await.unwrap_or_default();
+                    let sensors = drive.environment_sensor_links().await;
                     (drive, sensors)
                 })
                 .buffer_unordered(self.discovery_concurrency)
@@ -264,6 +275,9 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
                 .await;
 
             for (entity, sensors) in discovered {
+                let sensors = self
+                    .record_failure(sensors, "get drive environment sensors", fetch_failures)
+                    .unwrap_or_default();
                 for sensor in &sensors {
                     sensor_ids.insert(sensor.odata_id().to_string());
                 }
@@ -295,7 +309,7 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
         let discovered: Vec<_> = stream::iter(power_supplies)
             .map(|ps| async move {
                 let ps = Arc::new(ps);
-                let sensors = ps.metrics_sensor_links().await.unwrap_or_default();
+                let sensors = ps.metrics_sensor_links().await;
                 (ps, sensors)
             })
             .buffer_unordered(self.discovery_concurrency)
@@ -303,6 +317,9 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             .await;
 
         for (entity, sensors) in discovered {
+            let sensors = self
+                .record_failure(sensors, "get power supply metric sensors", fetch_failures)
+                .unwrap_or_default();
             for sensor in &sensors {
                 sensor_ids.insert(sensor.odata_id().to_string());
             }
@@ -326,7 +343,11 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             Ok(None) => Vec::new(),
             Err(error) => {
                 fetch_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(?error, bmc_addr = ?self.endpoint.addr, "Failed to get chassis sensors");
+                tracing::warn!(
+                    ?error,
+                    bmc_address = ?self.endpoint.addr,
+                    "Failed to get chassis sensors"
+                );
                 Vec::new()
             }
         };

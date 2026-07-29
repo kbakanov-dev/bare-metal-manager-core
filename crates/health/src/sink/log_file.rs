@@ -99,6 +99,8 @@ struct JsonLogRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    system_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     machine_serial: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     driver_version: Option<&'a str>,
@@ -106,6 +108,8 @@ struct JsonLogRecord<'a> {
     component_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nvlink_domain_uuid: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    labels: &'a std::collections::BTreeMap<String, String>,
     severity: &'a str,
     body: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -119,10 +123,12 @@ impl<'a> JsonLogRecord<'a> {
             endpoint: context.endpoint_key(),
             collector: context.collector_type,
             machine_id: context.machine_id().map(|id| id.to_string()),
+            system_uuid: context.system_uuid().map(|id| id.to_string()),
             machine_serial: context.machine_serial(),
             driver_version: context.driver_version(),
             component_type: context.component_type(),
             nvlink_domain_uuid: context.nvlink_domain_uuid().map(|id| id.to_string()),
+            labels: context.labels(),
             severity: &record.severity,
             body: &record.body,
             attributes: record
@@ -205,17 +211,25 @@ impl SyncLogFileWriter {
             return Ok(());
         }
 
-        tracing::info!(size = self.current_size, "rotating log file");
+        tracing::info!(file_size_bytes = self.current_size, "rotating log file");
 
-        // flush and drop the current file handle before renaming
-        if let Some(mut file) = self.current_file.take() {
-            let _ = file.flush();
+        // Flush and drop the current handle before renaming. If the flush fails
+        // we would rename a file still missing its buffered bytes, so keep the
+        // writer and defer rotation to the next write instead of losing them.
+        if let Some(mut file) = self.current_file.take()
+            && let Err(e) = file.flush()
+        {
+            tracing::warn!(error = %e, "failed to flush log file; deferring rotation");
+            self.current_file = Some(file);
+            return Ok(());
         }
 
         let current_path = self.log_path();
 
         if self.max_backups == 0 {
-            let _ = fs::remove_file(&current_path);
+            if let Err(e) = fs::remove_file(&current_path) {
+                tracing::warn!(error = %e, path = %current_path.display(), "failed to remove current log file during rotation");
+            }
         } else {
             self.shift_backups(&current_path);
         }
@@ -229,19 +243,31 @@ impl SyncLogFileWriter {
         for i in (1..self.max_backups).rev() {
             let from = self.rotated_path(i);
             let to = self.rotated_path(i + 1);
-            if from.exists() {
-                let _ = fs::rename(&from, &to);
+            match fs::rename(&from, &to) {
+                Ok(()) => {}
+                // No backup at this index yet -- nothing to shift.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, from = %from.display(), to = %to.display(), "failed to shift rotated log file");
+                }
             }
         }
 
         // current -> .1
         let backup = self.rotated_path(1);
-        let _ = fs::rename(current_path, &backup);
+        if let Err(e) = fs::rename(current_path, &backup) {
+            tracing::warn!(error = %e, from = %current_path.display(), to = %backup.display(), "failed to rotate current log file to backup");
+        }
 
         // prune the oldest backup beyond the limit
         let oldest = self.rotated_path(self.max_backups + 1);
-        if oldest.exists() {
-            let _ = fs::remove_file(&oldest);
+        match fs::remove_file(&oldest) {
+            Ok(()) => {}
+            // Nothing beyond the limit to prune.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, path = %oldest.display(), "failed to prune oldest rotated log file");
+            }
         }
     }
 }
@@ -270,17 +296,25 @@ mod tests {
             collector_type: "test",
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         }
     }
 
     /// Builds a log context with representative machine metadata.
     fn machine_context() -> EventContext {
         EventContext {
+            labels: std::collections::BTreeMap::from([(
+                "site".to_string(),
+                "rno-dev7".to_string(),
+            )]),
             metadata: Some(EndpointMetadata::Machine(MachineData {
-                machine_id: "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
-                    .parse()
-                    .expect("valid machine id"),
+                machine_id: Some(
+                    "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                        .parse()
+                        .expect("valid machine id"),
+                ),
                 machine_serial: Some("MN-001".to_string()),
+                system_uuid: Some(uuid::uuid!("4c4c4544-0044-4710-8052-cac04f4b4632")).into(),
                 slot_number: None,
                 tray_index: None,
                 nvlink_domain_uuid: Some(NvLinkDomainId::nil()),
@@ -463,9 +497,14 @@ mod tests {
             parsed["machine_id"],
             "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
         );
+        assert_eq!(
+            parsed["system_uuid"],
+            "4c4c4544-0044-4710-8052-cac04f4b4632"
+        );
         assert_eq!(parsed["machine_serial"], "MN-001");
         assert_eq!(parsed["driver_version"], "570.82");
         assert_eq!(parsed["component_type"], "compute_node");
+        assert_eq!(parsed["labels"]["site"], "rno-dev7");
         assert_eq!(
             parsed["nvlink_domain_uuid"],
             "00000000-0000-0000-0000-000000000000"

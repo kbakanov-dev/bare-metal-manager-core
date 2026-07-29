@@ -74,6 +74,8 @@ impl InternalRBACRules {
         x.perm("DeleteVpc", vec![Machineatron, SiteAgent]);
         x.perm("FindVpcIds", vec![SiteAgent, ForgeAdminCLI, Machineatron]);
         x.perm("FindVpcsByIds", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("FindSitePrefixIds", vec![ForgeAdminCLI, SiteAgent]);
+        x.perm("FindSitePrefixesByIds", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("CreateVpcPrefix", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("SearchVpcPrefixes", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("GetVpcPrefixes", vec![ForgeAdminCLI, SiteAgent]);
@@ -271,14 +273,17 @@ impl InternalRBACRules {
             vec![ForgeAdminCLI, Machineatron],
         );
         x.perm("GetSiteExplorerLastRun", vec![ForgeAdminCLI, Machineatron]);
-        x.perm("ClearSiteExplorationError", vec![ForgeAdminCLI]);
+        x.perm("ClearSiteExplorationError", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("IsBmcInManagedHost", vec![ForgeAdminCLI]);
         x.perm("Explore", vec![ForgeAdminCLI, Flow]);
-        x.perm("ReExploreEndpoint", vec![ForgeAdminCLI, Flow]);
+        x.perm("ReExploreEndpoint", vec![ForgeAdminCLI, Flow, SiteAgent]);
         x.perm("RefreshEndpointReport", vec![ForgeAdminCLI, Flow]);
         x.perm("DeleteExploredEndpoint", vec![ForgeAdminCLI]);
         x.perm("PauseExploredEndpointRemediation", vec![ForgeAdminCLI]);
-        x.perm("FindExploredEndpointIds", vec![ForgeAdminCLI, Flow]);
+        x.perm(
+            "FindExploredEndpointIds",
+            vec![ForgeAdminCLI, Flow, SiteAgent],
+        );
         x.perm("FindExploredEndpointsByIds", vec![ForgeAdminCLI, Flow]);
         x.perm("FindExploredManagedHostIds", vec![ForgeAdminCLI, Flow]);
         x.perm("FindExploredManagedHostsByIds", vec![ForgeAdminCLI, Flow]);
@@ -322,7 +327,10 @@ impl InternalRBACRules {
         x.perm("UpdateInstancePhoneHomeLastContact", vec![Agent]);
         x.perm("SetHostUefiPassword", vec![ForgeAdminCLI]);
         x.perm("ClearHostUefiPassword", vec![ForgeAdminCLI]);
-        x.perm("AddExpectedMachine", vec![ForgeAdminCLI, SiteAgent, Flow]);
+        x.perm(
+            "AddExpectedMachine",
+            vec![ForgeAdminCLI, SiteAgent, Flow, Machineatron],
+        );
         x.perm("DeleteExpectedMachine", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("UpdateExpectedMachine", vec![ForgeAdminCLI, SiteAgent]);
         x.perm("CreateExpectedMachines", vec![ForgeAdminCLI, SiteAgent]);
@@ -485,6 +493,8 @@ impl InternalRBACRules {
             "GetMachineValidationExternalConfig",
             vec![ForgeAdminCLI, Scout],
         );
+        x.perm("GetContainerRegistryCredential", vec![ForgeAdminCLI, Scout]);
+        x.perm("SetContainerRegistryCredential", vec![ForgeAdminCLI]);
         x.perm(
             "AddUpdateMachineValidationExternalConfig",
             vec![ForgeAdminCLI, SiteAgent],
@@ -608,7 +618,10 @@ impl InternalRBACRules {
         x.perm("VerifySkuForMachine", vec![ForgeAdminCLI]);
         x.perm("RemoveSkuAssociation", vec![ForgeAdminCLI]);
         x.perm("GetAllSkuIds", vec![ForgeAdminCLI, SiteAgent, Flow]);
-        x.perm("FindSkusByIds", vec![ForgeAdminCLI, SiteAgent, Flow]);
+        x.perm(
+            "FindSkusByIds",
+            vec![ForgeAdminCLI, Health, SiteAgent, Flow],
+        );
         x.perm("DeleteSku", vec![ForgeAdminCLI]);
         x.perm("UpdateSkuMetadata", vec![ForgeAdminCLI]);
         x.perm("UpdateMachineHardwareInfo", vec![ForgeAdminCLI]);
@@ -1134,6 +1147,22 @@ mod rbac_rule_tests {
             "GetAllExpectedSwitchesLinked",
             "GetAllExpectedPowerShelves",
             "GetAllExpectedPowerShelvesLinked",
+        ] {
+            assert!(
+                InternalRBACRules::allowed_from_static(
+                    method,
+                    &[Principal::SpiffeServiceIdentifier(
+                        "elektra-site-agent".to_string()
+                    )]
+                ),
+                "{method} should allow SiteAgent"
+            );
+        }
+
+        for method in [
+            "ClearSiteExplorationError",
+            "ReExploreEndpoint",
+            "FindExploredEndpointIds",
         ] {
             assert!(
                 InternalRBACRules::allowed_from_static(

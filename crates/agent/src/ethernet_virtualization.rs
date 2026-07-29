@@ -92,15 +92,15 @@ impl InterfaceState {
             // Execute command only if interface state is changed.
             let mut cmd = needed_state.command();
             tracing::info!(
-                "Updating interface state from {:?} to {:?} with command: {:?}",
-                current_state,
-                needed_state,
-                cmd
+                current_interface_state = ?current_state,
+                target_interface_state = ?needed_state,
+                command = ?cmd,
+                "Updating interface state"
             );
             let result = cmd.output().await?;
             if !result.status.success() {
                 return Err(eyre::eyre!(
-                    "Failed to update interface state: {}",
+                    "failed to update interface state: {}",
                     result.status
                 ));
             }
@@ -109,8 +109,8 @@ impl InterfaceState {
             let new_state = get_interface_state(InterfaceState::HOST_INTERFACE_NAME).await?;
             if &new_state != needed_state {
                 return Err(eyre::eyre!(
-                    r#"State is not updated after command execution. Will try in next iteration. 
-                Needed {needed_state:?}, After updating {new_state:?}, Interface: {}"#,
+                    r#"state is not updated after command execution. will try in next iteration. 
+                needed {needed_state:?}, after updating {new_state:?}, interface: {}"#,
                     InterfaceState::HOST_INTERFACE_NAME
                 ));
             }
@@ -308,6 +308,31 @@ impl From<&rpc::FlatInterfaceRoutingProfile> for nvue::InterfaceRoutingProfile {
     }
 }
 
+/// `parse_managed_host_loopback_ips` types the string-valued RPC fields before
+/// NVUE rendering. In particular, parsing `loopback_ip_v6` as `Ipv6Addr` keeps
+/// an IPv4 value from slipping through just because protobuf stores it as a
+/// string.
+fn parse_managed_host_loopback_ips(
+    config: &rpc::ManagedHostNetworkConfig,
+) -> eyre::Result<(IpAddr, Option<Ipv6Addr>)> {
+    if config.loopback_ip.is_empty() {
+        return Err(eyre::eyre!("missing loopback IP"));
+    }
+
+    let loopback_ip = config
+        .loopback_ip
+        .parse()
+        .wrap_err_with(|| format!("invalid primary loopback IP: {}", config.loopback_ip))?;
+    let loopback_ip_v6 = config
+        .loopback_ip_v6
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .wrap_err("invalid IPv6 loopback IP")?;
+
+    Ok((loopback_ip, loopback_ip_v6))
+}
+
 /// Update the NVUE network config. Returns Ok(true) if the configuration changed, and
 /// Ok(false) if not.
 pub async fn update_nvue(
@@ -322,28 +347,21 @@ pub async fn update_nvue(
             .nvue_client
             .system_build_info()
             .await
-            .map_err(|e| eyre::eyre!("Couldn't get HBN version from NVUE: {e}"))
+            .map_err(|e| eyre::eyre!("couldn't get HBN version from NVUE: {e}"))
             .and_then(|build_value| hbn::parse_nvue_build_as_hbn_version(&build_value))?,
     };
 
-    let l_ip_str = match &nc.managed_host_config {
-        None => {
-            return Err(eyre::eyre!("Missing managed_host_config in response"));
-        }
-        Some(cfg) => {
-            if cfg.loopback_ip.is_empty() {
-                return Err(eyre::eyre!("Missing loopback IP"));
-            }
-            &cfg.loopback_ip
-        }
-    };
-    let loopback_ip = l_ip_str.parse().wrap_err_with(|| l_ip_str.clone())?;
+    let managed_host_config = nc
+        .managed_host_config
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("missing managed_host_config in response"))?;
+    let (loopback_ip, loopback_ip_v6) = parse_managed_host_loopback_ips(managed_host_config)?;
 
     let access_vlans = if nc.use_admin_network {
         let admin_interface = nc
             .admin_interface
             .as_ref()
-            .ok_or_else(|| eyre::eyre!("Missing admin_interface"))?;
+            .ok_or_else(|| eyre::eyre!("missing admin_interface"))?;
         vec![nvue::VlanConfig {
             vlan_id: admin_interface.vlan_id,
             network: admin_interface.interface_prefix.clone(),
@@ -386,7 +404,7 @@ pub async fn update_nvue(
             let admin_interface = nc
                 .admin_interface
                 .as_ref()
-                .ok_or_else(|| eyre::eyre!("Missing admin_interface"))?;
+                .ok_or_else(|| eyre::eyre!("missing admin_interface"))?;
             vec![nvue::PortConfig {
                 interface_name: physical_name,
                 is_phy: true,
@@ -456,7 +474,7 @@ pub async fn update_nvue(
                 match net.virtual_function_id {
                     Some(id) => hbn_device_names.build_virt(id),
                     None => {
-                        eyre::bail!("Missing virtual function id");
+                        eyre::bail!("missing virtual function id");
                     }
                 }
             };
@@ -588,6 +606,7 @@ pub async fn update_nvue(
         use_admin_network: nc.use_admin_network,
         tenancy_enabled,
         loopback_ip,
+        loopback_ip_v6,
         vf_intercept_bridge_port_name: nc.traffic_intercept_config.as_ref().and_then(|vc| {
             vc.bridging
                 .as_ref()
@@ -684,7 +703,11 @@ pub async fn update_nvue(
                     if !skip_post {
                         let cmd = acl_rules::RELOAD_CMD;
                         if let Err(err) = hbn::run_in_container_shell(cmd).await {
-                            tracing::error!("running nvue extra acl post '{}': {err:#}", cmd);
+                            tracing::error!(
+                                command = %cmd,
+                                error = format!("{err:#}"),
+                                "running nvue extra acl post"
+                            );
                         }
                         path_acl.del("BAK");
                     }
@@ -692,7 +715,7 @@ pub async fn update_nvue(
                 // ACLs didn't need changing, should be always this except on first boot
                 Ok(false) => {}
                 // Log the error but continue so that we get network working
-                Err(err) => tracing::error!("write nvue extra ACL: {err:#}"),
+                Err(err) => tracing::error!(error = format!("{err:#}"), "write nvue extra ACL"),
             }
 
             // nvue can save a copy of the config here. If that exists nvue uses it on boot.
@@ -702,8 +725,9 @@ pub async fn update_nvue(
                 && let Err(err) = fs::remove_file(&saved_config)
             {
                 tracing::warn!(
-                    "Failed removing old startup.yaml at {}: {err:#}",
-                    saved_config.display()
+                    saved_config_path = %saved_config.display(),
+                    error = format!("{err:#}"),
+                    "Failed removing old startup.yaml"
                 );
             }
 
@@ -738,11 +762,11 @@ pub async fn update_nvue(
         NvueUpdateFlavor::RestApi { nvue_context } => {
             let config = NvueConfigWithHeader::from_yaml(&next_contents)
                 .map(|config_with_header| config_with_header.into_nvue_config())
-                .map_err(|e| eyre::eyre!("Couldn't parse NVUE config as YAML: {e}"))?;
+                .map_err(|e| eyre::eyre!("couldn't parse NVUE config as YAML: {e}"))?;
             let revision_id = nvue_context
                 .update_config(&config)
                 .await
-                .map_err(|e| eyre::eyre!("Couldn't push new config to NVUE server: {e}"))?;
+                .map_err(|e| eyre::eyre!("couldn't push new config to NVUE server: {e}"))?;
             if let Some(revision_id) = revision_id {
                 tracing::debug!(revision_id, "Applied NVUE config via REST API");
                 Ok(true)
@@ -827,7 +851,13 @@ pub async fn update_traffic_intercept_bridging(
             };
 
             interface_to_bridge.get(&name).map(|bridging| {
-                tracing::debug!("update_traffic_intercept_bridging representor={name} bridge={} vni={} gateway={}", bridging.bridge, i.vni, i.gateway);
+                tracing::debug!(
+                    representor = %name,
+                    bridge = %bridging.bridge,
+                    vni = i.vni,
+                    gateway = %i.gateway,
+                    "Created traffic-intercept bridge mapping"
+                );
                 traffic_intercept_bridging::TrafficInterceptBridgeMapping {
                     bridge: bridging.bridge.clone(),
                     patch_port: bridging.patch_port.clone(),
@@ -1015,7 +1045,7 @@ async fn get_interface_state(interface_name: &str) -> eyre::Result<InterfaceStat
 
     if !output.status.success() {
         return Err(eyre::eyre!(
-            "Failed to get interface state: {}",
+            "failed to get interface state: {}",
             output.status
         ));
     }
@@ -1077,7 +1107,7 @@ async fn update_dhcp_via_grpc(
     interface_translation_mode: Option<&InterfaceTranslationMode>,
 ) -> eyre::Result<bool> {
     let Some(mh_nc) = &network_config.managed_host_config else {
-        eyre::bail!("Loopback IP is missing. Can't write dhcp-server config.");
+        eyre::bail!("loopback IP is missing. can't write dhcp-server config");
     };
     let loopback_ip: Ipv4Addr = mh_nc.loopback_ip.parse()?;
 
@@ -1297,7 +1327,11 @@ pub async fn interfaces(
                     Some(vlan_fdb) => match tenant_vf_mac(vlan_fdb).await {
                         Ok(mac) => Some(mac.to_string()),
                         Err(err) => {
-                            tracing::error!(%err, vlan_id=iface.vlan_id, "Error fetching tenant VF MAC");
+                            tracing::error!(
+                                error = %err,
+                                vlan_id = iface.vlan_id,
+                                "Error fetching tenant VF MAC"
+                            );
                             None
                         }
                     },
@@ -1403,7 +1437,7 @@ pub async fn reset(hbn_root: &Path, skip_post: bool) {
 
     let err_message = errs.join(", ");
     if !err_message.is_empty() {
-        tracing::error!(err_message);
+        tracing::error!(error = %err_message, "Failed to reset network configuration");
     }
 }
 
@@ -1428,7 +1462,11 @@ fn write_dhcp_v4_server_config(
             dhcp_relay_path.del("BAK");
         }
         Ok(false) => {}
-        Err(err) => tracing::warn!("Write blank DHCP relay {dhcp_relay_path}: {err:#}"),
+        Err(err) => tracing::warn!(
+            %dhcp_relay_path,
+            error = format!("{err:#}"),
+            "Write blank DHCP relay"
+        ),
     }
 
     let interfaces = if nc.use_admin_network {
@@ -1436,7 +1474,7 @@ fn write_dhcp_v4_server_config(
             .admin_interface
             .as_ref()
             .map(|x| format!("vlan{}", x.vlan_id))
-            .ok_or_else(|| eyre::eyre!("Admin interface missing on admin network."))?;
+            .ok_or_else(|| eyre::eyre!("admin interface missing on admin network"))?;
         vec![vlan_intf]
     } else {
         let mut interfaces = Vec::with_capacity(nc.tenant_interfaces.len());
@@ -1474,7 +1512,7 @@ fn write_dhcp_v4_server_config(
 
     let Some(mh_nc) = &nc.managed_host_config else {
         return Err(eyre::eyre!(
-            "Loopback IP is missing. Can't write dhcp-server config."
+            "loopback IP is missing. can't write dhcp-server config"
         ));
     };
 
@@ -1515,7 +1553,11 @@ fn write_dhcp_v4_server_config(
             dhcp_server_path.server.del("BAK");
         }
         Ok(false) => {}
-        Err(err) => tracing::error!("Write DHCP server {}: {err:#}", dhcp_server_path.server),
+        Err(err) => tracing::error!(
+            dhcp_server_path = %dhcp_server_path.server,
+            error = format!("{err:#}"),
+            "Write DHCP server"
+        ),
     }
 
     let next_contents = dhcp::build_server_config(
@@ -1537,8 +1579,9 @@ fn write_dhcp_v4_server_config(
         }
         Ok(false) => {}
         Err(err) => tracing::error!(
-            "Write DHCP server config {}: {err:#}",
-            dhcp_server_path.config
+            dhcp_server_config_path = %dhcp_server_path.config,
+            error = format!("{err:#}"),
+            "Write DHCP server config"
         ),
     }
 
@@ -1555,8 +1598,9 @@ fn write_dhcp_v4_server_config(
         }
         Ok(false) => {}
         Err(err) => tracing::error!(
-            "Write DHCP server host config {}: {err:#}",
-            dhcp_server_path.host_config
+            dhcp_server_host_config_path = %dhcp_server_path.host_config,
+            error = format!("{err:#}"),
+            "Write DHCP server host config"
         ),
     }
 
@@ -1599,7 +1643,7 @@ fn write(
     if !has_changed {
         return Ok(false);
     }
-    tracing::debug!("Applying new {file_type} config");
+    tracing::debug!(%file_type, "Applying new config");
 
     let path_bak = path.backup();
     if path.0.exists() {
@@ -1706,11 +1750,11 @@ fn parse_fdb(fdb_json: &str) -> eyre::Result<HashMap<u32, Vec<Fdb>>> {
 async fn tenant_vf_mac(vlan_fdb: &[Fdb]) -> eyre::Result<&str> {
     // We're expecting only the host side and our side
     if vlan_fdb.len() != 2 {
-        eyre::bail!("Expected two fdb entries, got {vlan_fdb:?}");
+        eyre::bail!("expected two fdb entries, got {vlan_fdb:?}");
     }
     if vlan_fdb[0].ifname != vlan_fdb[1].ifname {
         eyre::bail!(
-            "Both entries must have the same ifname, got '{}' and '{}'",
+            "both entries must have the same ifname, got '{}' and '{}'",
             vlan_fdb[0].ifname,
             vlan_fdb[1].ifname
         );
@@ -1730,9 +1774,9 @@ async fn tenant_vf_mac(vlan_fdb: &[Fdb]) -> eyre::Result<&str> {
 
     if !ip_out.status.success() {
         tracing::debug!(
-            "STDERR {}: {}",
-            super::pretty_cmd(cmd.as_std()),
-            String::from_utf8_lossy(&ip_out.stderr)
+            command = %super::pretty_cmd(cmd.as_std()),
+            stderr = %String::from_utf8_lossy(&ip_out.stderr),
+            "STDERR"
         );
         return Err(eyre::eyre!(
             "{} for cmd '{}'",
@@ -1744,7 +1788,7 @@ async fn tenant_vf_mac(vlan_fdb: &[Fdb]) -> eyre::Result<&str> {
     let ip_json = String::from_utf8_lossy(&ip_out.stdout).to_string();
     let ip_show: Vec<IpShow> = serde_json::from_str(&ip_json)?;
     if ip_show.len() != 1 {
-        eyre::bail!("Getting local side MAC should return 1 entry, got {ip_show:?}");
+        eyre::bail!("getting local side MAC should return 1 entry, got {ip_show:?}");
     }
 
     // Ignore our side
@@ -1754,7 +1798,7 @@ async fn tenant_vf_mac(vlan_fdb: &[Fdb]) -> eyre::Result<&str> {
         .collect();
 
     if remote_side.len() != 1 {
-        eyre::bail!("After all removals there should be 1 entry, got {remote_side:?}");
+        eyre::bail!("after all removals there should be 1 entry, got {remote_side:?}");
     }
     Ok(&remote_side[0].mac)
 }
@@ -1792,7 +1836,7 @@ fn hostname() -> eyre::Result<Hostname> {
         .split('.')
         .next()
         .map(|s| s.to_owned())
-        .ok_or(eyre::eyre!("Empty hostname?"))?;
+        .ok_or(eyre::eyre!("empty hostname?"))?;
     let search_domain = fqdn.split('.').skip(1).collect::<Vec<&str>>().join(".");
     Ok(Hostname {
         hostname,
@@ -1843,7 +1887,11 @@ impl FPath {
             match fs::remove_file(&p) {
                 Ok(_) => true,
                 Err(err) => {
-                    tracing::warn!("Failed removing {}: {err}.", p.display());
+                    tracing::warn!(
+                        file_path = %p.display(),
+                        error = %err,
+                        "Failed to remove file"
+                    );
                     false
                 }
             }
@@ -1896,10 +1944,14 @@ fn cleanup_old_acls(hbn_root: &Path) {
         if p.exists() {
             match fs::remove_file(p) {
                 Ok(_) => {
-                    tracing::info!("Cleaned up old ACL file {}", p.display());
+                    tracing::info!(acl_file_path = %p.display(), "Cleaned up old ACL file");
                 }
                 Err(err) => {
-                    tracing::warn!("Failed removing old ACL file {}: {err}.", p.display());
+                    tracing::warn!(
+                        acl_file_path = %p.display(),
+                        error = %err,
+                        "Failed removing old ACL file."
+                    );
                 }
             }
         }
@@ -1937,6 +1989,7 @@ mod tests {
     use ::rpc::{common as rpc_common, forge as rpc};
     use carbide_network::virtualization::{VpcVirtualizationType, get_svi_ip};
     use carbide_rpc_utils::dhcp::{DhcpConfig, HostConfig};
+    use carbide_utils::none_if_empty::NoneIfEmpty;
     use eyre::WrapErr;
     use ipnetwork::IpNetwork;
 
@@ -1948,6 +2001,58 @@ mod tests {
     #[ctor::ctor(unsafe)]
     fn setup() {
         carbide_host_support::init_logging("nico-dpu-agent").unwrap();
+    }
+
+    #[test]
+    fn test_parse_managed_host_loopback_ips() {
+        use carbide_test_support::Outcome::*;
+        use carbide_test_support::scenarios;
+
+        scenarios!(run = |config: rpc::ManagedHostNetworkConfig| {
+            parse_managed_host_loopback_ips(&config).map_err(drop)
+        };
+            "valid wire values" {
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: "10.0.0.1".to_string(),
+                    loopback_ip_v6: None,
+                    quarantine_state: None,
+                } => Yields(("10.0.0.1".parse().unwrap(), None)),
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: "10.0.0.1".to_string(),
+                    loopback_ip_v6: Some("2001:db8::1".to_string()),
+                    quarantine_state: None,
+                } => Yields((
+                    "10.0.0.1".parse().unwrap(),
+                    Some("2001:db8::1".parse().unwrap()),
+                )),
+            }
+
+            "invalid IPv6 wire value" {
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: "10.0.0.1".to_string(),
+                    loopback_ip_v6: Some("not-an-ipv6-address".to_string()),
+                    quarantine_state: None,
+                } => Fails,
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: "10.0.0.1".to_string(),
+                    loopback_ip_v6: Some("192.0.2.1".to_string()),
+                    quarantine_state: None,
+                } => Fails,
+            }
+
+            "invalid primary loopback" {
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: String::new(),
+                    loopback_ip_v6: None,
+                    quarantine_state: None,
+                } => Fails,
+                rpc::ManagedHostNetworkConfig {
+                    loopback_ip: "not-an-ip-address".to_string(),
+                    loopback_ip_v6: None,
+                    quarantine_state: None,
+                } => Fails,
+            }
+        );
     }
 
     #[test]
@@ -2017,6 +2122,12 @@ mod tests {
 
         // Test without an NSG to make sure there are no changes for pre-FNN users
         // if they don't opt-in to a network security group.
+        //
+        // The `true` is `second_interface_l2`, which makes this the bridge case as well --
+        // `nvue_startup.yaml.expected` already carries the `bridge:` blocks. Extend this
+        // test rather than adding a separate bridge one; the last attempt at that passed
+        // these exact arguments against a byte-identical copy of the golden, so a bridge
+        // regression needed both files updated before anything would fail.
         let network_config = netconf(virtualization_type, 32, 24, false, None, true, false);
 
         let td = tempfile::tempdir()?;
@@ -2046,45 +2157,6 @@ mod tests {
 
         // check startup.yaml
         let expected = include_str!("../templates/tests/nvue_startup.yaml.expected");
-        compare_diffed(hbn_root.join(nvue::PATH), expected)?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_with_tenant_nvue_with_bridge() -> Result<(), Box<dyn std::error::Error>> {
-        let virtualization_type = VpcVirtualizationType::EthernetVirtualizer;
-
-        // Both interfaces are L2 segments, so IncludeBridge is true and the bridge block is emitted.
-        let network_config = netconf(virtualization_type, 32, 24, false, None, true, false);
-
-        let td = tempfile::tempdir()?;
-        let hbn_root = td.path();
-        fs::create_dir_all(hbn_root.join("var/support"))?;
-        fs::create_dir_all(hbn_root.join("etc/cumulus/acl/policy.d"))?;
-        let update_flavor = NvueUpdateFlavor::StartupFile {
-            hbn_root,
-            skip_post: true,
-        };
-
-        let has_changes = super::update_nvue(
-            virtualization_type,
-            update_flavor,
-            &network_config,
-            HBNDeviceNames::hbn_23(),
-        )
-        .await?;
-        assert!(
-            has_changes,
-            "update_nvue should have written the file, there should be changes"
-        );
-
-        // check ACLs
-        let expected = include_str!("../templates/tests/70-forge_nvue.rules.expected");
-        compare_diffed(hbn_root.join(nvue::PATH_ACL), expected)?;
-
-        // check startup.yaml (includes bridge block)
-        let expected = include_str!("../templates/tests/nvue_startup_with_bridge.yaml.expected");
         compare_diffed(hbn_root.join(nvue::PATH), expected)?;
 
         Ok(())
@@ -2432,7 +2504,7 @@ mod tests {
                 let mut f = fs::File::create(ERR_FILE).unwrap();
                 f.write_all(startup_yaml.as_bytes()).unwrap();
             })
-            .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+            .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
 
         Ok(())
     }
@@ -2489,7 +2561,7 @@ mod tests {
                 let mut f = fs::File::create(ERR_FILE).unwrap();
                 f.write_all(startup_yaml.as_bytes()).unwrap();
             })
-            .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+            .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
 
         Ok(())
     }
@@ -2555,7 +2627,7 @@ mod tests {
                 let mut f = fs::File::create(ERR_FILE).unwrap();
                 f.write_all(startup_yaml.as_bytes()).unwrap();
             })
-            .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+            .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
 
         Ok(())
     }
@@ -2608,7 +2680,7 @@ mod tests {
                 let mut f = fs::File::create(ERR_FILE).unwrap();
                 f.write_all(startup_yaml.as_bytes()).unwrap();
             })
-            .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+            .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
 
         Ok(())
     }
@@ -2949,6 +3021,7 @@ mod tests {
 
         let netconf = rpc::ManagedHostNetworkConfig {
             loopback_ip: "10.217.5.39".to_string(),
+            loopback_ip_v6: None,
             quarantine_state: None,
         };
         rpc::ManagedHostNetworkConfigResponse {
@@ -3106,7 +3179,7 @@ mod tests {
         // check dhcp server
         let dhcp_path = hbn_root.join("etc/supervisor/conf.d/default-forge-dhcp-server.conf");
         let dhcp_contents =
-            super::read_limited(&dhcp_path).wrap_err(format!("Failed reading {dhcp_path:?}"))?;
+            super::read_limited(&dhcp_path).wrap_err(format!("failed reading {dhcp_path:?}"))?;
         assert_eq!(dhcp_contents, crate::dhcp::TMPL_EMPTY);
         Ok(())
     }
@@ -3208,6 +3281,7 @@ mod tests {
             tenancy_enabled: true,
             site_global_vpc_vni: None,
             loopback_ip: "10.217.5.39".parse().unwrap(),
+            loopback_ip_v6: None,
             secondary_overlay_vtep_ip: Some("10.255.254.253".parse().unwrap()),
             internal_bridge_routing_prefix: Some("10.255.255.0/29".parse().unwrap()),
             vf_intercept_bridge_port_name: Some("pfdpu0".to_string()),
@@ -3296,7 +3370,7 @@ mod tests {
                 let mut f = fs::File::create(ERR_FILE).unwrap();
                 f.write_all(startup_yaml.as_bytes()).unwrap();
             })
-            .wrap_err(format!("YAML parser error. Output written to {ERR_FILE}"))?;
+            .wrap_err(format!("YAML parser error. output written to {ERR_FILE}"))?;
         assert_eq!(yaml_obj.len(), 2); // 'header' and 'set'
         Ok(())
     }
@@ -3481,6 +3555,7 @@ mod tests {
 
         let netconf = rpc::ManagedHostNetworkConfig {
             loopback_ip: "10.217.5.39".to_string(),
+            loopback_ip_v6: None,
             quarantine_state: None,
         };
 
@@ -3552,7 +3627,7 @@ mod tests {
             network_security_policy_overrides: vec![],
             instance_id: Some(
                 uuid::Uuid::try_from("60cef902-9779-4666-8362-c9bb4b37184f")
-                    .wrap_err("Uuid::try_from")?
+                    .wrap_err("uuid::try_from")?
                     .into(),
             ),
             remote_id: "test".to_string(),
@@ -3722,6 +3797,7 @@ mod tests {
     fn test_dhcp_server_config_errors_without_ipv4_pxe() -> Result<(), Box<dyn std::error::Error>> {
         let netconf = rpc::ManagedHostNetworkConfig {
             loopback_ip: "10.217.5.39".to_string(),
+            loopback_ip_v6: None,
             quarantine_state: None,
         };
         let network_config = rpc::ManagedHostNetworkConfigResponse {
@@ -3863,26 +3939,26 @@ mod tests {
         let interface_prefix_v6 = Some("2001:db8::/127".to_string());
 
         let addresses: Vec<String> = std::iter::once(ip.clone())
-            .chain(ip6.filter(|s| !s.is_empty()))
+            .chain(ip6.none_if_empty())
             .collect();
         assert_eq!(addresses, vec!["10.0.0.1", "2001:db8::1"]);
 
         let prefixes: Vec<String> = std::iter::once(interface_prefix)
-            .chain(interface_prefix_v6.filter(|s| !s.is_empty()))
+            .chain(interface_prefix_v6.none_if_empty())
             .collect();
         assert_eq!(prefixes, vec!["10.0.0.0/31", "2001:db8::/127"]);
 
         // Verify empty ip6 is not included.
         let empty_ip6: Option<String> = Some("".to_string());
         let addresses2: Vec<String> = std::iter::once(ip)
-            .chain(empty_ip6.filter(|s| !s.is_empty()))
+            .chain(empty_ip6.none_if_empty())
             .collect();
         assert_eq!(addresses2, vec!["10.0.0.1"]);
 
         // Verify None ip6 is not included.
         let none_ip6: Option<String> = None;
         let addresses3: Vec<String> = std::iter::once("10.0.0.1".to_string())
-            .chain(none_ip6.filter(|s| !s.is_empty()))
+            .chain(none_ip6.none_if_empty())
             .collect();
         assert_eq!(addresses3, vec!["10.0.0.1"]);
     }

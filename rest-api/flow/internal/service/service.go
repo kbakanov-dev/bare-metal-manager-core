@@ -16,8 +16,10 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	cdb "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/authz"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/certs"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/grpclog"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/common/grpcrecovery"
 	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/db/migrations"
 	inventorymanager "github.com/NVIDIA/infra-controller/rest-api/flow/internal/inventory/manager"
 	inventorystore "github.com/NVIDIA/infra-controller/rest-api/flow/internal/inventory/store"
@@ -34,6 +36,17 @@ import (
 	taskstore "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/store"
 	pb "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/proto/v1"
 )
+
+// ignoreMigrationSignatureChangesEnvVar enables the temporary migration
+// recovery workaround during service startup. When set to "true", changed
+// signatures are stored without re-running installed migration SQL.
+const ignoreMigrationSignatureChangesEnvVar = "FLOW_DB_MIGRATION_IGNORE_SIGNATURE_CHANGES"
+
+func migrationOptionsFromEnv() migrations.MigrateOptions {
+	return migrations.MigrateOptions{
+		IgnoreSignatureChanges: os.Getenv(ignoreMigrationSignatureChangesEnvVar) == "true",
+	}
+}
 
 // Service is the top-level Flow service. It owns the gRPC server, database
 // session, inventory manager, and task manager and coordinates their lifecycles.
@@ -66,8 +79,14 @@ func New(ctx context.Context, c Config) (*Service, error) {
 		return nil, fmt.Errorf("failed to create database connection: %w", err)
 	}
 
-	// Run migrations
-	if err := migrations.MigrateWithDB(ctx, session.DB); err != nil {
+	// Run migrations. The signature override is an operational escape hatch for
+	// recovering from changed migration files; strict verification remains the
+	// default.
+	migrationOptions := migrationOptionsFromEnv()
+	if migrationOptions.IgnoreSignatureChanges {
+		log.Warn().Msgf("Migration signature changes will be accepted because %s=true", ignoreMigrationSignatureChangesEnvVar)
+	}
+	if err := migrations.MigrateWithDB(ctx, session.DB, migrationOptions); err != nil {
 		session.Close()
 
 		return nil, fmt.Errorf("failed to run migrations: %w", err)
@@ -133,8 +152,6 @@ func New(ctx context.Context, c Config) (*Service, error) {
 func (s *Service) Start(ctx context.Context) (retErr error) {
 	log.Logger = log.With().Caller().Logger()
 
-	certOpt := s.certOption()
-
 	// On any error return, shut down every resource that was started, in
 	// reverse start order. Boolean flags record which components are running
 	// because inventoryManager and taskManager are always non-nil (set in New)
@@ -172,6 +189,12 @@ func (s *Service) Start(ctx context.Context) (retErr error) {
 		s.session.Close()
 	}()
 
+	certOpt, secure := s.certOption()
+	authorizer, err := s.newAuthorizer(secure)
+	if err != nil {
+		return err
+	}
+
 	// Rule resolver is ready immediately (queries DB for rules)
 	log.Info().Msg("Rule resolver ready (will query DB for operation rules)")
 
@@ -199,7 +222,6 @@ func (s *Service) Start(ctx context.Context) (retErr error) {
 			TaskStore:   s.taskStore,
 		},
 	)
-	var err error
 	operationRunDispatcher, err := operationrundispatcher.New(
 		operationrundispatcher.Dependencies{
 			Store:       s.operationRunStore,
@@ -248,9 +270,14 @@ func (s *Service) Start(ctx context.Context) (retErr error) {
 	s.operationRunDispatcher = operationRunDispatcher
 	log.Info().Msg("Operation run dispatcher started")
 
+	// Access logging wraps authorization so rejected unary RPCs receive the
+	// same completion log as accepted calls. Recovery runs on both sides of
+	// authorization: the outer layer catches authorization panics, while the
+	// inner layer can enrich downstream panic logs with the resolved identity.
 	s.grpcServer = grpc.NewServer(
 		certOpt,
-		grpc.ChainUnaryInterceptor(grpclog.UnaryServerInterceptor()),
+		grpc.ChainUnaryInterceptor(unaryServerInterceptors(authorizer)...),
+		grpc.ChainStreamInterceptor(streamServerInterceptors(authorizer)...),
 	)
 
 	log.Info().Msg("gRPC server is running")
@@ -273,6 +300,23 @@ func (s *Service) Start(ctx context.Context) (retErr error) {
 	}
 
 	return nil
+}
+
+func unaryServerInterceptors(authorizer *authz.Authorizer) []grpc.UnaryServerInterceptor {
+	return []grpc.UnaryServerInterceptor{
+		grpclog.UnaryServerInterceptor(),
+		grpcrecovery.UnaryServerInterceptor(nil),
+		authz.UnaryServerInterceptor(authorizer),
+		grpcrecovery.UnaryServerInterceptor(authz.ServiceIdentityFromContext),
+	}
+}
+
+func streamServerInterceptors(authorizer *authz.Authorizer) []grpc.StreamServerInterceptor {
+	return []grpc.StreamServerInterceptor{
+		grpcrecovery.StreamServerInterceptor(nil),
+		authz.StreamServerInterceptor(authorizer),
+		grpcrecovery.StreamServerInterceptor(authz.ServiceIdentityFromContext),
+	}
 }
 
 // Stop gracefully shuts down the service in dependency order:
@@ -328,13 +372,13 @@ func (s *Service) Stop(ctx context.Context) {
 // If explicit certificate paths are set in the config they take precedence;
 // otherwise CERTDIR / the k8s SPIFFE default is used. The service refuses to
 // start without certificates unless ALLOW_INSECURE_GRPC=true is set.
-func (s *Service) certOption() grpc.ServerOption {
+func (s *Service) certOption() (grpc.ServerOption, bool) {
 	tlsConfig, source, err := certs.ResolveServer(s.conf.CertConfig)
 	if err != nil {
 		if errors.Is(err, certs.ErrNotPresent) {
 			if os.Getenv("ALLOW_INSECURE_GRPC") == "true" {
 				log.Warn().Msg("TLS certs not present, running without mTLS")
-				return grpc.EmptyServerOption{}
+				return grpc.EmptyServerOption{}, false
 			}
 			log.Fatal().Msg("TLS certificates required but not found; set ALLOW_INSECURE_GRPC=true for local development")
 		}
@@ -342,7 +386,21 @@ func (s *Service) certOption() grpc.ServerOption {
 	}
 
 	log.Info().Msgf("Using certificates from %s", source)
-	return grpc.Creds(credentials.NewTLS(tlsConfig))
+	return grpc.Creds(credentials.NewTLS(tlsConfig)), true
+}
+
+func (s *Service) newAuthorizer(secure bool) (*authz.Authorizer, error) {
+	if secure {
+		authorizer, err := authz.New(s.conf.Authorization)
+		if err != nil {
+			return nil, fmt.Errorf("create gRPC service authorizer: %w", err)
+		}
+
+		return authorizer, nil
+	}
+
+	log.Warn().Msg("Flow gRPC service authorization is running in audit mode for insecure development")
+	return authz.New(authz.Config{Mode: authz.ModeAudit})
 }
 
 func (s *Service) startScheduler(ctx context.Context) error {

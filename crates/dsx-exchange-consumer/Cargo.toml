@@ -20,6 +20,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "carbide-dsx-exchange-consumer"
@@ -62,6 +63,7 @@ carbide-version = { path = "../version" }
 [dev-dependencies]
 carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

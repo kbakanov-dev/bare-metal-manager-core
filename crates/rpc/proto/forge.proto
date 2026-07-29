@@ -65,6 +65,10 @@ service Forge {
   rpc UpdateVpcPrefix(VpcPrefixUpdateRequest) returns (VpcPrefix);
   rpc DeleteVpcPrefix(VpcPrefixDeletionRequest) returns (VpcPrefixDeletionResult);
 
+  // Site prefixes
+  rpc FindSitePrefixIds(SitePrefixSearchFilter) returns (SitePrefixIdList);
+  rpc FindSitePrefixesByIds(SitePrefixesByIdsRequest) returns (SitePrefixList);
+
   // VPC peering
   rpc CreateVpcPeering(VpcPeeringCreationRequest) returns (VpcPeering);
   rpc FindVpcPeeringIds(VpcPeeringSearchFilter) returns (VpcPeeringIdList);
@@ -129,11 +133,9 @@ service Forge {
   // rpc UpdateInstanceNetworkConfig(InstanceNetworkConfigUpdateRequest) returns (Instance);
   // Updates the Operating System on a running instance
   rpc UpdateInstanceOperatingSystem(InstanceOperatingSystemUpdateRequest) returns (Instance);
-  // Updates the configuration of a running instance.
-  // Only the following configurations of an instance can be changed:
-  // - Keyset IDs
-  // - Metadata (Name, Description, Labels)
-  // - Operating System Details
+  // Updates the mutable desired configuration and metadata of a running instance.
+  // `config` and `metadata` are complete values, not patches. Callers must
+  // preserve fields and selector variants they do not intend to change.
   // The update will take effect asynchronously. Users should monitor `Instance.status.synced`
   // to determine whether all updates have been applied.
   rpc UpdateInstanceConfig(InstanceConfigUpdateRequest) returns (Instance);
@@ -405,6 +407,12 @@ service Forge {
   // Report convergence of an in-flight (or completed) site-wide rotation.
   rpc GetCredentialRotationStatus(CredentialRotationStatusRequest)
       returns (CredentialRotationStatusResult);
+
+  // Get Container registry credentials 
+  rpc GetContainerRegistryCredential(GetContainerRegistryCredentialRequest)
+    returns (GetContainerRegistryCredentialResponse);
+  rpc SetContainerRegistryCredential(SetContainerRegistryCredentialRequest)
+    returns (google.protobuf.Empty);
 
   // Route Server Management
   rpc GetRouteServers(google.protobuf.Empty) returns (RouteServerEntries);
@@ -1796,10 +1804,10 @@ message VpcUpdateVirtualizationRequest {
   // a `ConcurrentModificationError`.
   optional string if_version_match = 2;
 
-  // network_virtualization_type is the new VpcVirtualizationType
-  // to set for the VPC. This is intended for dev use only, and
-  // will return an error if any instances are already configured
-  // in the VPC.
+  // Development or maintenance operation. The only supported use migrates a
+  // legacy ETHERNET_VIRTUALIZER VPC with no instances to FNN. Quiesce instance
+  // allocation into that VPC before starting and until completion. Do not
+  // transition an existing FNN or FLAT VPC, or transition any VPC to FLAT.
   optional VpcVirtualizationType network_virtualization_type = 3;
 }
 
@@ -2645,8 +2653,19 @@ message NetworkPrefix {
   reserved 5,6; // deprecated state and events
   // deprecated circuit id.
   reserved 7;
+  // Legacy `uint32` count retained for existing clients. Values above
+  // `2^32 - 1` are capped, and zero also represents "not requested." New
+  // clients should use `free_ip_count_v2`.
   uint32 free_ip_count = 8;
   optional string svi_ip = 9;
+  // Wider free-address count with explicit presence. Absent when accounting was
+  // not requested; clients also see it absent in responses from older servers.
+  // When `free_ip_count_saturated` is true, this is `2^64 - 1` and the exact
+  // count is larger.
+  optional uint64 free_ip_count_v2 = 10;
+  // True when `free_ip_count_v2` was capped because the exact count exceeds
+  // `2^64 - 1`.
+  bool free_ip_count_saturated = 11;
 }
 
 message MachineState {
@@ -2785,8 +2804,8 @@ message IpxeTemplateArtifact {
   optional string cached_url = 7;           // Local cached URL, set by carbide-core on successful download. If present overrides 'url' at boot time.
 }
 
-// Scope for iPXE script templates.
-enum IpxeTemplateScope {
+// Visibility for iPXE script templates.
+enum IpxeTemplateVisibility {
   INTERNAL = 0;  // Carbide-core usage only
   PUBLIC = 1;    // Usable by tenant
 }
@@ -2799,8 +2818,10 @@ message IpxeTemplate {
   string description = 4;
   repeated string reserved_params = 5;  // Reserved for carbide-core to provide at render time
   repeated string required_artifacts = 6;  // Error if these artifacts are not provided or empty
-  IpxeTemplateScope scope = 7;  // INTERNAL = carbide-core only, PUBLIC = tenant-usable
+  reserved 7;  // formerly `IpxeTemplateScope scope`; renamed to `visibility` and moved to 9
+  reserved "scope";  // old field name; do not reuse
   common.IpxeTemplateId id = 8;  // Stable UUID, hardcoded in templates.yaml; consistent across all sites
+  IpxeTemplateVisibility visibility = 9;  // INTERNAL = carbide-core only, PUBLIC = tenant-usable
 }
 
 // Tenant related configuration that is set once the instance is allocated
@@ -3024,7 +3045,9 @@ message InstanceConfigUpdateRequest {
   // a `ConcurrentModificationError`.
   optional string if_version_match = 2;
 
-  // New configuration to be utilized by the instance
+  // Complete desired configuration replacing the current configuration. The
+  // server does not merge omitted fields. Read-modify-write clients must
+  // preserve fields and oneof variants they do not intend to change.
   InstanceConfig config = 3;
   // New Metadata to be utilized by the instance
   Metadata metadata = 4;
@@ -3239,6 +3262,11 @@ message InstanceInterfaceConfig {
     // and continue IP allocation. This field is address-family agnostic —
     // it can be an IPv4 or IPv6 VPC prefix.
     common.VpcPrefixId vpc_prefix_id = 6;
+    // Select prefixes and addresses automatically from this FNN VPC.
+    // This selector records caller intent. Clients replacing `InstanceConfig`
+    // must preserve it unless intentionally switching to an explicit segment
+    // or prefix.
+    InstanceInterfaceVpcSelection vpc = 13;
   }
 
   // The ID of security group that is attached to this interface
@@ -3277,6 +3305,29 @@ message InstanceInterfaceConfig {
   // narrow prefix-list options that are already allowed by the owning VPC's
   // routing profile.
   optional InstanceInterfaceRoutingProfile routing_profile = 12;
+}
+
+// Automatic VPC-backed network selection for one instance interface.
+message InstanceInterfaceVpcSelection {
+  // The single logical VPC this interface belongs to.
+  common.VpcId vpc_id = 1;
+  // The address families Core must allocate. Unspecified is invalid.
+  InstanceInterfaceIpFamilyMode family_mode = 2;
+}
+
+// Address families requested for automatic VPC prefix and address selection.
+//
+// Core models and persists every mode. External IPv6-only and dual-stack
+// requests are temporarily rejected until downstream DPU support is complete.
+enum InstanceInterfaceIpFamilyMode {
+  // Invalid for an automatic VPC selection request.
+  INSTANCE_INTERFACE_IP_FAMILY_MODE_UNSPECIFIED = 0;
+  // Allocate one IPv4 prefix and address.
+  INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY = 1;
+  // Allocate one IPv6 prefix and address.
+  INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV6_ONLY = 2;
+  // Allocate one prefix and address from each family in the same VPC.
+  INSTANCE_INTERFACE_IP_FAMILY_MODE_DUAL_STACK = 3;
 }
 
 // IPv6 configuration for a dual-stack instance interface.
@@ -3329,6 +3380,12 @@ message InstanceIBInterfaceConfig {
   common.IBPartitionId ib_partition_id = 21;
 }
 
+// VPC prefixes Core resolved for an instance interface, keyed by family.
+message InstanceInterfaceResolvedVpcPrefixes {
+  optional common.VpcPrefixId ipv4_vpc_prefix_id = 1;
+  optional common.VpcPrefixId ipv6_vpc_prefix_id = 2;
+}
+
 // The actual status of a single network interface of an instance
 message InstanceInterfaceStatus {
   // If the interface is defined as a virtual function (associated
@@ -3363,6 +3420,9 @@ message InstanceInterfaceStatus {
 
   // The logical VPC this interface belongs to.
   optional common.VpcId vpc_id = 8;
+
+  // Prefixes resolved from explicit-prefix or automatic VPC intent.
+  optional InstanceInterfaceResolvedVpcPrefixes resolved_vpc_prefixes = 9;
 }
 
 // The actual status of a single IB interface of an instance
@@ -3624,6 +3684,53 @@ message SwitchNvosInfo {
   optional uint32 port = 3;
 }
 
+message MachineConfig {
+  // Maintenance annotation set by the operator.
+  optional string maintenance_reference = 1;
+  optional google.protobuf.Timestamp maintenance_start_time = 2;
+
+  // Override to enable or disable firmware auto-update.
+  optional bool firmware_autoupdate = 3;
+
+  // The instance type with which this machine is associated, if any.
+  optional string instance_type_id = 4;
+
+  // DPF configuration for this machine.
+  optional DpfMachineState dpf = 5;
+
+  // The declared desired hardware SKU (set via the AssignSku API).
+  // Distinct from MachineStatus.hw_sku, which reflects the observed match.
+  optional string hw_sku = 6;
+}
+
+message MachineStatus {
+  // Deprecated Machine.interfaces is superseded by this field.
+  repeated MachineInterface interfaces = 1;
+  optional machine_discovery.DiscoveryInfo discovery_info = 2;
+  google.protobuf.Timestamp last_reboot_time = 3;
+  google.protobuf.Timestamp last_observation_time = 4;
+  optional common.MachineId associated_host_machine_id = 5;
+  repeated common.MachineId associated_dpu_machine_ids = 6;
+  optional google.protobuf.Timestamp last_reboot_requested_time = 7;
+  optional string last_reboot_requested_mode = 8;
+  optional string dpu_agent_version = 9;
+  health.HealthReport health = 10;
+  repeated HealthSourceOrigin health_sources = 11;
+  optional string failure_details = 12;
+  optional InfinibandStatusObservation infiniband = 13;
+  MachineCapabilitiesSet capabilities = 14;
+  optional SkuStatus hw_sku = 15;
+  optional ManagedHostQuarantineState quarantine = 16;
+  optional string hw_sku_device_type = 17;
+  bool update_complete = 18;
+  optional MachineNVLinkInfo nvlink_info = 19;
+  optional MachineNVLinkStatusObservation nvlink = 20;
+  optional MachineSpxStatusObservation spx = 21;
+  optional string last_scout_observed_version = 22;
+  optional InstanceNetworkRestrictions instance_network_restrictions = 23;
+  LifecycleStatus lifecycle = 24;
+}
+
 message Machine {
   // Uniquely identifies a Forge machine.
   // The value of this field is globally unique.
@@ -3647,53 +3754,89 @@ message Machine {
   // Note: This is not yet removed in this change to limit the amount of breaking
   // changes at once - but users shouldn't rely on it. The actually interesting
   // information around interfaces for Instance users is in `Instance::InstanceNetworkStatus`.
-  repeated MachineInterface interfaces = 9;
+  // Deprecated: use status.interfaces
+  // TODO: change to reserved once rest-api uses MachineStatus
+  repeated MachineInterface interfaces = 9 [deprecated = true];
 
   // TODO: This field might actually move Instance since the discovered hardware
   // could be different per lifecycle. When the machine is updated with different
   // hardware and restarted, the data can change. The Instance would have the
   // capability to store the actual discovery information for each lifecycle
-  optional machine_discovery.DiscoveryInfo discovery_info = 10;
+  // Deprecated: use status.discovery_info
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional machine_discovery.DiscoveryInfo discovery_info = 10 [deprecated = true];
 
-  // Machine type if it is a DPU or HOST.
+  // Machine type (DPU or HOST). Set at ingestion time; not operator-mutable.
   MachineType machine_type = 11;
 
+  // BMC connection details. Discovered at ingestion time; not operator-mutable.
   BmcInfo bmc_info = 12;
 
-  google.protobuf.Timestamp last_reboot_time = 14;
+  // Deprecated: use status.last_reboot_time
+  // TODO: change to reserved once rest-api uses MachineStatus
+  google.protobuf.Timestamp last_reboot_time = 14 [deprecated = true];
   // This is used by legacy versions of forge-admin-cli as well as by Forge Cloud
   reserved 15; // Was NetworkHealth network_health = 15;
-  google.protobuf.Timestamp last_observation_time = 16;
-  optional string maintenance_reference = 17;
-  optional google.protobuf.Timestamp maintenance_start_time = 18;
+  // Deprecated: use status.last_observation_time
+  // TODO: change to reserved once rest-api uses MachineStatus
+  google.protobuf.Timestamp last_observation_time = 16 [deprecated = true];
+
+  // Deprecated: use config.maintenance_reference
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional string maintenance_reference = 17 [deprecated = true];
+
+  // Deprecated: use config.maintenance_start_time
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional google.protobuf.Timestamp maintenance_start_time = 18 [deprecated = true];
 
   // Other machine ids associated with this machine
-  optional common.MachineId associated_host_machine_id = 19;
+  // Deprecated: use status.associated_host_machine_id
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional common.MachineId associated_host_machine_id = 19 [deprecated = true];
   reserved 20; /* previously: optional common.MachineId associated_dpu_machine_id = 20; */
 
+  // Hardware inventory (NIC firmware, etc.). Discovered at ingestion time; not operator-mutable.
   optional MachineInventory inventory = 21;
-  optional google.protobuf.Timestamp last_reboot_requested_time = 22;
-  optional string last_reboot_requested_mode = 23;
+  // Deprecated: use status.last_reboot_requested_time
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional google.protobuf.Timestamp last_reboot_requested_time = 22 [deprecated = true];
+  // Deprecated: use status.last_reboot_requested_mode
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional string last_reboot_requested_mode = 23 [deprecated = true];
 
-  optional string dpu_agent_version = 24;
+  // Deprecated: use status.dpu_agent_version
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional string dpu_agent_version = 24 [deprecated = true];
 
   // Fields are not ordered numerically, check the whole message for max field number
-  repeated common.MachineId associated_dpu_machine_ids = 26;
+  // Deprecated: use status.associated_dpu_machine_ids
+  // TODO: change to reserved once rest-api uses MachineStatus
+  repeated common.MachineId associated_dpu_machine_ids = 26 [deprecated = true];
 
   // For Host Machines returns the aggregate health of the host
   // For DPUs, it returns the individual DPU health
-  health.HealthReport health = 27;
+  // Deprecated: use status.health
+  // TODO: change to reserved once rest-api uses MachineStatus
+  health.HealthReport health = 27 [deprecated = true];
+
+  // Deprecated: use config.firmware_autoupdate
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional bool firmware_autoupdate = 28 [deprecated = true];
 
   // Health report sources (identified by a specific source name and mode) that are applied
   // to the aggregate health of this machine
-  repeated HealthSourceOrigin health_sources = 29;
+  // Deprecated: use status.health_sources
+  // TODO: change to reserved once rest-api uses MachineStatus
+  repeated HealthSourceOrigin health_sources = 29 [deprecated = true];
 
-  optional bool firmware_autoupdate = 28;
-
-  optional string failure_details = 30;
+  // Deprecated: use status.failure_details
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional string failure_details = 30 [deprecated = true];
 
   // Infiniband devices information attached to the machine.
-  optional InfinibandStatusObservation ib_status = 32;
+  // Deprecated: use status.ib_status
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional InfinibandStatusObservation ib_status = 32 [deprecated = true];
 
   // Metadata associated with the Machine
   Metadata metadata = 33;
@@ -3703,38 +3846,68 @@ message Machine {
   string version = 34;
 
   // Restrictions on the network configuration for any instances that can be allocated on this machine.
-  optional InstanceNetworkRestrictions instance_network_restrictions = 35;
+  // Deprecated: use status.instance_network_restrictions
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional InstanceNetworkRestrictions instance_network_restrictions = 35 [deprecated = true];
 
   // The instance type with which a machine is associated if any.
-  optional string instance_type_id = 36;
+  // Deprecated: use config.instance_type_id
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional string instance_type_id = 36 [deprecated = true];
 
   // The known capabilities of a machine
-  MachineCapabilitiesSet capabilities = 37;
+  // Deprecated: use status.capabilities
+  // TODO: change to reserved once rest-api uses MachineStatus
+  MachineCapabilitiesSet capabilities = 37 [deprecated = true];
 
-  optional string hw_sku = 38;
-  optional SkuStatus hw_sku_status = 39;
+  // Deprecated: use config.hw_sku
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional string hw_sku = 38 [deprecated = true];
+  // Deprecated: use status.hw_sku_status
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional SkuStatus hw_sku_status = 39 [deprecated = true];
 
-  optional ManagedHostQuarantineState quarantine_state = 40;
+  // Deprecated: use status.quarantine
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional ManagedHostQuarantineState quarantine_state = 40 [deprecated = true];
 
-  optional string hw_sku_device_type = 41;
+  // Deprecated: use status.hw_sku_device_type
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional string hw_sku_device_type = 41 [deprecated = true];
 
-  bool update_complete = 42;
+  // Deprecated: use status.update_complete
+  // TODO: change to reserved once rest-api uses MachineStatus
+  bool update_complete = 42 [deprecated = true];
 
-  optional MachineNVLinkInfo nvlink_info = 43;
+  // Deprecated: use status.nvlink_info
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional MachineNVLinkInfo nvlink_info = 43 [deprecated = true];
 
-  optional MachineNVLinkStatusObservation nvlink_status_observation = 44;
+  // Deprecated: use status.nvlink
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional MachineNVLinkStatusObservation nvlink_status_observation = 44 [deprecated = true];
 
-  // The rack that this machine is associated with
+  // The rack this machine is assigned to (from expected machine record).
   optional common.RackId rack_id = 45;
 
+  // Slot and tray position within the rack (from expected machine record).
   optional PlacementInRack placement_in_rack = 46;
 
-  optional MachineSpxStatusObservation spx_status_observation = 47;
+  // Deprecated: use status.spx
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional MachineSpxStatusObservation spx_status_observation = 47 [deprecated = true];
 
   // Build version of forge-scout last observed during machine discovery registration.
-  optional string last_scout_observed_version = 48;
+  // Deprecated: use status.last_scout_observed_version
+  // TODO: change to reserved once rest-api uses MachineStatus
+  optional string last_scout_observed_version = 48 [deprecated = true];
 
-  optional DpfMachineState dpf = 49;
+  // Deprecated: use config.dpf
+  // TODO: change to reserved once rest-api uses MachineConfig
+  optional DpfMachineState dpf = 49 [deprecated = true];
+
+  MachineConfig config = 50;
+  MachineStatus status = 51;
 }
 
 message DpfMachineState {
@@ -4500,6 +4673,8 @@ message ManagedHostNetworkConfig {
   // DPU loopback IP
   string loopback_ip = 1;
   optional ManagedHostQuarantineState quarantine_state = 2;
+  // DPU IPv6 loopback IP; unset for non-FNN agents or when the `lo-ip-v6` pool is not configured.
+  optional string loopback_ip_v6 = 3;
 }
 
 message FlatInterfaceConfig {
@@ -5098,6 +5273,15 @@ message PxeInstructions {
   optional string static_pxe_url_override = 4;
 }
 
+// Selects how a booting DPU obtains the CA used to authenticate Carbide.
+// LEGACY_DOWNLOAD preserves the historical unauthenticated PXE download for
+// rolling upgrades. EMBEDDED and MOUNTED require a CA to already be present.
+enum BootstrapCaSource {
+  BOOTSTRAP_CA_SOURCE_LEGACY_DOWNLOAD = 0;
+  BOOTSTRAP_CA_SOURCE_EMBEDDED = 1;
+  BOOTSTRAP_CA_SOURCE_MOUNTED = 2;
+}
+
 message CloudInitDiscoveryInstructions {
   MachineInterface machine_interface = 1;
   PxeDomain domain = 2;
@@ -5129,6 +5313,10 @@ message CloudInitDiscoveryInstructions {
 
   // Bridge that intercept patch ports attach to during BlueField provisioning.
   optional string hbn_bridge = 12;
+
+  // How the DPU obtains the CA used to authenticate Carbide. The zero value
+  // preserves the legacy download behavior for rolling upgrades.
+  BootstrapCaSource bootstrap_ca_source = 13;
 }
 
 message CloudInitMetaData {
@@ -5980,42 +6168,59 @@ message IpxeTemplateList {
 message ExpectedHostNic {
   string mac_address = 1;
   // Legacy free-form segment hint (bf3, onboard, oob, ...). Kept for backward
-  // compatibility; declare network_segment_type instead, which wins.
+  // compatibility; declare `network_segment_type` instead, which wins.
   optional string nic_type = 2;
   optional string fixed_ip = 3;
   optional string fixed_mask = 4;
   optional string fixed_gateway = 5;
-  // When true, this flags the given NIC as the host's primary (boot)
-  // interface (used in cases of zero DPU).
+  // Host-role interfaces may set this to true to declare the host's primary
+  // (boot) interface.
   //
-  // Up to one NIC per ExpectedMachine may be marked primary, if set at
-  // all. Propagates to `machine_interfaces.primary_interface` during DHCP
-  // when this NIC is first discovered.
-  //
-  // Some day this could be even possibly used to say "this dumb NIC
-  // *is* the primary interface, even though I know I have a DPU."
+  // At most one Host interface per `ExpectedMachine` may set it to true; the
+  // other Host interfaces then become non-primary. False remains accepted for
+  // compatibility but does not replace that machine-wide selection. DPU OS
+  // interfaces are primary data interfaces and DPU BMC interfaces are
+  // non-primary; those roles must omit this field.
   optional bool primary = 6;
-  // The network segment type this NIC's first DHCP lease should come from.
-  // A NIC's segment normally follows its DHCP relay; where segment prefixes
-  // nest or overlap and a relay matches several, this narrows the choice to
-  // the segment of this type. Supersedes nic_type; absent both, the relay's
-  // match stands.
+  // Optional guard for this interface's network segment type. An explicit
+  // allocation policy or DPU role applies the guard to DHCP-selected segments
+  // and fixed-address containment. A legacy Host declaration with an omitted
+  // policy keeps the earlier first-DHCP selection-only behavior. Supersedes
+  // `nic_type` for DHCP; absent both, relay selection remains unconstrained.
+  // On update, omission clears this guard.
   optional NetworkSegmentType network_segment_type = 7;
+  // Machine endpoint that owns this interface. The role selects interface type
+  // and primary behavior only; Host, DPU OS, and DPU BMC all accept the same
+  // allocation policies and optional segment guard. On create, missing and
+  // Unspecified mean Host. On update, omission preserves the stored role while
+  // explicit Unspecified resets it to Host.
+  optional ExpectedInterfaceRole role = 8;
+  // Optional allocation policy. On create, missing and Unspecified infer Fixed
+  // from `fixed_ip` and Dynamic otherwise. On update, omission preserves the
+  // stored policy while explicit Unspecified resets to that inference.
+  // Explicit Dynamic rejects `fixed_ip`. Explicit Fixed, or a DPU role that
+  // infers Fixed, requires `fixed_ip` inside a configured managed prefix. A
+  // legacy Host declaration with an omitted policy may instead fall back to
+  // `static-assignments` and does not turn `network_segment_type` into a
+  // fixed-address guard.
+  optional ExpectedInterfaceIpAllocation ip_allocation = 9;
 }
 
-// Per-host DPU operating mode. Lets site operators mix DPU-mode,
-// NIC-mode, and no-DPU hosts within a single site.
+// Forge RPC representation of the per-host policy for how NICo treats DPU
+// hardware. The server translates this compatibility surface to the internal
+// `HostDpuPolicy` model at the RPC boundary.
 //
-// - DPU_MODE: The default. Attached DPUs are managed by NICo (DPU upgrades,
-//   overlay networking, etc).
-// - NIC_MODE: DPUs are present physically but operate as plain NICs. Site
-//   explorer reconfigures them to NIC mode if needed; the host is then
-//   tracked as if it had no DPUs.
-// - NO_DPU: no DPU hardware at all -- a plain host NIC on the underlay.
+// - DPU_MODE: `HostDpuPolicy::Manage`. Attached DPUs are managed by NICo. At
+//   the per-host boundary this retains the legacy inheritance behavior and
+//   defers to the site policy.
+// - NIC_MODE: `HostDpuPolicy::Nic`. Physically present DPUs operate as
+//   plain NICs and the host is tracked as if it had no DPUs.
+// - NO_DPU: `HostDpuPolicy::Ignore`. NICo does not configure or attach DPU
+//   hardware.
 //
-// Unset and `DPU_MODE_UNSPECIFIED` both mean "use the site default,"
-// which comes from `[site_explorer] dpu_mode` (and falls back to
-// DPU_MODE when that's unset).
+// Unset and `DPU_MODE_UNSPECIFIED` both mean "use the site default," which
+// comes from `[site_explorer] dpu_policy` (and falls back to `Manage` when
+// that's unset).
 enum DpuMode {
   DPU_MODE_UNSPECIFIED = 0;
   DPU_MODE = 1;
@@ -6075,9 +6280,9 @@ message ExpectedMachine {
   // When true, site-explorer skips BMC password rotation and stores the
   // factory-default credentials in Vault as-is.
   optional bool bmc_retain_credentials = 15;
-  // Per-host DPU operating mode. See `DpuMode` above. Unset means "use
-  // the site-wide `[site_explorer] dpu_mode` default" (which itself
-  // defaults to DPU_MODE when unset).
+  // Forge RPC compatibility field for the per-host DPU policy. See `DpuMode`
+  // above. Internal config and admin-CLI inputs call this `dpu_policy`; the RPC
+  // boundary translates between those policy names and this stable field.
   optional DpuMode dpu_mode = 16;
   // Per-host lifecycle profile. When unset in a patch/update request, the
   // existing DB value is preserved via COALESCE.
@@ -7198,6 +7403,9 @@ message SkuComponentStorage {
   string model = 2;
   uint32 count = 3;
   uint32 capacity_mb = 4;
+  optional uint32 min_size_mb = 5;
+  optional uint32 max_size_mb = 6;
+  repeated string pci_patterns = 7;
 }
 
 message SkuComponentStorageController {
@@ -8941,11 +9149,52 @@ enum OperatingSystemType {
   OS_TYPE_TEMPLATED_IPXE = 2; // iPXE OS using an iPXE template
 }
 
+// Identifies which machine endpoint owns an entry in `ExpectedMachine.host_nics`.
+// Each role accepts Dynamic, Fixed, and Retained allocation plus the optional
+// segment guard. The role only derives interface type and primary behavior.
+//
+// On create, missing and `EXPECTED_INTERFACE_ROLE_UNSPECIFIED` mean Host. On
+// update, omission preserves the stored role, while explicit
+// `EXPECTED_INTERFACE_ROLE_UNSPECIFIED` resets it to Host. Host BMC identity
+// remains on `ExpectedMachine.bmc_mac_address`. NVIDIA/infra-controller#4103
+// tracks adding its network settings to this same interface model.
+enum ExpectedInterfaceRole {
+  // Preserve the legacy Host role when the optional field is absent.
+  EXPECTED_INTERFACE_ROLE_UNSPECIFIED = 0;
+  // Host operating-system data interface. Primary selection is machine-wide.
+  EXPECTED_INTERFACE_ROLE_HOST = 1;
+  // DPU operating-system data interface. Always primary for its DPU.
+  EXPECTED_INTERFACE_ROLE_DPU_OS = 2;
+  // DPU Redfish/BMC interface. Never primary.
+  EXPECTED_INTERFACE_ROLE_DPU_BMC = 3;
+}
+
+// Controls how an expected interface receives and retains its IP address.
+// Missing and `EXPECTED_INTERFACE_IP_ALLOCATION_UNSPECIFIED` preserve legacy
+// behavior: `fixed_ip` implies `FIXED`, while its absence implies `DYNAMIC`.
+enum ExpectedInterfaceIpAllocation {
+  // Infer Fixed or Dynamic from whether `fixed_ip` is configured. For a legacy
+  // Host declaration, this does not opt into the fixed-address segment guard.
+  EXPECTED_INTERFACE_IP_ALLOCATION_UNSPECIFIED = 0;
+  // Use an expiring DHCP lease. The segment guard must match the relay's
+  // selected segment when configured.
+  EXPECTED_INTERFACE_IP_ALLOCATION_DYNAMIC = 1;
+  // Reserve `fixed_ip`. Explicit Fixed, or a DPU role that infers Fixed,
+  // requires a configured managed prefix to contain the address. That prefix
+  // selects the segment, and the segment guard must match when configured.
+  EXPECTED_INTERFACE_IP_ALLOCATION_FIXED = 2;
+  // Allocate through DHCP, then make the address Static for this interface
+  // row's lifetime. It is not saved in ExpectedMachine for re-ingestion. The
+  // address is not converted back to DHCP if the policy later changes. The
+  // segment guard must match the relay's selected segment when configured.
+  EXPECTED_INTERFACE_IP_ALLOCATION_RETAINED = 3;
+}
+
 message OperatingSystem {
   common.OperatingSystemId id = 1;
   string name = 2;
   optional string description = 3;
-  string tenant_organization_id = 4;
+  optional string tenant_organization_id = 4;
   OperatingSystemType type = 5;
   TenantState status = 6; // we only use some states from TenantState
   bool is_active = 7;
@@ -8967,7 +9216,7 @@ message OperatingSystem {
 message CreateOperatingSystemRequest {
   string name = 1;
   optional string description = 2;
-  string tenant_organization_id = 3;
+  optional string tenant_organization_id = 3;
   bool is_active = 4;
   bool allow_override = 5;
   bool phone_home_enabled = 6;
@@ -9179,4 +9428,90 @@ message GetMachineBootInterfacesResponse {
   // non-underlay prediction. Absent when there are no predictions or when the
   // pick refuses to guess among several undeclared NICs.
   MachineBootInterface predicted_boot_interface = 10;
+}
+
+message GetContainerRegistryCredentialRequest {
+  string registry = 1;
+}
+
+message GetContainerRegistryCredentialResponse {
+  string username = 1;
+  string password = 2;
+}
+
+message SetContainerRegistryCredentialRequest {
+  string registry = 1;
+  string username = 2;
+  string password = 3;
+}
+
+// Identifies the lifecycle authority responsible for a site prefix.
+enum SitePrefixAuthority {
+  SITE_PREFIX_AUTHORITY_UNSPECIFIED = 0;
+  SITE_PREFIX_AUTHORITY_CONFIGURED = 1;
+  SITE_PREFIX_AUTHORITY_TENANT_MANAGED = 2;
+}
+
+// Describes where a site prefix may be routed.
+enum SitePrefixRoutingScope {
+  SITE_PREFIX_ROUTING_SCOPE_UNSPECIFIED = 0;
+  SITE_PREFIX_ROUTING_SCOPE_DATACENTER_ONLY = 1;
+}
+
+// Describes the current lifecycle state of a site prefix.
+enum SitePrefixLifecycleState {
+  SITE_PREFIX_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  SITE_PREFIX_LIFECYCLE_STATE_PROVISIONING = 1;
+  SITE_PREFIX_LIFECYCLE_STATE_READY = 2;
+  SITE_PREFIX_LIFECYCLE_STATE_DELETING = 3;
+  SITE_PREFIX_LIFECYCLE_STATE_ERROR = 4;
+}
+
+// A site-level prefix that may contain VPC address space.
+message SitePrefix {
+  common.SitePrefixId id = 1;
+  SitePrefixConfig config = 2;
+  SitePrefixStatus status = 3;
+  Metadata metadata = 4;
+  string version = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message SitePrefixConfig {
+  // IPv4 or IPv6 prefix in canonical CIDR notation.
+  string prefix = 1;
+  // Present only for tenant-managed site prefixes.
+  optional string tenant_organization_id = 2;
+  SitePrefixRoutingScope routing_scope = 3;
+}
+
+message SitePrefixStatus {
+  SitePrefixAuthority authority = 1;
+  SitePrefixLifecycleState lifecycle_state = 2;
+}
+
+// All fields are optional. An empty filter returns the complete inventory.
+message SitePrefixSearchFilter {
+  optional string tenant_organization_id = 1;
+  optional SitePrefixAuthority authority = 2;
+  optional SitePrefixRoutingScope routing_scope = 3;
+  optional SitePrefixLifecycleState lifecycle_state = 4;
+
+  // When present, prefix_match_type is required and selects how the stored
+  // site prefix is compared with this CIDR.
+  optional string prefix_match = 5;
+  optional PrefixMatchType prefix_match_type = 6;
+}
+
+message SitePrefixesByIdsRequest {
+  repeated common.SitePrefixId site_prefix_ids = 1;
+}
+
+message SitePrefixIdList {
+  repeated common.SitePrefixId site_prefix_ids = 1;
+}
+
+message SitePrefixList {
+  repeated SitePrefix site_prefixes = 1;
 }

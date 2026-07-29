@@ -19,14 +19,19 @@ use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::forge::{self as rpc, HealthReportEntry};
+use carbide_instrument::{Event, emit};
 use carbide_rack::firmware_object::{
     rack_maintenance_access_token_key, rms_access_token_or_noauth,
 };
-use carbide_secrets::credentials::Credentials;
+use carbide_secrets::credentials::CredentialManager;
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::power_shelf::PowerShelfId;
 use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::SwitchId;
+use component_manager::component_manager::{
+    RackMaintenanceAccessToken, RackMaintenanceEligibility, RackMaintenanceRequestOutcome,
+    request_rack_maintenance_via_state_controller,
+};
 use db::{
     ObjectColumnFilter, WithTransaction, machine as db_machine, power_shelf as db_power_shelf,
     rack as db_rack, switch as db_switch,
@@ -41,6 +46,7 @@ use tonic::{Request, Response, Status};
 use crate::CarbideError;
 use crate::api::{Api, log_request_data, log_request_data_redacted};
 use crate::auth::AuthContext;
+use crate::handlers::component_manager::component_manager_error_to_status;
 
 pub async fn get_rack(
     api: &Api,
@@ -54,7 +60,7 @@ pub async fn get_rack(
 
     let racks = if let Some(id) = req.id {
         let rack_id = RackId::from_str(&id)
-            .map_err(|e| CarbideError::InvalidArgument(format!("Invalid rack ID: {}", e)))?;
+            .map_err(|e| CarbideError::InvalidArgument(format!("invalid rack ID: {}", e)))?;
         db_rack::find_by(
             reader.as_mut(),
             ObjectColumnFilter::One(db_rack::IdColumn, &rack_id),
@@ -125,7 +131,7 @@ pub async fn find_by_ids(
         result.push(rack.into());
     }
 
-    let _ = txn.rollback().await;
+    txn.rollback_or_log("read-only load of racks by id").await;
 
     Ok(Response::new(rpc::RackList { racks: result }))
 }
@@ -185,7 +191,7 @@ pub async fn delete_rack(
     api.with_txn(|txn| {
         async move {
             let rack_id = RackId::from_str(&req.id)
-                .map_err(|e| CarbideError::InvalidArgument(format!("Invalid rack ID: {}", e)))?;
+                .map_err(|e| CarbideError::InvalidArgument(format!("invalid rack ID: {}", e)))?;
             let _rack = db_rack::find_by(
                 txn.as_mut(),
                 ObjectColumnFilter::One(db_rack::IdColumn, &rack_id),
@@ -209,6 +215,38 @@ pub async fn delete_rack(
     })
     .await??;
     Ok(Response::new(()))
+}
+
+#[derive(Event)]
+#[event(
+    event_name = "rack_force_delete_access_token_cleanup_failed",
+    metric_name = "carbide_rack_maintenance_access_token_cleanup_failures_total",
+    component = "nico-api",
+    log = warn,
+    metric = counter,
+    message = "failed to delete rack maintenance access token during force delete",
+    describe = "Number of rack maintenance access token cleanup failures"
+)]
+struct RackForceDeleteAccessTokenCleanupFailed {
+    #[context]
+    rack_id: RackId,
+    #[context]
+    error: String,
+}
+
+async fn delete_rack_maintenance_access_token_after_force_delete(
+    credential_manager: &dyn CredentialManager,
+    rack_id: &RackId,
+) {
+    if let Err(error) = credential_manager
+        .delete_credentials(&rack_maintenance_access_token_key(rack_id))
+        .await
+    {
+        emit(RackForceDeleteAccessTokenCleanupFailed {
+            rack_id: rack_id.clone(),
+            error: error.to_string(),
+        });
+    }
 }
 
 /// Force deletes a rack from the database.
@@ -248,17 +286,11 @@ pub async fn admin_force_delete_rack(
 
     txn.commit().await?;
 
-    if let Err(error) = api
-        .credential_manager
-        .delete_credentials(&rack_maintenance_access_token_key(&rack_id))
-        .await
-    {
-        tracing::warn!(
-            rack_id = %rack_id,
-            error = %error,
-            "failed to delete rack maintenance access token during force delete",
-        );
-    }
+    delete_rack_maintenance_access_token_after_force_delete(
+        api.credential_manager.as_ref(),
+        &rack_id,
+    )
+    .await;
 
     Ok(Response::new(rpc::AdminForceDeleteRackResponse {
         rack_id: rack_id.to_string(),
@@ -567,7 +599,7 @@ pub(crate) async fn on_demand_rack_maintenance(
         RackState::Ready | RackState::Error { .. }
     ) {
         return Err(CarbideError::InvalidArgument(format!(
-            "Rack {} is not in Ready or Error state (current: {:?}). Maintenance can only be requested when the rack is Ready or in Error.",
+            "rack {} is not in ready or error state (current: {:?}). maintenance can only be requested when the rack is ready or in error",
             rack_id, *rack.controller_state
         ))
         .into());
@@ -575,7 +607,7 @@ pub(crate) async fn on_demand_rack_maintenance(
 
     if rack.config.maintenance_requested.is_some() {
         return Err(CarbideError::InvalidArgument(format!(
-            "On-demand maintenance for rack {} is already scheduled.",
+            "on-demand maintenance for rack {} is already scheduled",
             rack_id,
         ))
         .into());
@@ -639,7 +671,7 @@ pub(crate) async fn on_demand_rack_maintenance(
             Some(ProtoActivity::PowerSequence(_)) => MaintenanceActivity::PowerSequence,
             None => {
                 return Err(CarbideError::InvalidArgument(
-                    "Maintenance activity entry has no activity set".into(),
+                    "maintenance activity entry has no activity set".into(),
                 )
                 .into());
             }
@@ -653,19 +685,19 @@ pub(crate) async fn on_demand_rack_maintenance(
             .iter()
             .map(|s| MachineId::from_str(s))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CarbideError::InvalidArgument(format!("Invalid machine_id: {e}")))?,
+            .map_err(|e| CarbideError::InvalidArgument(format!("invalid machine_id: {e}")))?,
         switch_ids: proto_scope
             .switch_ids
             .iter()
             .map(|s| SwitchId::from_str(s))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CarbideError::InvalidArgument(format!("Invalid switch_id: {e}")))?,
+            .map_err(|e| CarbideError::InvalidArgument(format!("invalid switch_id: {e}")))?,
         power_shelf_ids: proto_scope
             .power_shelf_ids
             .iter()
             .map(|s| PowerShelfId::from_str(s))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CarbideError::InvalidArgument(format!("Invalid power_shelf_id: {e}")))?,
+            .map_err(|e| CarbideError::InvalidArgument(format!("invalid power_shelf_id: {e}")))?,
         activities,
     };
 
@@ -766,62 +798,156 @@ pub(crate) async fn on_demand_rack_maintenance(
         }
     }
 
-    let access_token_stored = maintenance_access_token.is_some();
-    if let Some(token) = maintenance_access_token {
-        api.credential_manager
-            .set_credentials(
-                &rack_maintenance_access_token_key(&rack_id),
-                &Credentials::UsernamePassword {
-                    username: "access_token".into(),
-                    password: token,
-                },
-            )
-            .await
-            .map_err(|error| CarbideError::Internal {
-                message: format!("failed to store rack maintenance access token: {error}"),
-            })?;
-    }
+    let maintenance_access_token =
+        maintenance_access_token.map(|token| RackMaintenanceAccessToken {
+            credential_manager: api.credential_manager.as_ref(),
+            token,
+        });
 
-    let mut updated_config = rack.config.clone();
-    updated_config.maintenance_requested = Some(scope);
-
-    let db_result: Result<(), Status> = async {
-        let mut txn = api.txn_begin().await?;
-        db_rack::update(&mut txn, &rack_id, &updated_config).await?;
-        if updated_config
-            .maintenance_requested
-            .as_ref()
-            .is_some_and(|scope| {
-                scope.should_run(&MaintenanceActivity::FirmwareUpgrade {
-                    firmware_version: None,
-                    components: vec![],
-                    force_update: false,
-                })
-            })
-        {
-            db_rack::update_firmware_upgrade_job(txn.as_mut(), &rack_id, None).await?;
-        }
-        txn.commit().await?;
-        Ok(())
-    }
+    let schedule_result = request_rack_maintenance_via_state_controller(
+        &api.database_connection,
+        &rack_id,
+        scope,
+        RackMaintenanceEligibility::AllowErrorRecovery,
+        maintenance_access_token,
+    )
     .await;
-    if let Err(status) = db_result {
-        if access_token_stored
-            && let Err(error) = api
-                .credential_manager
-                .delete_credentials(&rack_maintenance_access_token_key(&rack_id))
-                .await
-        {
-            tracing::warn!(
-                rack_id = %rack_id,
-                error = %error,
-                "failed to delete rack maintenance access token after DB error",
-            );
-        }
+
+    let scheduling_error = match schedule_result {
+        Ok(
+            RackMaintenanceRequestOutcome::Scheduled
+            | RackMaintenanceRequestOutcome::AlreadyPending,
+        ) => None,
+        Ok(RackMaintenanceRequestOutcome::Busy) => Some(
+            CarbideError::InvalidArgument(format!(
+                "on-demand maintenance for rack {} is already scheduled",
+                rack_id,
+            ))
+            .into(),
+        ),
+        Ok(RackMaintenanceRequestOutcome::Deferred { state }) => Some(
+            CarbideError::InvalidArgument(format!(
+                "rack {} is not in ready or error state (current: {:?}). maintenance can only be requested when the rack is ready or in error",
+                rack_id, state,
+            ))
+            .into(),
+        ),
+        Err(error) => Some(component_manager_error_to_status(error)),
+    };
+
+    if let Some(status) = scheduling_error {
         return Err(status);
     }
 
-    tracing::info!("On-demand maintenance scheduled for rack {}", rack_id,);
+    tracing::info!(
+        rack_id = %rack_id,
+        "On-demand maintenance scheduled",
+    );
 
     Ok(Response::new(rpc::RackMaintenanceOnDemandResponse {}))
+}
+
+#[cfg(test)]
+mod tests {
+    use carbide_instrument::testing::{MetricsCapture, capture_logs};
+    use carbide_secrets::test_support::credentials::TestCredentialManager;
+
+    use super::*;
+
+    const ACCESS_TOKEN_CLEANUP_FAILURE_METRIC: &str =
+        "carbide_rack_maintenance_access_token_cleanup_failures_total";
+
+    #[derive(Debug, PartialEq)]
+    struct AccessTokenCleanupObservation {
+        counter_delta: f64,
+        log_count: usize,
+        level: Option<tracing::Level>,
+        metadata_name: Option<String>,
+        message: Option<String>,
+        event_name: Option<String>,
+        metric_name: Option<String>,
+        rack_id: Option<String>,
+        error: Option<String>,
+    }
+
+    #[test]
+    fn rack_force_delete_access_token_cleanup_emits_only_on_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let rack_id = RackId::from("rack-1");
+
+        carbide_test_support::value_scenarios!(
+            run = |delete_fails: bool| {
+                let credential_manager = TestCredentialManager::default();
+                credential_manager.set_delete_credentials_failure(delete_fails);
+                let metrics = MetricsCapture::start();
+                let logs = capture_logs(|| {
+                    runtime.block_on(delete_rack_maintenance_access_token_after_force_delete(
+                        &credential_manager,
+                        &rack_id,
+                    ));
+                })
+                .into_iter()
+                .filter(|log| {
+                    log.field("event_name")
+                        == Some("rack_force_delete_access_token_cleanup_failed")
+                })
+                .collect::<Vec<_>>();
+                let log = logs.first();
+
+                AccessTokenCleanupObservation {
+                    counter_delta: metrics
+                        .counter_delta(ACCESS_TOKEN_CLEANUP_FAILURE_METRIC, &[]),
+                    log_count: logs.len(),
+                    level: log.map(|log| log.level),
+                    metadata_name: log.map(|log| log.metadata_name.clone()),
+                    message: log.map(|log| log.message.clone()),
+                    event_name: log
+                        .and_then(|log| log.field("event_name"))
+                        .map(str::to_string),
+                    metric_name: log
+                        .and_then(|log| log.field("metric_name"))
+                        .map(str::to_string),
+                    rack_id: log
+                        .and_then(|log| log.field("rack_id"))
+                        .map(str::to_string),
+                    error: log.and_then(|log| log.field("error")).map(str::to_string),
+                }
+            };
+            "credential cleanup outcome" {
+                false => AccessTokenCleanupObservation {
+                    counter_delta: 0.0,
+                    log_count: 0,
+                    level: None,
+                    metadata_name: None,
+                    message: None,
+                    event_name: None,
+                    metric_name: None,
+                    rack_id: None,
+                    error: None,
+                },
+                true => AccessTokenCleanupObservation {
+                    counter_delta: 1.0,
+                    log_count: 1,
+                    level: Some(tracing::Level::WARN),
+                    metadata_name: Some(
+                        "rack_force_delete_access_token_cleanup_failed".to_string(),
+                    ),
+                    message: Some(
+                        "failed to delete rack maintenance access token during force delete"
+                            .to_string(),
+                    ),
+                    event_name: Some(
+                        "rack_force_delete_access_token_cleanup_failed".to_string(),
+                    ),
+                    metric_name: Some(ACCESS_TOKEN_CLEANUP_FAILURE_METRIC.to_string()),
+                    rack_id: Some("rack-1".to_string()),
+                    error: Some(
+                        "Secrets operation failed: test credential delete failure".to_string(),
+                    ),
+                },
+            }
+        );
+    }
 }

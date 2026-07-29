@@ -33,10 +33,12 @@
 //!
 //! #[derive(Event)]
 //! #[event(
-//!     name      = "carbide_power_control_total", // the exposed name, verbatim
+//!     event_name  = "power_control_failed",       // stable event identity
+//!     metric_name = "carbide_power_control_total", // exposed verbatim
 //!     component = "component_manager",
 //!     log       = warn,                          // error|warn|info|debug|trace|off
 //!     metric    = counter,                       // counter | histogram | none
+//!     describe  = "Number of power control operations that failed", // counter HELP text
 //!     message   = "power control failed",
 //! )]
 //! struct PowerControlFailed {
@@ -69,11 +71,195 @@
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "carbide_demo_total", component = "demo", log = off, metric = counter)]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total",
+//!         component = "demo", log = off, metric = counter,
+//!         describe = "Number of demo events")]
 //! struct Demo {
 //!     #[label]
 //!     machine_id: String, // ERROR: String is not a LabelValue
 //! }
+//! ```
+//!
+//! `#[context]` formats through `Display` by default. `#[context(value)]` is
+//! the opt-in for fields whose tracing type is part of the structured-log
+//! contract; it accepts `bool`, `i64`, `f64`, or `String`:
+//!
+//! ```
+//! #[derive(carbide_instrument::Event)]
+//! #[event(
+//!     event_name = "retry_scheduled",
+//!     component = "demo",
+//!     message = "retry scheduled"
+//! )]
+//! struct RetryScheduled {
+//!     #[context(value)]
+//!     retry_interval_seconds: f64,
+//! }
+//! ```
+//!
+//! `#[label(name = "component")]` exists for a frozen metric key that cannot
+//! also be the Rust field name because Event logs reserve `component`. For a
+//! field such as `publisher: Publisher`, the metric keeps `component` while
+//! the generated log keeps `publisher`. Context and observation fields do not
+//! support this compatibility alias.
+//!
+//! # One metric, several events
+//!
+//! When a second event needs the same metric, declare the metric once as a
+//! [`MetricFamily`] and point both events at it. The family owns the name, the
+//! kind, the description, the component, and the label set; each event states
+//! only its own identity, level, message, and context:
+//!
+//! ```
+//! use carbide_instrument::{Event, LabelValue, MetricFamily, Outcome, emit};
+//!
+//! #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
+//! enum Stage {
+//!     Fetch,
+//!     Persist,
+//! }
+//!
+//! #[derive(MetricFamily)]
+//! #[metric(
+//!     name = "carbide_inventory_failures_total",
+//!     kind = counter,                       // counter | histogram
+//!     component = "site_explorer",
+//!     describe = "Number of inventory failures, by stage and outcome",
+//! )]
+//! struct InventoryFailures {
+//!     stage: Stage, // every field is a label
+//!     outcome: Outcome,
+//! }
+//!
+//! #[derive(Event)]
+//! #[event(
+//!     event_name = "inventory_fetch_failed",
+//!     metric_family = InventoryFailures,           // the family, not a kind
+//!     log = warn,
+//!     message = "inventory fetch failed",
+//! )]
+//! struct FetchFailed {
+//!     #[label]
+//!     stage: Stage,
+//!     #[label]
+//!     outcome: Outcome,
+//!     #[context]
+//!     error: String, // this event's own detail
+//! }
+//!
+//! emit(FetchFailed {
+//!     stage: Stage::Fetch,
+//!     outcome: Outcome::Error,
+//!     error: "deadline exceeded".to_string(),
+//! });
+//! ```
+//!
+//! The event still declares its `#[label]` fields, so its log line is
+//! unchanged -- the derive builds the family from them by name, which is what
+//! holds the two sides together. A label the family does not know, or one it
+//! knows and the event forgot, is an ordinary compile error:
+//!
+//! ```compile_fail
+//! # use carbide_instrument::{Event, LabelValue, MetricFamily, Outcome};
+//! # #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
+//! # enum Stage { Fetch }
+//! # #[derive(MetricFamily)]
+//! # #[metric(name = "carbide_demo_family_total", kind = counter, component = "demo",
+//! #          describe = "Number of demo failures")]
+//! # struct DemoFailures { stage: Stage, outcome: Outcome }
+//! #[derive(Event)]
+//! #[event(event_name = "demo_failed", metric_family = DemoFailures, log = warn, message = "demo")]
+//! struct DemoFailed {
+//!     #[label]
+//!     stage: Stage, // ERROR: missing field `outcome` in initializer of `DemoFailures`
+//! }
+//! ```
+//!
+//! ## A label the family computes
+//!
+//! Sometimes one label is a function of another -- a failure *kind* that
+//! follows from the *stage* it failed at. Declaring both invites a call site to
+//! pair them wrongly, so the family can compute one instead:
+//!
+//! ```
+//! use carbide_instrument::{Event, LabelValue, MetricFamily, emit};
+//!
+//! #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
+//! enum Stage {
+//!     Decode,
+//!     Publish,
+//! }
+//!
+//! #[derive(Debug, Clone, Copy, PartialEq, Eq, LabelValue)]
+//! enum Kind {
+//!     InvalidRequest,
+//!     Rpc,
+//! }
+//!
+//! impl From<Stage> for Kind {
+//!     fn from(stage: Stage) -> Self {
+//!         match stage {
+//!             Stage::Decode => Kind::InvalidRequest,
+//!             Stage::Publish => Kind::Rpc,
+//!         }
+//!     }
+//! }
+//!
+//! #[derive(MetricFamily)]
+//! #[metric(
+//!     name = "carbide_ingest_failures_total",
+//!     kind = counter,
+//!     component = "ingest",
+//!     describe = "Number of ingest failures, by stage and kind",
+//! )]
+//! #[derived(kind: Kind, from = stage)] // computed, never supplied
+//! struct IngestFailures {
+//!     stage: Stage,
+//! }
+//!
+//! #[derive(Event)]
+//! #[event(
+//!     event_name = "ingest_failed",
+//!     metric_family = IngestFailures,
+//!     log = warn,
+//!     message = "ingest failed",
+//! )]
+//! struct IngestFailed {
+//!     #[label]
+//!     stage: Stage, // `kind` is the family's to compute; declaring it here is a compile error
+//! }
+//!
+//! emit(IngestFailed {
+//!     stage: Stage::Publish,
+//! }); // records kind="rpc"
+//! ```
+//!
+//! `kind` stays a metric label with the same values; what changes is that the
+//! family computes it through `From`, so a contradictory pair has no series to
+//! land in. A derived label is not a field of any event, so it does not appear
+//! as a log field either -- the label it reads does, and the `From` impl is the
+//! one place the mapping lives.
+//!
+//! Reach for a family only when two or more events move the same metric. A
+//! metric one event owns stays declared inline on that event -- and because
+//! the family owns the metric side, an event that names one must not restate
+//! it:
+//!
+//! ```compile_fail
+//! # use carbide_instrument::{Event, LabelValue, MetricFamily, Outcome};
+//! # #[derive(MetricFamily)]
+//! # #[metric(name = "carbide_demo_family_total", kind = counter, component = "demo",
+//! #          describe = "Number of demo failures")]
+//! # struct DemoFailures {}
+//! #[derive(Event)]
+//! #[event(
+//!     event_name = "demo_failed",
+//!     metric_family = DemoFailures,
+//!     metric_name = "carbide_demo_family_total", // ERROR: the family declares this
+//!     log = warn,
+//!     message = "demo",
+//! )]
+//! struct DemoFailed {}
 //! ```
 //!
 //! The metric name is validated at compile time -- the `carbide_` prefix, the
@@ -81,13 +267,15 @@
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "power_control_total", component = "demo", log = off, metric = counter)]
+//! #[event(event_name = "power_control", metric_name = "power_control_total",
+//!         component = "demo", log = off, metric = counter)]
 //! struct Demo {} // ERROR: metric names use the `carbide_` prefix
 //! ```
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "carbide_power_control", component = "demo", log = off, metric = counter)]
+//! #[event(event_name = "power_control", metric_name = "carbide_power_control",
+//!         component = "demo", log = off, metric = counter)]
 //! struct Demo {} // ERROR: counter names end in `_total`
 //! ```
 //!
@@ -96,31 +284,73 @@
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "carbide_demo", component = "demo", log = off, metric = none)]
+//! #[event(event_name = "demo", component = "demo", log = off, metric = none)]
 //! struct Demo {} // ERROR: declare at least one side
 //! ```
 //!
-//! `unit` belongs to histograms (and only `name_unchecked` ones -- a standard
-//! histogram name already declares its unit as the suffix), and `describe`
-//! documents a metric:
+//! `unit` belongs to histograms (and only `metric_name_unchecked` ones -- a
+//! standard histogram name already declares its unit as the suffix), and
+//! `describe` documents a metric:
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "carbide_demo_total", component = "demo", log = off, metric = counter,
-//!         unit = "s")]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total",
+//!         component = "demo", log = off, metric = counter, unit = "s")]
 //! struct Demo {} // ERROR: `unit` is only valid for histogram metrics
 //! ```
 //!
 //! ```compile_fail
 //! #[derive(carbide_instrument::Event)]
-//! #[event(name = "carbide_demo", component = "demo", message = "demo", describe = "demo")]
+//! #[event(event_name = "demo", component = "demo", message = "demo", describe = "demo")]
 //! struct Demo {} // ERROR: `describe` documents a metric; this event has metric = none
+//! ```
+//!
+//! A counter documents itself: `describe` is required and opens with
+//! "Number of ..." (the tech-writer house rule, so the `core_metrics.md`
+//! catalogue reads consistently):
+//!
+//! ```compile_fail
+//! #[derive(carbide_instrument::Event)]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total", component = "demo",
+//!         log = off, metric = counter)]
+//! struct Demo {} // ERROR: a counter must document itself with describe = "Number of ..."
+//! ```
+//!
+//! ```compile_fail
+//! #[derive(carbide_instrument::Event)]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total", component = "demo",
+//!         log = off, metric = counter, describe = "Total number of demos")]
+//! struct Demo {} // ERROR: a counter's describe opens with "Number of ..."
+//! ```
+//!
+//! A counter name ends in `_total` (Prometheus convention) but not
+//! `_total_total` -- the framework strips one `_total` before registering and
+//! the exporter appends it back, so a doubled suffix ships a `_total_total`
+//! series:
+//!
+//! ```compile_fail
+//! #[derive(carbide_instrument::Event)]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total_total", component = "demo",
+//!         log = off, metric = counter, describe = "Number of demos")]
+//! struct Demo {} // ERROR: counter name ends in `_total_total`
+//! ```
+//!
+//! Both checks have a greppable escape hatch for grandfathered metrics --
+//! `describe_unchecked` for the text, `metric_name_unchecked` for the name:
+//!
+//! ```
+//! #[derive(carbide_instrument::Event)]
+//! #[event(event_name = "demo", metric_name = "carbide_demo_total_total", component = "demo",
+//!         log = off, metric = counter, metric_name_unchecked,
+//!         describe = "Total number of demos", describe_unchecked)]
+//! struct Demo {}
 //! ```
 
 use std::time::Duration;
 
-/// The derive macros: `#[derive(Event)]` and `#[derive(LabelValue)]`.
-pub use carbide_instrument_macros::{Event, LabelValue};
+/// The derive macros: `#[derive(Event)]`, `#[derive(LabelValue)]`, and
+/// `#[derive(MetricFamily)]`.
+pub use carbide_instrument_macros::{Event, LabelValue, MetricFamily};
 use opentelemetry::{KeyValue, StringValue};
 
 /// Whether (and at which level) an event writes a log line.
@@ -138,9 +368,9 @@ pub enum LogAt {
 /// Which metric instrument an event updates, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
-    /// A monotonic counter; the event name must end in `_total`.
+    /// A monotonic counter; the metric name must end in `_total`.
     Counter,
-    /// A histogram of [`Event::observation`] values; the event name must end
+    /// A histogram of [`Event::observation`] values; the metric name must end
     /// in its unit (`_seconds`, `_milliseconds`, `_microseconds`, `_bytes`).
     Histogram {
         /// The OpenTelemetry unit string, derived from the name suffix.
@@ -216,14 +446,19 @@ wide_observation!(u64, usize, i64);
 
 /// A significant occurrence, declared once as a type.
 ///
-/// Implemented with `#[derive(Event)]` (see the crate docs); hand
-/// implementations are possible but rare. Emitting an event produces a log
-/// line and/or a metric per the [`LogAt`] and [`MetricKind`] knobs -- each
-/// side independently optional.
+/// Implemented with `#[derive(Event)]` (see the crate docs). Production hand
+/// implementations are unsupported because they bypass identity validation
+/// and the workspace uniqueness check. Emitting an event produces a log line
+/// and/or a metric per the [`LogAt`] and [`MetricKind`] knobs -- each side
+/// independently optional.
 pub trait Event {
-    /// The exposed metric name, verbatim (derive-validated), or the event's
-    /// identity for log-only events.
-    const NAME: &'static str;
+    /// Stable semantic identity for this event, rendered as `event_name` on
+    /// Event-generated log lines.
+    const EVENT_NAME: &'static str;
+    /// The exposed metric name, verbatim and derive-validated. Exactly `Some`
+    /// when [`Self::METRIC`] records a metric; `None` for a typed log with
+    /// `metric = none`.
+    const METRIC_NAME: Option<&'static str>;
     /// The owning subsystem, for tooling and test assertions. The logfmt
     /// `component` key on log lines continues to come from the subscriber
     /// configuration and span attributes, as everywhere else.
@@ -267,12 +502,55 @@ pub trait Event {
     fn __instrument(&self) -> &'static __private::CachedInstrument;
 }
 
+/// A Prometheus metric family: one name, one instrument kind, one description,
+/// and one closed set of label dimensions, declared once and shared by every
+/// [`Event`] that moves it.
+///
+/// Implemented with `#[derive(MetricFamily)]` on a struct whose fields are the
+/// family's labels. An Event names the family with `#[event(metric_family = Family)]`
+/// and keeps supplying the labels as its own `#[label]` fields; the derive
+/// builds the family from them by name, so a missing or misnamed label is an
+/// ordinary compile error instead of a metric that quietly exports a second
+/// label set.
+///
+/// Reach for a family when two or more Events move the same metric. A metric
+/// only one Event moves stays declared inline on that Event.
+///
+/// Because the derive builds the family with a struct literal, its fields must
+/// be visible wherever an Event that names it is declared -- private fields are
+/// fine for a family and its Events in one module, and a family shared across
+/// modules or crates declares `pub` fields. A family's label types are also
+/// [`Clone`], which every derived [`LabelValue`] enum already is; the derive
+/// reports a label type that is not, at the family rather than at each Event.
+pub trait MetricFamily {
+    /// The exposed metric name, verbatim and derive-validated.
+    const METRIC_NAME: &'static str;
+    /// The owning subsystem, for tooling and test assertions. As with
+    /// [`Event::COMPONENT`], the logfmt `component` key on log lines still
+    /// comes from the subscriber configuration and span attributes.
+    const COMPONENT: &'static str;
+    /// The metric's description: the Prometheus HELP text, and the row the
+    /// `core_metrics.md` catalogue picks up.
+    const DESCRIBE: &'static str = "";
+    /// The instrument this family registers.
+    const METRIC: MetricKind;
+    /// The label array, sized by the derive -- no heap allocation on emit.
+    type Labels: AsRef<[KeyValue]>;
+
+    /// The family's bounded labels, attached to the metric and, through the
+    /// declaring Event, to the log line.
+    fn labels(&self) -> Self::Labels;
+
+    #[doc(hidden)]
+    fn __instrument() -> &'static __private::CachedInstrument;
+}
+
 /// Emits an event: a log line and/or a metric, per the event's knobs.
 ///
 /// Never panics. The metric side resolves its instrument once per event type
-/// (a `OnceLock`) from the global OpenTelemetry meter -- install the meter
-/// provider at startup, before the first emit, as every NICo binary already
-/// does for its existing metrics.
+/// -- or once per [`MetricFamily`], for an Event that names one -- from the
+/// global OpenTelemetry meter. Install the meter provider at startup, before
+/// the first emit, as every NICo binary already does for its existing metrics.
 pub fn emit<E: Event>(event: E) {
     if let LogAt::Level(level) = event.log_at() {
         event.__log(level);
@@ -285,6 +563,29 @@ pub fn emit<E: Event>(event: E) {
             histogram.record(event.observation(), event.labels().as_ref());
         }
         __private::CachedInstrument::None => {}
+    }
+}
+
+/// `initialize_counter_series` exposes one Event counter label set at zero
+/// without writing the Event's log line. It uses the same cached instrument as
+/// [`emit`], so the global meter provider must already be installed before this
+/// call. Context fields are ignored; only the Event's bounded labels select the
+/// series.
+///
+/// Returns `false` without registering anything when `event` does not declare
+/// `metric = counter`.
+#[must_use = "a false result means the Event is not a counter"]
+pub fn initialize_counter_series<E: Event>(event: &E) -> bool {
+    if !matches!(E::METRIC, MetricKind::Counter) {
+        return false;
+    }
+
+    match event.__instrument() {
+        __private::CachedInstrument::Counter(counter) => {
+            counter.add(0, event.labels().as_ref());
+            true
+        }
+        __private::CachedInstrument::Histogram(_) | __private::CachedInstrument::None => false,
     }
 }
 
@@ -337,20 +638,30 @@ pub mod __private {
         None,
     }
 
-    /// Builds the instrument an event type declares, from the global meter.
+    /// Builds the instrument a declaration names, from the global meter. Both
+    /// the `Event` derive (for a metric declared inline) and the
+    /// `MetricFamily` derive resolve through here, so one metric registers the
+    /// same way however it was declared.
     ///
-    /// `Event::NAME` is the *exposed* name, verbatim. The Prometheus exporter
-    /// appends the conventional suffix itself (`_total` for counters, the
-    /// unit for histograms), so the instrument registers under the name with
-    /// that suffix stripped -- what lands on `/metrics` is exactly `NAME`.
-    pub fn new_instrument<E: crate::Event>() -> CachedInstrument {
+    /// `metric_name` is the *exposed* name, verbatim. The Prometheus exporter
+    /// appends the conventional suffix itself (`_total` for counters, the unit
+    /// for histograms), so the instrument registers under the name with that
+    /// suffix stripped -- what lands on `/metrics` is exactly `metric_name`.
+    pub fn new_instrument(
+        metric_name: Option<&'static str>,
+        metric: crate::MetricKind,
+        describe: &'static str,
+    ) -> CachedInstrument {
         let meter = opentelemetry::global::meter("carbide-instrument");
-        match E::METRIC {
+        let Some(metric_name) = metric_name else {
+            return CachedInstrument::None;
+        };
+        match metric {
             crate::MetricKind::Counter => {
-                let name = E::NAME.strip_suffix("_total").unwrap_or(E::NAME);
+                let name = metric_name.strip_suffix("_total").unwrap_or(metric_name);
                 let mut builder = meter.u64_counter(name);
-                if !E::DESCRIBE.is_empty() {
-                    builder = builder.with_description(E::DESCRIBE);
+                if !describe.is_empty() {
+                    builder = builder.with_description(describe);
                 }
                 CachedInstrument::Counter(builder.build())
             }
@@ -363,20 +674,37 @@ pub mod __private {
                     _ => "",
                 };
                 let name = if suffix.is_empty() {
-                    E::NAME
+                    metric_name
                 } else {
-                    E::NAME.strip_suffix(suffix).unwrap_or(E::NAME)
+                    metric_name.strip_suffix(suffix).unwrap_or(metric_name)
                 };
                 let mut builder = meter.f64_histogram(name);
                 if !unit.is_empty() {
                     builder = builder.with_unit(unit);
                 }
-                if !E::DESCRIBE.is_empty() {
-                    builder = builder.with_description(E::DESCRIBE);
+                if !describe.is_empty() {
+                    builder = builder.with_description(describe);
                 }
                 CachedInstrument::Histogram(builder.build())
             }
             crate::MetricKind::None => CachedInstrument::None,
+        }
+    }
+
+    /// Whether a declared metric records a histogram. The `Event` derive uses
+    /// this in a `const` assertion: an Event that names a histogram family
+    /// needs an `#[observation]` field, and the family's kind is only known at
+    /// the type level from the Event's declaration site.
+    pub const fn is_histogram(metric: crate::MetricKind) -> bool {
+        matches!(metric, crate::MetricKind::Histogram { .. })
+    }
+
+    /// The unit a declared metric records in, for converting an
+    /// `#[observation]` when the kind lives on a `MetricFamily`.
+    pub const fn metric_unit(metric: crate::MetricKind) -> &'static str {
+        match metric {
+            crate::MetricKind::Histogram { unit } => unit,
+            crate::MetricKind::Counter | crate::MetricKind::None => "",
         }
     }
 }
@@ -390,9 +718,38 @@ pub trait DynamicLog {
     fn log_at(&self) -> LogAt;
 }
 
+/// Per-instance message selection for `message = dynamic` events: implement
+/// this and the derive routes `Event::message` through it, choosing the log
+/// message from the event's own fields. Return a distinct `&'static str` per
+/// case, e.g. by matching on a `#[label]` enum. Reach for it only when the
+/// wording says something a label doesn't: where the label already names the
+/// case, a static `message` plus that label is the leaner choice.
+pub trait DynamicMessage {
+    /// The message for this instance's log line.
+    fn message(&self) -> &'static str;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(carbide_instrument::Event)]
+    #[event(
+        event_name = "metric_only_reserved_labels",
+        metric_name = "carbide_metric_only_reserved_labels_total",
+        component = "instrument_test",
+        log = off,
+        metric = counter,
+        describe = "Number of metric-only reserved-label test events",
+    )]
+    struct MetricOnlyReservedLabels {
+        #[label]
+        component: carbide_instrument::Outcome,
+        #[label]
+        event_name: carbide_instrument::Outcome,
+        #[label]
+        metric_name: carbide_instrument::Outcome,
+    }
 
     #[test]
     fn outcome_from_result() {
@@ -437,5 +794,76 @@ mod tests {
     fn numeric_observations_ignore_the_unit() {
         assert!((42u64.observe_as("ms") - 42.0).abs() < f64::EPSILON);
         assert!((2.5f64.observe_as("s") - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metric_only_reserved_labels_have_no_log_surface() {
+        let event = MetricOnlyReservedLabels {
+            component: carbide_instrument::Outcome::Ok,
+            event_name: carbide_instrument::Outcome::Ok,
+            metric_name: carbide_instrument::Outcome::Ok,
+        };
+
+        assert_eq!(carbide_instrument::Event::labels(&event).len(), 3);
+        assert_eq!(
+            carbide_instrument::Event::log_at(&event),
+            carbide_instrument::LogAt::Off
+        );
+    }
+
+    #[derive(carbide_instrument::Event)]
+    #[event(
+        event_name = "dynamic_message_test",
+        component = "instrument_test",
+        log = dynamic,
+        message = dynamic,
+    )]
+    struct DynamicMessageTest {
+        #[label]
+        outcome: carbide_instrument::Outcome,
+    }
+
+    impl carbide_instrument::DynamicLog for DynamicMessageTest {
+        fn log_at(&self) -> carbide_instrument::LogAt {
+            match self.outcome {
+                carbide_instrument::Outcome::Error => {
+                    carbide_instrument::LogAt::Level(tracing::Level::WARN)
+                }
+                carbide_instrument::Outcome::Ok => carbide_instrument::LogAt::Off,
+            }
+        }
+    }
+
+    impl carbide_instrument::DynamicMessage for DynamicMessageTest {
+        fn message(&self) -> &'static str {
+            match self.outcome {
+                carbide_instrument::Outcome::Error => "call failed",
+                carbide_instrument::Outcome::Ok => "call finished",
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_message_selects_wording_per_variant() {
+        let ok = DynamicMessageTest {
+            outcome: carbide_instrument::Outcome::Ok,
+        };
+        let err = DynamicMessageTest {
+            outcome: carbide_instrument::Outcome::Error,
+        };
+
+        // `message = dynamic` routes `Event::message` through `DynamicMessage`.
+        assert_eq!(carbide_instrument::Event::message(&ok), "call finished");
+        assert_eq!(carbide_instrument::Event::message(&err), "call failed");
+
+        // The message axis is independent of the level axis (`DynamicLog`).
+        assert_eq!(
+            carbide_instrument::Event::log_at(&ok),
+            carbide_instrument::LogAt::Off
+        );
+        assert_eq!(
+            carbide_instrument::Event::log_at(&err),
+            carbide_instrument::LogAt::Level(tracing::Level::WARN)
+        );
     }
 }

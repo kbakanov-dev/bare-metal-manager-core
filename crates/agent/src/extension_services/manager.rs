@@ -60,7 +60,12 @@ impl ExtensionServiceManager {
         self.service_handlers
             .get_mut(t)
             .map(|handler| handler.as_mut() as &mut dyn ExtensionServiceHandler)
-            .ok_or_else(|| eyre::eyre!("No handler for {:?}", t))
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "extension service type {:?} is not supported on this DPU",
+                    t
+                )
+            })
     }
 
     pub async fn update_desired_services(
@@ -73,7 +78,7 @@ impl ExtensionServiceManager {
         for config in configs {
             let service = ServiceConfig::try_from(config).map_err(|e| {
                 eyre::eyre!(
-                    "Failed to convert ManagedHostDpuExtensionServiceConfig to ServiceConfig: {}",
+                    "failed to convert ManagedHostDpuExtensionServiceConfig to ServiceConfig: {}",
                     e
                 )
             })?;
@@ -101,15 +106,34 @@ impl ExtensionServiceManager {
             .into_iter()
             .map(|c| {
                 ServiceConfig::try_from(c).map_err(|e| eyre::eyre!(
-                "Failed to convert ManagedHostDpuExtensionServiceConfig to ServiceConfig: {e}"
+                "failed to convert ManagedHostDpuExtensionServiceConfig to ServiceConfig: {e}"
             ))
             })
             .collect::<Result<_, _>>()?;
 
         let mut service_statuses = Vec::with_capacity(service_configs.len());
         for service in service_configs {
-            let handler = self.get_handler_mut(&service.service_type).unwrap();
-            let status = handler.get_service_status(&service).await?;
+            let status = match self.get_handler_mut(&service.service_type) {
+                Ok(handler) => handler.get_service_status(&service).await?,
+                Err(err) => {
+                    tracing::error!(
+                        service_id = %service.id,
+                        error = %err,
+                        "Error getting extension service status"
+                    );
+                    rpc::DpuExtensionServiceStatusObservation {
+                        service_id: service.id.to_string(),
+                        service_type: service.service_type.into(),
+                        service_name: service.name,
+                        version: service.version.to_string(),
+                        removed: service.removed,
+                        state: rpc::DpuExtensionServiceDeploymentStatus::DpuExtensionServiceError
+                            .into(),
+                        components: vec![],
+                        message: err.to_string(),
+                    }
+                }
+            };
             service_statuses.push(status);
         }
 

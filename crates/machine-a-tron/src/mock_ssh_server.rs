@@ -23,7 +23,7 @@ use eyre::Context;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
 use russh::keys::PublicKeyBase64;
-use russh::server::{Auth, Config, Msg, Server as _, Session, run_stream};
+use russh::server::{Auth, ChannelOpenHandle, Config, Msg, Server as _, Session, run_stream};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty, server};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -119,7 +119,10 @@ impl Server {
                             tokio::spawn(async move {
                                 if config.nodelay
                                     && let Err(e) = socket.set_nodelay(true) {
-                                        tracing::warn!("set_nodelay() failed: {e:?}");
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "set_nodelay failed",
+                                        );
                                     }
 
                                 let session = match run_stream(config, socket, handler).await {
@@ -229,10 +232,12 @@ impl server::Handler for MockSshHandler {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> StdResult<bool, Self::Error> {
+    ) -> StdResult<(), Self::Error> {
         tracing::debug!("channel_open_session");
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -283,7 +288,8 @@ impl server::Handler for MockSshHandler {
                 Ok(server::Auth::Accept)
             } else {
                 tracing::info!(
-                    "got incorrect auth_password, rejecting. user={user}, password={password}"
+                    user = %user,
+                    "Incorrect SSH password; rejecting authentication",
                 );
                 Ok(server::Auth::Reject {
                     proceed_with_methods: None,
@@ -292,7 +298,8 @@ impl server::Handler for MockSshHandler {
             }
         } else {
             tracing::info!(
-                "configured to accept any credentials, accepting user={user}, password={password}"
+                user = %user,
+                "Accepting SSH credentials because any credentials are allowed",
             );
             Ok(server::Auth::Accept)
         }
@@ -367,8 +374,8 @@ impl server::Handler for MockSshHandler {
                         (b"\x1c", PromptBehavior::Dell) => {
                             // ssh-console should have prevented this, make it a warning.
                             tracing::warn!(
-                                "Got ctrl+\\ in system console, dropping to BMC prompt {:?}",
-                                self.console_state
+                                console_state = ?self.console_state,
+                                "Got ctrl+\\ in system console, dropping to BMC prompt",
                             );
                             // ctrl+\
                             self.console_state = ConsoleState::Bmc;

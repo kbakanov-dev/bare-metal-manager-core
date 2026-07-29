@@ -29,6 +29,22 @@ use crate::certificate::{
     poll_configure_switch_certificate_job, start_configure_switch_certificate,
 };
 use crate::context::SwitchStateHandlerContextObjects;
+use crate::nvos_password_rotation::{
+    NvosPasswordRotationOutcome, expected_nvos_credential_pair, read_nvos_site_credentials,
+    reconcile_nvos_password_rotation,
+};
+
+/// Result of resolving the current per-switch NVOS credential.
+pub(crate) enum NvosAdminCredentialStatus {
+    /// A credential is available to resolve the component-manager endpoint.
+    Available,
+
+    /// No credential source exists, so credential-dependent work is not actionable yet.
+    Skip,
+
+    /// Credential state required to resolve a usable credential is inconsistent.
+    Error(String),
+}
 
 /// Handles the Configuring state for a switch.
 pub async fn handle_configuring(
@@ -56,126 +72,269 @@ async fn handle_rotate_os_password(
     state: &mut Switch,
     ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
 ) -> Result<StateHandlerOutcome<SwitchControllerState>, StateHandlerError> {
-    let Some(bmc_mac_address) = state.bmc_mac_address else {
-        return Ok(StateHandlerOutcome::transition(
-            SwitchControllerState::Error {
-                cause: "No BMC MAC address on switch".to_string(),
-            },
-        ));
-    };
+    match reconcile_nvos_password_rotation(switch_id, state, ctx).await? {
+        NvosPasswordRotationOutcome::UpToDate => Ok(StateHandlerOutcome::transition(
+            SwitchControllerState::FetchInfo,
+        )),
+        NvosPasswordRotationOutcome::Waiting(reason) => Ok(StateHandlerOutcome::wait(reason)),
+        NvosPasswordRotationOutcome::CredentialError(cause) => Ok(StateHandlerOutcome::transition(
+            SwitchControllerState::Error { cause },
+        )),
+    }
+}
 
+/// Persists and verifies the effective per-switch NVOS credential.
+pub(crate) async fn persist_nvos_admin_credentials(
+    switch_id: &SwitchId,
+    bmc_mac_address: mac_address::MacAddress,
+    credentials: &Credentials,
+    ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
+) -> Result<(), StateHandlerError> {
     let key = CredentialKey::SwitchNvosAdmin { bmc_mac_address };
 
-    if let Ok(Some(Credentials::UsernamePassword { .. })) =
-        ctx.services.credential_manager.get_credentials(&key).await
-    {
-        tracing::info!(
-            "Switch {:?}: NVOS admin credentials already exist in vault for BMC MAC {}",
-            switch_id,
-            bmc_mac_address
-        );
-        return Ok(StateHandlerOutcome::transition(
-            SwitchControllerState::FetchInfo,
-        ));
-    }
-
-    let outcome = StateHandlerOutcome::transition(SwitchControllerState::FetchInfo);
-
-    // REQ-6 (set NVOS from factory) is not implemented yet, so this is gated off.
-    // Today NICo does not change the NVOS password from the factory default: it
-    // only copies the operator-provided credential into Vault (the `else` branch)
-    // so the rest of NICo can authenticate, and records no rotation convergence
-    // (the backfill skips `nvos` for the same reason). When REQ-6 lands, flip
-    // `update_device_password` to `true`: that branch rotates the password on the
-    // switch, stores the resulting NICo-owned credential, and records `nvos`
-    // convergence (keyed by BMC MAC) committed atomically with the transition.
-    //
-    // IMPORTANT: before flipping this on, REQ-6 must also seed a
-    // `sitewide_credential_rotation` row for `nvos` (via the backfill migration
-    // or at runtime). `record_device_converged` now requires the site-wide
-    // target to exist and returns `MissingSitewideRotationTarget` otherwise --
-    // unlike the other credential types, nvos has no backfilled row today, so
-    // ungating without seeding it would make every switch fail here.
-    let update_device_password = false;
-    if update_device_password {
-        let mut txn = ctx.services.db_pool.begin().await?;
-
-        // TODO(REQ-6): rotate the NVOS password on the switch here (factory ->
-        // NICo-owned) and store the resulting credential in Vault before recording
-        // convergence below. Only once the password is actually changed on the
-        // device has the switch converged to the current nvos target.
-        db::credential_rotation::record_device_converged(
-            &mut txn,
-            bmc_mac_address,
-            db::credential_rotation::CredentialRotationType::Nvos,
-        )
+    ctx.services
+        .credential_manager
+        .set_credentials(&key, credentials)
         .await
-        .map_err(|e| {
+        .map_err(|error| {
             StateHandlerError::GenericError(eyre::eyre!(
-                "Switch {:?}: failed to record nvos rotation convergence: {}",
-                switch_id,
-                e
+                "switch {switch_id}: failed to persist NVOS credentials: {error}"
             ))
         })?;
 
-        Ok(outcome.with_txn(txn))
-    } else {
-        // Copy the operator-provided NVOS admin credential from the expected
-        // switch into Vault. This does not touch the switch, so no convergence is
-        // recorded.
-        let mut txn = ctx.services.db_pool.begin().await?;
-        let expected_switch =
-            db::expected_switch::find_by_bmc_mac_address(&mut txn, bmc_mac_address).await?;
-        txn.commit().await?;
+    let persisted = ctx
+        .services
+        .credential_manager
+        .get_credentials_from_writer(&key)
+        .await
+        .map_err(|error| {
+            StateHandlerError::GenericError(eyre::eyre!(
+                "switch {switch_id}: failed to read back NVOS credentials: {error}"
+            ))
+        })?;
 
-        let expected_switch = match expected_switch {
-            Some(es) => es,
-            None => {
-                return Ok(StateHandlerOutcome::transition(
-                    SwitchControllerState::Error {
-                        cause: format!("No expected switch found for BMC MAC {}", bmc_mac_address),
-                    },
-                ));
+    if persisted.as_ref() != Some(credentials) {
+        return Err(StateHandlerError::GenericError(eyre::eyre!(
+            "switch {switch_id}: NVOS credential writer readback did not match"
+        )));
+    }
+
+    let effective = ctx
+        .services
+        .credential_manager
+        .get_credentials(&key)
+        .await
+        .map_err(|error| {
+            StateHandlerError::GenericError(eyre::eyre!(
+                "switch {switch_id}: failed to read effective NVOS credentials: {error}"
+            ))
+        })?;
+
+    if effective.as_ref() != Some(credentials) {
+        return Err(StateHandlerError::GenericError(eyre::eyre!(
+            "switch {switch_id}: NVOS credential is shadowed in the effective read chain"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Ensures the credential manager contains the switch's current NVOS credential.
+///
+/// Expected-switch credentials seed the initial value before rotation starts.
+/// While the initial rotation is staged, the captured per-switch credential is
+/// preserved. After convergence, it is repaired from the immutable confirmed
+/// site credential.
+pub(crate) async fn ensure_nvos_admin_credentials(
+    switch_id: &SwitchId,
+    bmc_mac_address: mac_address::MacAddress,
+    ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
+) -> Result<NvosAdminCredentialStatus, StateHandlerError> {
+    let key = CredentialKey::SwitchNvosAdmin { bmc_mac_address };
+
+    // This effective value may be the bootstrap credential, the confirmed
+    // credential, or a target persisted immediately before DB promotion.
+    let existing = ctx
+        .services
+        .credential_manager
+        .get_credentials(&key)
+        .await
+        .map_err(|error| {
+            StateHandlerError::GenericError(eyre::eyre!(
+                "switch {switch_id}: failed to read NVOS credentials from credential store: {error}"
+            ))
+        })?;
+
+    let mut txn = ctx.services.db_pool.begin().await?;
+
+    let expected_switch =
+        db::expected_switch::find_by_bmc_mac_address(&mut txn, bmc_mac_address).await?;
+
+    let operation = db::credential_rotation::device_rotation_operation_state(
+        &mut *txn,
+        db::credential_rotation::CredentialRotationType::Nvos,
+        bmc_mac_address,
+    )
+    .await?;
+
+    txn.commit().await?;
+
+    // Rotation may resume after a restart. Before initial confirmation, retain
+    // any valid per-switch credential. Also retain a staged target that was
+    // persisted before its matching DB promotion completed.
+    if let Some(operation) = operation.as_ref()
+        && let Some(staged_version) = operation.rotating_to_version
+    {
+        let existing_password = match existing.as_ref() {
+            Some(Credentials::UsernamePassword { username, password })
+                if !username.is_empty() && !password.is_empty() =>
+            {
+                Some(password.as_str())
             }
+            _ => None,
         };
 
-        let (username, password) = match (
-            expected_switch.nvos_username,
-            expected_switch.nvos_password,
-        ) {
-            (Some(username), Some(password)) => (username, password),
-            _ => {
-                tracing::info!(
-                    "Switch {:?}: no NVOS credentials in vault or expected switch for BMC MAC {}, skipping",
-                    switch_id,
-                    bmc_mac_address
-                );
-                return Ok(outcome);
-            }
-        };
+        if operation.current_version.is_none() {
+            // During initial rotation, no versioned credential is confirmed.
+            // Preserve any valid per-switch credential so retries keep a
+            // usable password.
+            return Ok(if existing_password.is_some() {
+                NvosAdminCredentialStatus::Available
+            } else {
+                NvosAdminCredentialStatus::Error(
+                    "Staged NVOS rotation has no valid current per-switch credential".to_string(),
+                )
+            });
+        }
 
-        let credentials = Credentials::UsernamePassword { username, password };
+        if let Some(existing_password) = existing_password
+            && let Some(Credentials::UsernamePassword {
+                password: staged_password,
+                ..
+            }) = read_nvos_site_credentials(
+                switch_id,
+                staged_version,
+                ctx.services.credential_manager.as_ref(),
+            )
+            .await?
+            && existing_password == staged_password
+        {
+            // Completion persists the target before promoting its DB version.
+            // Preserve that target when recovering between those two steps.
+            return Ok(NvosAdminCredentialStatus::Available);
+        }
+    }
 
-        ctx.services
-            .credential_manager
-            .set_credentials(&key, &credentials)
-            .await
-            .map_err(|e| {
+    // Expected-switch data provides bootstrap credentials and the fallback
+    // username because site-wide rotation targets contain only a password.
+    let Some(expected_switch) = expected_switch else {
+        return Ok(NvosAdminCredentialStatus::Error(format!(
+            "No expected switch found for BMC MAC {bmc_mac_address}"
+        )));
+    };
+
+    let expected_credentials = match expected_nvos_credential_pair(
+        expected_switch.nvos_username.as_deref(),
+        expected_switch.nvos_password.as_deref(),
+    ) {
+        Ok(None) => None,
+        Ok(Some(credentials)) => Some(credentials),
+        Err(error) => return Ok(NvosAdminCredentialStatus::Error(error.to_string())),
+    };
+
+    let current_version = operation
+        .as_ref()
+        .and_then(|operation| operation.current_version);
+
+    let (credentials, source) = match current_version {
+        Some(current_version) => {
+            // A confirmed version is authoritative. Repair its password from
+            // the immutable site credential instead of stale bootstrap data.
+            let versioned = read_nvos_site_credentials(
+                switch_id,
+                current_version,
+                ctx.services.credential_manager.as_ref(),
+            )
+            .await?
+            .ok_or_else(|| {
                 StateHandlerError::GenericError(eyre::eyre!(
-                    "Switch {:?}: failed to store NVOS credentials in vault: {}",
-                    switch_id,
-                    e
+                    "switch {switch_id}: confirmed NVOS credential version {current_version} \
+                     is missing"
                 ))
             })?;
 
-        tracing::info!(
-            "Switch {:?}: stored NVOS admin credentials from expected switch into vault for BMC MAC {}",
-            switch_id,
-            bmc_mac_address
-        );
+            let Credentials::UsernamePassword { password, .. } = versioned;
 
-        Ok(outcome)
-    }
+            if password.is_empty() {
+                return Ok(NvosAdminCredentialStatus::Error(format!(
+                    "Confirmed NVOS credential version {current_version} has an empty password"
+                )));
+            }
+
+            // Rotation changes only the password. Preserve the established
+            // per-switch username, or recover it from expected-switch data.
+            let username = match existing.as_ref() {
+                Some(Credentials::UsernamePassword { username, .. }) if !username.is_empty() => {
+                    username.clone()
+                }
+                _ => {
+                    let Some((username, _)) = expected_credentials else {
+                        return Ok(NvosAdminCredentialStatus::Error(format!(
+                            "Cannot restore confirmed NVOS credential version {current_version} \
+                             without an expected-switch username"
+                        )));
+                    };
+
+                    username.to_string()
+                }
+            };
+
+            let credentials = Credentials::UsernamePassword { username, password };
+            (credentials, "confirmed rotation version")
+        }
+        None => {
+            // Before first convergence, expected-switch credentials bootstrap
+            // the per-switch key.
+            let Some((username, password)) = expected_credentials else {
+                // Preserve an existing credential when bootstrap input is
+                // absent so rotation can use it as the current credential.
+                let Some(credentials) = existing else {
+                    tracing::info!(
+                        switch_id = ?switch_id,
+                        bmc_mac_address = %bmc_mac_address,
+                        "Switch: no NVOS credentials in credential store or expected switch; skipping",
+                    );
+
+                    return Ok(NvosAdminCredentialStatus::Skip);
+                };
+
+                persist_nvos_admin_credentials(switch_id, bmc_mac_address, &credentials, ctx)
+                    .await?;
+
+                return Ok(NvosAdminCredentialStatus::Available);
+            };
+
+            (
+                Credentials::UsernamePassword {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                },
+                "expected switch",
+            )
+        }
+    };
+
+    // Availability is reported only after writer and effective readback agree.
+    persist_nvos_admin_credentials(switch_id, bmc_mac_address, &credentials, ctx).await?;
+
+    tracing::info!(
+        switch_id = ?switch_id,
+        bmc_mac_address = %bmc_mac_address,
+        source,
+        "Switch: restored NVOS admin credentials",
+    );
+
+    Ok(NvosAdminCredentialStatus::Available)
 }
 
 async fn handle_configure_certificate(
@@ -199,6 +358,53 @@ async fn handle_configure_certificate_start(
     state: &Switch,
     ctx: &mut StateHandlerContext<'_, SwitchStateHandlerContextObjects>,
 ) -> Result<StateHandlerOutcome<SwitchControllerState>, StateHandlerError> {
+    // `start_configure_switch_certificate` skips certificate bring-up without
+    // either a rack association or component manager. Resolve credentials only
+    // when that operation can start so skipped configurations retain their
+    // existing behavior.
+    //
+    // Certificate endpoint construction requires a per-switch NVOS
+    // username/password. Preserve an existing effective credential. When it is
+    // absent, use the rotation resolver to seed expected-switch bootstrap data.
+    if state.rack_id.is_some()
+        && ctx.services.component_manager.is_some()
+        && let Some(bmc_mac_address) = state.bmc_mac_address
+    {
+        let key = CredentialKey::SwitchNvosAdmin { bmc_mac_address };
+
+        let credential_exists = ctx
+            .services
+            .credential_manager
+            .get_credentials(&key)
+            .await
+            .map_err(|error| {
+                StateHandlerError::GenericError(eyre::eyre!(
+                    "switch {switch_id}: failed to read NVOS credentials from credential store: {error}"
+                ))
+            })?
+            .is_some();
+
+        if !credential_exists {
+            match ensure_nvos_admin_credentials(switch_id, bmc_mac_address, ctx).await? {
+                NvosAdminCredentialStatus::Available => {}
+                NvosAdminCredentialStatus::Skip => {
+                    // Stay in `ConfigureCertificate::Start` so periodic
+                    // reconciliation retries after credentials are imported.
+                    return Ok(StateHandlerOutcome::wait(format!(
+                        "switch {switch_id}: waiting for NVOS admin credentials"
+                    )));
+                }
+                NvosAdminCredentialStatus::Error(cause) => {
+                    // Expected-switch credential metadata can be corrected
+                    // without resetting the switch controller state.
+                    return Ok(StateHandlerOutcome::wait(format!(
+                        "switch {switch_id}: waiting for valid NVOS admin credentials: {cause}"
+                    )));
+                }
+            }
+        }
+    }
+
     match start_configure_switch_certificate(
         switch_id,
         state,
@@ -228,8 +434,8 @@ async fn handle_configure_certificate_wait_for_complete(
         crate::certificate::ConfigureSwitchCertificatePollOutcome::Completed => {
             tracing::info!(
                 %job_id,
-                "Switch {:?}: switch certificate configuration completed",
-                switch_id
+                switch_id = ?switch_id,
+                "Switch: switch certificate configuration completed",
             );
             Ok(StateHandlerOutcome::transition(
                 SwitchControllerState::Configuring {

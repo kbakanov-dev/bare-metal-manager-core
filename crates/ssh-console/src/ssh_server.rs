@@ -75,12 +75,17 @@ pub async fn spawn(
             addr: listen_address,
             error,
         })?;
-    tracing::info!("listening on {}", listen_address);
+    let listen_address = listener.local_addr().map_err(|error| Listening {
+        addr: listen_address,
+        error,
+    })?;
+    tracing::info!(%listen_address, "SSH server listening");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let join_handle = tokio::spawn(server.run(listener, shutdown_rx));
 
     Ok(Handle {
+        listen_address,
         shutdown_tx,
         join_handle,
     })
@@ -88,12 +93,12 @@ pub async fn spawn(
 
 #[derive(thiserror::Error, Debug)]
 pub enum SpawnError {
-    #[error("Error reading host key file at {path}: {error}")]
+    #[error("error reading host key file at {path}: {error}")]
     ReadingHostKeyFile {
         path: String,
         error: russh::keys::ssh_key::Error,
     },
-    #[error("Error listening on {addr}: {error}")]
+    #[error("error listening on {addr}: {error}")]
     Listening {
         addr: SocketAddr,
         error: std::io::Error,
@@ -101,8 +106,15 @@ pub enum SpawnError {
 }
 
 pub struct Handle {
+    listen_address: SocketAddr,
     shutdown_tx: oneshot::Sender<()>,
     join_handle: JoinHandle<()>,
+}
+
+impl Handle {
+    pub fn listen_address(&self) -> SocketAddr {
+        self.listen_address
+    }
 }
 
 impl ShutdownHandle<()> for Handle {

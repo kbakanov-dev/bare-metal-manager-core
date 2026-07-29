@@ -45,6 +45,7 @@ pub enum HwType {
     Supermicro,
     Viking,
     LiteonPowerShelf,
+    DeltaPowerShelf,
     NvSwitch,
     VeraRubin,
 }
@@ -65,6 +66,7 @@ impl HwType {
             // SMC GB300 runs a Supermicro (OpenBMC) host BMC.
             Self::SupermicroGb300 => Some(bmc_vendor::BMCVendor::Supermicro),
             Self::LiteonPowerShelf => Some(bmc_vendor::BMCVendor::Liteon),
+            Self::DeltaPowerShelf => Some(bmc_vendor::BMCVendor::Delta),
             Self::NvSwitch => Some(bmc_vendor::BMCVendor::Nvidia),
             Self::Supermicro => Some(bmc_vendor::BMCVendor::Supermicro),
             Self::Viking => Some(bmc_vendor::BMCVendor::Nvidia),
@@ -90,6 +92,7 @@ impl HwType {
             // TODO(smc): confirm the SMC GB300 infinite-boot BIOS attribute from the tray BIOS.
             Self::SupermicroGb300 => None,
             Self::LiteonPowerShelf => None,
+            Self::DeltaPowerShelf => None,
             Self::NvSwitch => None,
             Self::Supermicro => None,
             Self::Viking => Some(BiosAttr::new_str("NvidiaInfiniteboot", "Enable")),
@@ -151,5 +154,40 @@ impl fmt::Display for BiosAttrValue<'_> {
             BiosAttrValue::Int(v) => v.fmt(f),
             BiosAttrValue::AnyStr(v) => write!(f, "any({})", v.iter().join(",")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bmc_vendor::BMCVendor;
+    use carbide_test_support::value_scenarios;
+
+    use super::*;
+
+    #[test]
+    fn hw_type_bmc_vendor_maps_each_variant() {
+        value_scenarios!(run = |hardware_type: HwType| hardware_type.bmc_vendor();
+            "generic AMI has no canonical vendor" {
+                HwType::Ami => None,
+            }
+
+            "hardware types map to canonical vendors" {
+                HwType::Bluefield => Some(BMCVendor::Nvidia),
+                HwType::Dell => Some(BMCVendor::Dell),
+                HwType::Gb200 => Some(BMCVendor::Nvidia),
+                HwType::DgxGb300 => Some(BMCVendor::Nvidia),
+                HwType::Hpe => Some(BMCVendor::Hpe),
+                HwType::Lenovo => Some(BMCVendor::Lenovo),
+                HwType::LenovoAmi => Some(BMCVendor::LenovoAMI),
+                HwType::LenovoGb300 => Some(BMCVendor::LenovoAMI),
+                HwType::SupermicroGb300 => Some(BMCVendor::Supermicro),
+                HwType::Supermicro => Some(BMCVendor::Supermicro),
+                HwType::Viking => Some(BMCVendor::Nvidia),
+                HwType::LiteonPowerShelf => Some(BMCVendor::Liteon),
+                HwType::DeltaPowerShelf => Some(BMCVendor::Delta),
+                HwType::NvSwitch => Some(BMCVendor::Nvidia),
+                HwType::VeraRubin => Some(BMCVendor::Nvidia),
+            }
+        );
     }
 }

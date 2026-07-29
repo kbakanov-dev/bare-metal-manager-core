@@ -292,6 +292,7 @@ mod tests {
             collector_type: "test",
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         }
     }
 
@@ -520,12 +521,14 @@ mod tests {
                 batch_size: 512,
                 flush_interval: std::time::Duration::from_secs(2),
                 include_diagnostics: false,
+                tls: None,
             },
             OtlpTargetConfig {
                 endpoint: "http://second.example:4317".to_string(),
                 batch_size: 512,
                 flush_interval: std::time::Duration::from_secs(2),
                 include_diagnostics: false,
+                tls: None,
             },
         ];
 

@@ -53,6 +53,7 @@ struct ManagedHostShow {
     active_state_filter: String,
     active_time_in_state_above_sla_filter: String,
     states: Vec<String>,
+    health_alert_ids: Vec<String>,
     gpus: Vec<String>,
     active_gpu_filter: String,
     ibs: Vec<String>,
@@ -129,6 +130,7 @@ impl ManagedHostRowDisplay {
 
         // Decompose hardware_info into the pieces we want to show
         let (vendor, model, num_gpus, num_ib_ifs, host_memory) = host_snapshot
+            .status
             .hardware_info
             .map(|hardware_info| {
                 let (vendor, model) = hardware_info
@@ -153,17 +155,20 @@ impl ManagedHostRowDisplay {
             })
             .unwrap_or_default();
         let host_bmc_ip = host_snapshot
+            .status
             .bmc_info
             .ip
             .map(|ip| ip.to_string())
             .unwrap_or_default();
         let host_bmc_mac = host_snapshot
+            .status
             .bmc_info
             .mac
             .map(|m| m.to_string())
             .unwrap_or_default();
 
         let (host_admin_ip, host_admin_mac) = host_snapshot
+            .status
             .interfaces
             .into_iter()
             .find(|i| i.primary_interface)
@@ -213,8 +218,8 @@ impl ManagedHostRowDisplay {
             maintenance_reference,
             maintenance_start_time,
             dpus: dpu_snapshots.into_iter().map_into().collect(),
-            dpf_enabled: host_snapshot.dpf.enabled,
-            dpf_used_for_ingestion: host_snapshot.dpf.used_for_ingestion,
+            dpf_enabled: host_snapshot.config.dpf.enabled,
+            dpf_used_for_ingestion: host_snapshot.config.dpf.used_for_ingestion,
         }
     }
 }
@@ -222,12 +227,18 @@ impl ManagedHostRowDisplay {
 impl From<model::machine::Machine> for AttachedDpuRowDisplay {
     fn from(item: Machine) -> Self {
         let bmc_ip = item
+            .status
             .bmc_info
             .ip
             .map(|ip| ip.to_string())
             .unwrap_or_default();
-        let bmc_mac = item.bmc_info.mac.map(|m| m.to_string()).unwrap_or_default();
-        let primary_iface = item.interfaces.iter().find(|i| i.primary_interface);
+        let bmc_mac = item
+            .status
+            .bmc_info
+            .mac
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        let primary_iface = item.status.interfaces.iter().find(|i| i.primary_interface);
         let oob_ip = primary_iface
             .and_then(|t| t.addresses.first().map(|a| a.to_string()))
             .unwrap_or_default();
@@ -417,7 +428,7 @@ pub async fn show_html(
     {
         Ok(hosts) => hosts,
         Err(err) => {
-            tracing::error!(%err, "fetch_managed_hosts");
+            tracing::error!(error = %err, "fetch_managed_hosts");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading managed hosts",
@@ -456,6 +467,7 @@ pub async fn show_html(
     let mut hosts = Vec::new();
     let mut models_per_vendor: HashMap<String, Vec<String>> = HashMap::new();
     let mut states = HashSet::new();
+    let mut health_alert_ids = HashSet::new();
     let mut gpus = HashSet::new();
     let mut ibs = HashSet::new();
     let mut mems = HashSet::new();
@@ -481,6 +493,9 @@ pub async fn show_html(
         states.insert(short_state(&m.state).to_string());
         gpus.insert(m.num_gpus);
         ibs.insert(m.num_ib_ifs);
+        for alert in &m.health_probe_alerts {
+            health_alert_ids.insert(alert.id.to_string());
+        }
         let barry = mem_to_size(&m.host_memory);
         mems.insert((barry, format!("{barry} GiB")));
 
@@ -502,7 +517,10 @@ pub async fn show_html(
         }
         if active_gpu_filter != "all" {
             let Ok(gf) = active_gpu_filter.parse::<usize>() else {
-                tracing::warn!("Invalid GPU filter: '{active_gpu_filter}'");
+                tracing::warn!(
+                    active_gpu_filter = %active_gpu_filter,
+                    "Invalid GPU filter",
+                );
                 continue;
             };
             if gf != m.num_gpus {
@@ -511,7 +529,10 @@ pub async fn show_html(
         }
         if active_ib_filter != "all" {
             let Ok(ibf) = active_ib_filter.parse::<usize>() else {
-                tracing::warn!("Invalid IB IFs filter: '{active_ib_filter}'");
+                tracing::warn!(
+                    active_ib_filter = %active_ib_filter,
+                    "Invalid IB IFs filter",
+                );
                 continue;
             };
             if ibf != m.num_ib_ifs {
@@ -526,6 +547,15 @@ pub async fn show_html(
                 continue;
             }
             if active_health_alerts_filter == "unhealthy" && m.health_probe_alerts.is_empty() {
+                continue;
+            }
+            if active_health_alerts_filter != "healthy"
+                && active_health_alerts_filter != "unhealthy"
+                && !m
+                    .health_probe_alerts
+                    .iter()
+                    .any(|a| a.id.to_string() == active_health_alerts_filter)
+            {
                 continue;
             }
         }
@@ -569,6 +599,8 @@ pub async fn show_html(
     let models_per_vendor_json = serde_json::to_string(&models_per_vendor).unwrap();
 
     let states: Vec<String> = states.into_iter().sorted_unstable().collect();
+
+    let health_alert_ids: Vec<String> = health_alert_ids.into_iter().sorted_unstable().collect();
 
     let gpus: Vec<String> = gpus
         .into_iter()
@@ -633,6 +665,7 @@ pub async fn show_html(
         active_state_filter,
         active_time_in_state_above_sla_filter,
         states,
+        health_alert_ids,
         gpus,
         active_gpu_filter,
         ibs,
@@ -694,7 +727,7 @@ pub async fn show_all_json(state: AxumState<Arc<Api>>) -> Response {
     let mut managed_hosts = match fetch_managed_hosts_with_metadata(state, true).await {
         Ok(m) => m,
         Err(err) => {
-            tracing::error!(%err, "fetch_managed_hosts");
+            tracing::error!(error = %err, "fetch_managed_hosts");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading managed hosts",
@@ -817,7 +850,7 @@ fn mem_to_size(mem: &str) -> isize {
         .collect_tuple()
         .map(|(size, unit)| (size.parse::<f64>(), unit))
     else {
-        tracing::warn!("Invalid memory format: '{mem}'");
+        tracing::warn!(mem, "Invalid memory format",);
         return 0;
     };
 
@@ -825,7 +858,7 @@ fn mem_to_size(mem: &str) -> isize {
         "GiB" => size,
         "TiB" => size * 1024.0,
         _ => {
-            tracing::warn!("Invalid unit '{}' in mem string '{mem}'", unit);
+            tracing::warn!(unit, mem, "Invalid unit in mem string",);
             return 0;
         }
     }) as isize

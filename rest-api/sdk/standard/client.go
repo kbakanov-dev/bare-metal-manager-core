@@ -77,6 +77,8 @@ type APIClient struct {
 
 	IPBlockAPI *IPBlockAPIService
 
+	IPXETemplateAPI *IPXETemplateAPIService
+
 	InfiniBandPartitionAPI *InfiniBandPartitionAPIService
 
 	InfrastructureProviderAPI *InfrastructureProviderAPIService
@@ -109,9 +111,13 @@ type APIClient struct {
 
 	SiteAPI *SiteAPIService
 
+	SiteExplorerAPI *SiteExplorerAPIService
+
 	SubnetAPI *SubnetAPIService
 
 	TaskAPI *TaskAPIService
+
+	TaskRunAPI *TaskRunAPIService
 
 	TenantAPI *TenantAPIService
 
@@ -161,6 +167,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.HealthReportAPI = (*HealthReportAPIService)(&c.common)
 	c.HostFirmwareConfigAPI = (*HostFirmwareConfigAPIService)(&c.common)
 	c.IPBlockAPI = (*IPBlockAPIService)(&c.common)
+	c.IPXETemplateAPI = (*IPXETemplateAPIService)(&c.common)
 	c.InfiniBandPartitionAPI = (*InfiniBandPartitionAPIService)(&c.common)
 	c.InfrastructureProviderAPI = (*InfrastructureProviderAPIService)(&c.common)
 	c.InstanceAPI = (*InstanceAPIService)(&c.common)
@@ -177,8 +184,10 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.SSHKeyGroupAPI = (*SSHKeyGroupAPIService)(&c.common)
 	c.ServiceAccountAPI = (*ServiceAccountAPIService)(&c.common)
 	c.SiteAPI = (*SiteAPIService)(&c.common)
+	c.SiteExplorerAPI = (*SiteExplorerAPIService)(&c.common)
 	c.SubnetAPI = (*SubnetAPIService)(&c.common)
 	c.TaskAPI = (*TaskAPIService)(&c.common)
+	c.TaskRunAPI = (*TaskRunAPIService)(&c.common)
 	c.TenantAPI = (*TenantAPIService)(&c.common)
 	c.TenantAccountAPI = (*TenantAccountAPIService)(&c.common)
 	c.TenantIdentityAPI = (*TenantIdentityAPIService)(&c.common)
@@ -556,15 +565,6 @@ func (c *APIClient) decode(v interface{}, b []byte, contentType string) (err err
 	}
 	if s, ok := v.(*string); ok {
 		*s = string(b)
-		return nil
-	}
-	if r, ok := v.(*io.Reader); ok {
-		*r = bytes.NewReader(b)
-		return nil
-	}
-	// Must stay before the JSON branch: json.Unmarshal would base64-decode into *[]byte.
-	if p, ok := v.(*[]byte); ok {
-		*p = b
 		return nil
 	}
 	if f, ok := v.(*os.File); ok {

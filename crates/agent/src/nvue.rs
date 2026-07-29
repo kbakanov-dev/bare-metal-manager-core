@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 
 use ::rpc::forge as rpc;
@@ -52,7 +52,7 @@ pub fn template_for(vtype: VpcVirtualizationType) -> eyre::Result<&'static str> 
         // primary plus secondary DPUs used for VFs; if that ever
         // becomes a target, the dispatch here would need rethinking.)
         VpcVirtualizationType::Flat => {
-            Err(eyre::eyre!("Flat VPC virtualization type not supported",))
+            Err(eyre::eyre!("flat VPC virtualization type not supported",))
         }
     }
 }
@@ -594,6 +594,11 @@ pub fn build(conf: NvueConfig) -> eyre::Result<String> {
         BgpLeafSessionPassword: conf.bgp_leaf_session_password.unwrap_or_default(),
         UseAdminNetwork: conf.use_admin_network,
         LoopbackIP: conf.loopback_ip.to_string(),
+        HasLoopbackIpv6: conf.loopback_ip_v6.is_some(),
+        LoopbackIpv6: conf
+            .loopback_ip_v6
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
         HasSiteGlobalVpcVni: conf.site_global_vpc_vni.is_some(),
         SiteGlobalVpcVni: conf.site_global_vpc_vni.unwrap_or_default(),
         HasStaticAdvertisements: has_static_advertisements,
@@ -938,7 +943,11 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
             Ok(applied)
         }
         Err(err) => {
-            tracing::error!("update_nvue post command failed: {err:#}");
+            tracing::error!(
+                error = %err,
+                error_chain = format!("{err:#}").replace('\n', "; "),
+                "NVUE post command failed"
+            );
 
             // If the config apply failed, we won't be using it, so move it out
             // of the way to an .error file for others to enjoy (while attempting
@@ -948,8 +957,9 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
                 && let Err(e) = fs::remove_file(path_error.clone())
             {
                 tracing::warn!(
-                    "Failed to remove previous error file ({}): {e}",
-                    path_error.display()
+                    error_file_path = %path_error.display(),
+                    error = %e,
+                    "Failed to remove previous error file"
                 );
             }
 
@@ -980,7 +990,7 @@ pub async fn apply(hbn_root: &Path, config_path: &super::FPath) -> eyre::Result<
 async fn run_apply(hbn_root: &Path, path: &Path) -> eyre::Result<bool> {
     let mut in_container_path = path
         .strip_prefix(hbn_root)
-        .wrap_err("Stripping hbn_root prefix from path to make in-container path")?
+        .wrap_err("stripping hbn_root prefix from path to make in-container path")?
         .to_path_buf();
     // If hbn_root ends with "/", the stripped path will have it removed from start. Add back.
     if !in_container_path.has_root() {
@@ -1136,6 +1146,7 @@ pub struct NvueConfig {
     pub use_admin_network: bool,
     pub tenancy_enabled: bool,
     pub loopback_ip: IpAddr,
+    pub loopback_ip_v6: Option<Ipv6Addr>,
     pub asn: u32,
     pub datacenter_asn: u32,
     pub site_global_vpc_vni: Option<u32>,
@@ -1345,6 +1356,8 @@ struct TmplNvue {
     HasSiteGlobalVpcVni: bool,
     SiteGlobalVpcVni: u32,
     LoopbackIP: String,
+    HasLoopbackIpv6: bool,
+    LoopbackIpv6: String,
     HasSecondaryOverlayVTEP: bool,
     HasStaticAdvertisements: bool,
     SecondaryOverlayVtepIP: String,
@@ -1716,6 +1729,8 @@ struct TmplVni {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use carbide_test_support::value_scenarios;
 
     use super::*;
@@ -1842,6 +1857,7 @@ mod tests {
             use_admin_network: false,
             tenancy_enabled: true,
             loopback_ip: "10.0.0.1".parse().unwrap(),
+            loopback_ip_v6: None,
             asn: 65000,
             datacenter_asn: 11414,
             site_global_vpc_vni: None,
@@ -1875,6 +1891,82 @@ mod tests {
             ct_access_vlans: vec![],
             ct_routing_profile: None,
         }
+    }
+
+    struct LoopbackRenderRow {
+        virtualization_type: VpcVirtualizationType,
+        loopback_ip_v6: Option<Ipv6Addr>,
+    }
+
+    fn address_set(addresses: &[&str]) -> BTreeSet<String> {
+        addresses
+            .iter()
+            .map(|address| (*address).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_renders_ipv6_loopback_only_for_fnn() {
+        value_scenarios!(run = |row: LoopbackRenderRow| {
+            let mut conf = minimal_nvue_config();
+            conf.is_fnn = row.virtualization_type == VpcVirtualizationType::Fnn;
+            conf.vpc_virtualization_type = row.virtualization_type;
+            conf.loopback_ip_v6 = row.loopback_ip_v6;
+
+            let rendered = build(conf).unwrap();
+            let rendered_yaml: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+            let loopback_addresses = rendered_yaml.as_sequence().unwrap()[1]["set"]["interface"]
+                ["lo"]["ip"]["address"]
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|address| address.as_str().unwrap().to_string())
+                .collect();
+            let ipv6_underlay_prefixes = rendered_yaml.as_sequence().unwrap()[1]["set"]["router"]
+                ["policy"]["prefix-list"]["ALLOW_TO_UNDERLAY_PREFIX_LIST_IPV6"]["rule"]["65000"]
+                ["match"]
+                .as_mapping()
+                .into_iter()
+                .flat_map(|mapping| mapping.keys())
+                .map(|address| address.as_str().unwrap().to_string())
+                .collect();
+
+            assert!(
+                rendered.contains("address: 10.0.0.1"),
+                "the IPv4 loopback must remain the VXLAN VTEP"
+            );
+            assert!(
+                rendered.contains("router-id: 10.0.0.1"),
+                "the IPv4 loopback must remain the BGP router ID"
+            );
+
+            (loopback_addresses, ipv6_underlay_prefixes)
+        };
+            "FNN loopback rendering" {
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::Fnn,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (
+                    address_set(&["10.0.0.1/32", "2001:db8::1/128"]),
+                    address_set(&["2001:db8::1/128"]),
+                ),
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::Fnn,
+                    loopback_ip_v6: None,
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+            }
+
+            "ETV ignores the IPv6 loopback" {
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::EthernetVirtualizer,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+                LoopbackRenderRow {
+                    virtualization_type: VpcVirtualizationType::EthernetVirtualizerWithNvue,
+                    loopback_ip_v6: Some("2001:db8::1".parse().unwrap()),
+                } => (address_set(&["10.0.0.1/32"]), address_set(&[])),
+            }
+        );
     }
 
     #[test]

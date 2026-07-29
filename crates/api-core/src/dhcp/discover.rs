@@ -287,8 +287,8 @@ async fn ensure_dhcp_address_for_family(
     }
 
     tracing::info!(
-        interface_id = %machine_interface.id,
-        %parsed_mac,
+        machine_interface_id = %machine_interface.id,
+        client_mac_address = %parsed_mac,
         ?address_family,
         "Interface missing DHCP address for family, allocating from segment"
     );
@@ -419,9 +419,9 @@ async fn handle_dhcp_from_dpa(
         // Log cases where len is neither 0 nor 1.
         if !dpa_ifs.is_empty() {
             tracing::error!(
-                "handle_dpa_message -  invalid dpa_ifs len from find_by_mac_addr maddr: {} len: {}",
-                macaddr,
-                dpa_ifs.len()
+                mac_address = %macaddr,
+                dpa_interface_count = dpa_ifs.len(),
+                "Unexpected number of DPA interfaces found",
             );
         }
         return Ok(None);
@@ -480,12 +480,11 @@ pub async fn discover_dhcp(
     )?;
     let is_v6_observation = address_family == IpAddressFamily::Ipv6
         && message_kind == Some(DhcpMessageKind::V6InfoRequest);
-    let mut host_nic: Option<ExpectedHostNic> = None;
-    // `is_primary_nic` reflects the matched ExpectedHostNic's `primary` flag.
-    // - `Some(true)` -- the operator flagged this NIC as the host's boot interface.
-    // - `Some(false)` -- another NIC on this host is the declared primary.
-    // - `None` -- no declaration, use the default at interface creation time.
-    let mut is_primary_nic: Option<bool> = None;
+    let mut expected_interface: Option<ExpectedHostNic> = None;
+    // `host_primary_declaration` is intentionally Host-only. A DPU OS
+    // interface is always primary and a DPU BMC interface is never primary;
+    // api-db derives those values from the matched interface role.
+    let mut host_primary_declaration: Option<bool> = None;
 
     let parsed_mac: MacAddress = mac_address.parse()?;
     let mut predicted_interface_for_observation = None;
@@ -500,23 +499,23 @@ pub async fn discover_dhcp(
         match db::machine::find_existing_machine(&mut txn, parsed_mac, parsed_relay).await? {
             Some(existing_machine) => Some(existing_machine),
             None => {
-                if let Some(expected_interface) =
+                if let Some(predicted_interface) =
                     db::predicted_machine_interface::find_by_mac_address(&mut txn, parsed_mac)
                         .await?
                 {
                     if is_v6_observation {
-                        predicted_interface_for_observation = Some(expected_interface);
+                        predicted_interface_for_observation = Some(predicted_interface);
                         None
                     } else {
                         // remember expected machine id for later rack update
                         machine_interface::move_predicted_machine_interface_to_machine(
                             &mut txn,
-                            &expected_interface,
+                            &predicted_interface,
                             parsed_relay,
                             api.runtime_config.retained_boot_interface_window,
                         )
                         .await?;
-                        Some(expected_interface.machine_id)
+                        Some(predicted_interface.machine_id)
                     }
                 } else {
                     // DPA allocation is currently IPv4-only. The overlay
@@ -537,50 +536,48 @@ pub async fn discover_dhcp(
                         return Ok(resp);
                     }
 
-                    // Now lets check expected machine data to see if there's any
-                    // useful configuration we need to address, such as primary NIC
-                    // assignment and/or static DHCP reservation allocations.
+                    // ExpectedMachine is the ingestion template for an unknown
+                    // interface, so this is where its role, segment guard, Host
+                    // primary declaration, and allocation policy join the normal
+                    // DHCP path.
                     //
-                    // For static DHCP reservations, we do this here for the simple
-                    // reason that it's a good place to put it. If an operator force
-                    // deletes a machine and its interfaces, how would we put them
-                    // back? The answer is the same way they would be put back in a
-                    // dynamic allocation -- during DHCPDISCOVER/DHCPREQUEST. We see
-                    // that a static DHCP reservation is configured per expected
-                    // machine data, so we make an idempotent call to ensure that
-                    // allocation exists, and if not, is created.
+                    // Why also materialize a fixed reservation here? An operator
+                    // may force-delete a machine and all of its interfaces. The
+                    // next DHCP request is then the first point where we see that
+                    // MAC again, so the idempotent preallocation rebuilds the
+                    // reservation before the common find-or-create path runs.
                     if let Some(m) =
                         expected_machine::find_by_host_mac_address(&mut txn, parsed_mac)
                             .await
                             .map_err(CarbideError::from)?
                     {
-                        // The host's declared primary NIC (if any) decides whether this
-                        // MAC is its boot interface; the matched NIC also carries any
-                        // static reservation need handled below.
-                        if let Some(declared_primary_mac) = m.data.declared_primary_mac() {
-                            is_primary_nic = Some(declared_primary_mac == parsed_mac);
-                        }
-                        host_nic = m
+                        expected_interface = m
                             .data
                             .host_nics
                             .iter()
-                            .find(|nic| nic.mac_address == parsed_mac)
+                            .find(|interface| interface.mac_address == parsed_mac)
                             .cloned();
-                        if let Some(ref nic) = host_nic
-                            && let Some(fixed_ip) = nic.fixed_ip
-                            && fixed_ip.is_address_family(address_family)
-                        {
-                            // It looks like there's a DHCP reservation for this address,
-                            // so make an idempotent call to ensure we have a preallocated
-                            // machine interface (and machine interface address) for it,
-                            // creating one if needed.
-                            db::machine_interface::preallocate_machine_interface(
-                                &mut txn,
-                                parsed_mac,
-                                fixed_ip,
-                                api.runtime_config.retained_boot_interface_window,
-                            )
-                            .await?;
+                        if let Some(interface) = expected_interface.as_ref() {
+                            if interface.role.is_host()
+                                && let Some(declared_primary_mac) = m.data.declared_primary_mac()
+                            {
+                                host_primary_declaration = Some(declared_primary_mac == parsed_mac);
+                            }
+                            if interface
+                                .fixed_ip
+                                .is_some_and(|fixed_ip| fixed_ip.is_address_family(address_family))
+                            {
+                                // The fixed reservation must exist before the common
+                                // path looks up this MAC. This call also applies the
+                                // interface's role and segment guard while the row is
+                                // still unassociated.
+                                db::machine_interface::preallocate_expected_machine_interface(
+                                    &mut txn,
+                                    interface,
+                                    api.runtime_config.retained_boot_interface_window,
+                                )
+                                .await?;
+                            }
                         }
                     } else if let Some(m) =
                         expected_machine::find_by_bmc_mac_address(&mut txn, parsed_mac)
@@ -633,7 +630,7 @@ pub async fn discover_dhcp(
         let network_segments = db::machine_interface::network_segments_for_dhcp_relays(
             &mut txn,
             std::slice::from_ref(&parsed_relay),
-            host_nic.as_ref(),
+            expected_interface.as_ref(),
         )
         .await?;
         let exact_link_address_match = |segment: &NetworkSegment| {
@@ -671,7 +668,7 @@ pub async fn discover_dhcp(
             .or_else(|| network_segments.first())
             .ok_or_else(|| {
                 CarbideError::internal(format!(
-                    "No network segment defined for DHCPv6 relay address {parsed_relay}"
+                    "no network segment defined for DHCPv6 relay address {parsed_relay}"
                 ))
             })?;
         ensure_dhcpv6_enabled(segment)?;
@@ -685,17 +682,18 @@ pub async fn discover_dhcp(
             // Fall through so the existing global MAC guard rejects or handles
             // static-assignment moves exactly as IPv4/stateful DHCP does.
             tracing::debug!(
-                %parsed_mac,
-                segment_id = %segment.id,
+                client_mac_address = %parsed_mac,
+                network_segment_id = %segment.id,
                 "DHCPv6 options request will use global MAC segment reconciliation"
             );
         } else if segment.config.allocation_strategy == AllocationStrategy::Reserved
             && interfaces.is_empty()
             && predicted_interface_for_observation.is_none()
         {
-            // Anonymous reserved requests can receive segment options without
-            // creating observed rows. Known or predicted interfaces must
-            // continue through common safety checks and DHCP bookkeeping.
+            // Reserved requests without an existing or predicted interface can
+            // receive segment options without creating an observed row. Known
+            // or predicted interfaces must continue through common safety
+            // checks and DHCP bookkeeping.
             let record = options_only_dhcpv6_record_from_segment(
                 &mut txn,
                 parsed_mac,
@@ -733,8 +731,8 @@ pub async fn discover_dhcp(
             existing_machine_id,
             parsed_mac,
             std::slice::from_ref(&parsed_relay),
-            host_nic,
-            is_primary_nic,
+            expected_interface,
+            host_primary_declaration,
             api.runtime_config.retained_boot_interface_window,
         )
         .await?
@@ -747,8 +745,8 @@ pub async fn discover_dhcp(
             parsed_mac,
             std::slice::from_ref(&parsed_relay),
             machine_interface::FindOrCreateMachineInterfaceOptions {
-                host_nic,
-                is_primary: is_primary_nic,
+                host_nic: expected_interface,
+                is_primary: host_primary_declaration,
                 retained_window: api.runtime_config.retained_boot_interface_window,
             },
             address_family,
@@ -794,7 +792,7 @@ pub async fn discover_dhcp(
         && segment.config.segment_type == NetworkSegmentType::Admin
     {
         return Err(CarbideError::FailedPrecondition(format!(
-            "DHCP request received on dormant non-primary admin interface {}. Ignoring.",
+            "DHCP request received on dormant non-primary admin interface {}. ignoring",
             machine_interface.id
         )));
     }
@@ -825,7 +823,7 @@ pub async fn discover_dhcp(
         let dpus = db::machine::find_dpus_by_host_machine_id(&mut txn, &machine_id).await?;
         if !dpus.is_empty() {
             return Err(CarbideError::internal(format!(
-                "DHCP request received for instance: {instance_id}. Ignoring."
+                "DHCP request received for instance: {instance_id}. ignoring"
             )));
         }
     }

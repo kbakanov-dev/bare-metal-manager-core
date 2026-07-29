@@ -48,6 +48,8 @@ impl DataSink for TracingSink {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     "Metric collection start"
                 );
             }
@@ -55,6 +57,8 @@ impl DataSink for TracingSink {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     metric = %metric.name,
                     key = %metric.key,
                     metric_type = %metric.metric_type,
@@ -67,6 +71,8 @@ impl DataSink for TracingSink {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     "Metric collection end"
                 );
             }
@@ -74,48 +80,36 @@ impl DataSink for TracingSink {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     "Collector removed"
                 );
             }
             CollectorEvent::Log(record) => {
-                let has_included_diagnostics =
-                    self.include_diagnostics && record.diagnostic_record.is_some();
-
                 let record = record.emitted_log_record(self.include_diagnostics);
 
-                if has_included_diagnostics {
-                    tracing::info!(
-                        endpoint = %context.endpoint_key(),
-                        collector = %context.collector_type,
-                        machine_id = context.machine_id().map(tracing::field::display),
-                        machine_serial = context.machine_serial(),
-                        driver_version = context.driver_version(),
-                        component_type = context.component_type(),
-                        nvlink_domain_uuid = context.nvlink_domain_uuid().map(tracing::field::display),
-                        severity = %record.severity,
-                        body = %record.body,
-                        attributes = ?record.attributes,
-                        "Log event"
-                    );
-                } else {
-                    tracing::info!(
-                        endpoint = %context.endpoint_key(),
-                        collector = %context.collector_type,
-                        machine_id = context.machine_id().map(tracing::field::display),
-                        machine_serial = context.machine_serial(),
-                        driver_version = context.driver_version(),
-                        component_type = context.component_type(),
-                        nvlink_domain_uuid = context.nvlink_domain_uuid().map(tracing::field::display),
-                        severity = %record.severity,
-                        body = %record.body,
-                        "Log event"
-                    );
-                }
+                tracing::info!(
+                    endpoint = %context.endpoint_key(),
+                    collector = %context.collector_type,
+                    machine_id = context.machine_id().map(tracing::field::display),
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    machine_serial = context.machine_serial(),
+                    driver_version = context.driver_version(),
+                    component_type = context.component_type(),
+                    nvlink_domain_uuid = context.nvlink_domain_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
+                    severity = %record.severity,
+                    body = %record.body,
+                    attributes = ?record.attributes,
+                    "Log event"
+                );
             }
             CollectorEvent::Firmware(info) => {
                 tracing::info!(
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     firmware_name = %info.component,
                     version = %info.version,
                     "Firmware info event"
@@ -126,6 +120,8 @@ impl DataSink for TracingSink {
                     endpoint = %context.endpoint_key(),
                     collector = %context.collector_type,
                     machine_id = ?context.machine_id(),
+                    system_uuid = context.system_uuid().map(tracing::field::display),
+                    labels = ?context.labels(),
                     success_count = report.successes.len(),
                     alert_count = report.alerts.len(),
                     alerts = ?report.alerts,
@@ -137,5 +133,48 @@ impl DataSink for TracingSink {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use carbide_instrument::testing::capture_logs;
+
+    use super::*;
+    use crate::endpoint::test_support::{mac, test_endpoint};
+    use crate::sink::LogRecord;
+
+    #[test]
+    fn log_events_preserve_attributes_without_diagnostics() {
+        let sink = TracingSink::new(&TracingSinkConfig {
+            include_diagnostics: false,
+        });
+
+        let endpoint = test_endpoint(mac("00:11:22:33:44:55"));
+        let context = EventContext::from_endpoint(&endpoint, "nvue_rest");
+
+        let event = CollectorEvent::Log(Box::new(LogRecord {
+            body: "nvue_rest: collected system reboot reason".to_string(),
+            severity: "INFO".to_string(),
+            attributes: vec![
+                (Cow::Borrowed("gentime"), "2026-07-05 12:34:56".to_string()),
+                (Cow::Borrowed("user"), "admin".to_string()),
+            ],
+            diagnostic_record: None,
+        }));
+
+        let logs = capture_logs(|| sink.handle_event(&context, &event));
+
+        let log = logs.first().expect("tracing sink emits one log");
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(log.message, "Log event");
+
+        assert_eq!(
+            log.field("attributes"),
+            Some(r#"[("gentime", "2026-07-05 12:34:56"), ("user", "admin")]"#)
+        );
     }
 }

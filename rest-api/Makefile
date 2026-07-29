@@ -5,14 +5,30 @@
 .PHONY: build docker-build docker-build-local
 .PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
 .PHONY: validate-openapi preview-openapi generate-client
-.PHONY: core-proto core-proto-clean core-proto-fetch core-proto-fmt core-protogen flow-proto flow-protogen
+.PHONY: core-proto core-proto-clean core-proto-fetch core-proto-fmt core-protogen flow-proto flow-protogen tools-build tools-clean
 .PHONY: pre-commit-install pre-commit-run pre-commit-update
+
+# CLI tool versions are pinned in go.mod's tool (...) stanza (Go 1.24+).
+# Tools that can be invoked directly use `go tool` so the exact pinned version
+# from go.mod is always used with no separate install step.
+# Tools that buf calls as subprocesses (protoc-gen-*) must be real executables
+# on PATH; they are built into .tools/ from the pinned go.mod versions by the
+# .tools-stamp target and injected via PATH in targets that need them.
+TOOLS_DIR       := $(CURDIR)/.tools
+BUF             := go tool buf
+GOLANGCI_LINT   := go tool golangci-lint
+REVIVE          := go tool revive
 
 # Build configuration
 BUILD_DIR := build/binaries
 IMAGE_REGISTRY := localhost:5000
 IMAGE_TAG := latest
 DOCKERFILE_DIR := docker/production
+DOCKER_ARCHES := amd64 arm64
+LOCAL_REGISTRY_CONTAINER := nico-build-registry
+REST_IMAGES := nico-rest-api nico-rest-workflow nico-rest-site-manager \
+	nico-rest-site-agent nico-rest-db nico-rest-cert-manager nico-flow \
+	nico-psm nico-nsm nico-mcp
 
 # PostgreSQL container configuration
 POSTGRES_CONTAINER_NAME := project-test
@@ -121,8 +137,8 @@ fmt-go:
 
 lint-go:
 	go vet ./...
-	golangci-lint run --issues-exit-code 0 --output.code-climate.path=stdout | jq .
-	go list ./... | xargs -L1 revive -config .revive.toml -set_exit_status
+	$(GOLANGCI_LINT) run --issues-exit-code 0 --output.code-climate.path=stdout | jq .
+	go list ./... | xargs -L1 $(REVIVE) -config .revive.toml -set_exit_status
 
 test-ipam:
 	$(MAKE) ensure-postgres
@@ -264,16 +280,25 @@ nico-mcp:
 	@echo "Installed nico-mcp to $(INSTALL_DIR)/nico-mcp"
 
 docker-build:
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-api:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-api .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-workflow:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-workflow .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-site-manager:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-site-manager .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-site-agent:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-site-agent .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-db:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-db .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-cert-manager:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-rest-cert-manager .
-	docker build -t $(IMAGE_REGISTRY)/nico-flow:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-flow .
-	docker build -t $(IMAGE_REGISTRY)/nico-psm:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-psm .
-	docker build -t $(IMAGE_REGISTRY)/nico-nsm:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-nsm .
-	docker build -t $(IMAGE_REGISTRY)/nico-mcp:$(IMAGE_TAG) -f $(DOCKERFILE_DIR)/Dockerfile.nico-mcp .
+	@if [ "$(IMAGE_REGISTRY)" = "localhost:5000" ] && ! curl -fsS http://localhost:5000/v2/ >/dev/null 2>&1; then \
+		if docker inspect $(LOCAL_REGISTRY_CONTAINER) >/dev/null 2>&1; then \
+			docker start $(LOCAL_REGISTRY_CONTAINER); \
+		else \
+			docker run -d --rm --name $(LOCAL_REGISTRY_CONTAINER) -p 5000:5000 registry:2; \
+		fi; \
+	fi
+	@set -e; \
+	for image in $(REST_IMAGES); do \
+		for arch in $(DOCKER_ARCHES); do \
+			docker buildx build --platform linux/$$arch --push \
+				--build-arg TARGETOS=linux --build-arg TARGETARCH=$$arch \
+				-t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-$$arch \
+				-f $(DOCKERFILE_DIR)/Dockerfile.$$image .; \
+		done; \
+		docker buildx imagetools create -t $(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG) \
+			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-amd64 \
+			$(IMAGE_REGISTRY)/$$image:$(IMAGE_TAG)-arm64; \
+	done
 
 core-proto:
 	$(MAKE) core-proto-clean
@@ -298,29 +323,22 @@ core-proto-fmt:
 	@echo "Formatting Core protobuf files"
 	cd proto/cmd/core-proto-fmt && go run main.go
 
-core-protogen:
-	if ! command -v buf >/dev/null 2>&1; then \
-		echo "buf is not installed. Please install buf: https://buf.build/docs/installation"; \
-		exit 1; \
-	fi
-	if ! command -v protoc-gen-go >/dev/null 2>&1; then \
-		echo "protoc-gen-go is not installed. Please install it: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11"; \
-		exit 1; \
-	fi
-	if ! protoc-gen-go --version | grep -q "1.36.11"; then \
-		echo "protoc-gen-go is not version 1.36.11. Please install it: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11"; \
-		exit 1; \
-	fi
-	if ! command -v protoc-gen-go-grpc >/dev/null 2>&1; then \
-		echo "protoc-gen-go-grpc is not installed. Please install it: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1"; \
-		exit 1; \
-	fi
-	if ! protoc-gen-go-grpc --version | grep -q "1.6.1"; then \
-		echo "protoc-gen-go-grpc is not version 1.6.1. Please install it: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1"; \
-		exit 1; \
-	fi
+# Build pinned protoc plugins into .tools/ so buf can find them on PATH.
+# Rebuilds only when go.mod or go.sum changes.
+.tools-stamp: go.mod go.sum
+	@mkdir -p $(TOOLS_DIR)
+	go build -o $(TOOLS_DIR)/protoc-gen-go      google.golang.org/protobuf/cmd/protoc-gen-go
+	go build -o $(TOOLS_DIR)/protoc-gen-go-grpc google.golang.org/grpc/cmd/protoc-gen-go-grpc
+	@touch $@
+
+tools-build: .tools-stamp
+
+tools-clean:
+	rm -rf $(TOOLS_DIR) .tools-stamp
+
+core-protogen: .tools-stamp
 	echo "Generating protobuf for Core"
-	cd proto/core && buf generate
+	cd proto/core && PATH="$(TOOLS_DIR):$$PATH" $(BUF) generate
 	go fmt ./...
 	python3 scripts/check_source_headers.py --fix
 
@@ -341,16 +359,16 @@ flow-proto-fetch:
 		./proto/scripts/add-go-package-option.sh "proto/flow/src/v1/$$(basename "$$file")" "github.com/NVIDIA/infra-controller/rest-api/proto/flow"; \
 	done
 
-flow-protogen:
+flow-protogen: .tools-stamp
 	echo "Generating protobuf for Flow"
-	cd proto/flow && buf generate
+	cd proto/flow && PATH="$(TOOLS_DIR):$$PATH" $(BUF) generate
 	go fmt ./...
 
 # =============================================================================
 # Kind Local Deployment Targets
 # =============================================================================
 
-.PHONY: kind-up kind-down kind-deploy kind-load kind-apply kind-redeploy kind-status kind-logs kind-reset kind-reset-infra kind-reset-kustomize kind-reset-helm kind-verify setup-site-agent test-simple-sdk-example
+.PHONY: kind-up kind-down kind-deploy kind-load kind-apply kind-redeploy kind-status kind-logs kind-reset kind-reset-infra kind-reset-kustomize kind-reset-helm kind-verify setup-site-agent configure-local-core-site-agent test-simple-sdk-example
 .PHONY: deploy-overlay-api deploy-overlay-cert-manager deploy-overlay-site-manager deploy-overlay-workflow
 .PHONY: helm-lint helm-template helm-deploy helm-deploy-site-agent helm-deploy-mcp helm-deploy-all helm-redeploy helm-verify helm-verify-site-agent helm-uninstall
 
@@ -358,6 +376,19 @@ flow-protogen:
 KIND_CLUSTER_NAME := nico-rest-local
 KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 LOCAL_DOCKERFILE_DIR := docker/local
+
+# Set LOCAL_CORE=true to connect the site-agent to a locally-running nico-core
+# (started from the repo root via dev/mac-local-dev/run-nico-api.sh) instead of
+# the in-cluster mock-core.
+#
+# LOCAL_CORE_HOST must be reachable from inside the kind cluster nodes. On Docker
+# Desktop and colima, host.docker.internal resolves to both IPv6 and IPv4. Go's
+# dialer may prefer IPv6, which is unreachable from Kind pods, so the recipe
+# resolves it to IPv4 before patching the ConfigMap.
+LOCAL_CORE ?=
+LOCAL_CORE_HOST ?= host.docker.internal
+LOCAL_CORE_PORT ?= 1079
+LOCAL_CORE_CERTS_DIR ?= ../dev/certs/localhost
 
 # Recommended colima configuration for full stack with Temporal:
 #   colima start --cpu 8 --memory 8 --disk 100
@@ -368,7 +399,9 @@ docker-build-local:
 	docker build -t $(IMAGE_REGISTRY)/nico-rest-workflow:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-workflow .
 	docker build -t $(IMAGE_REGISTRY)/nico-rest-site-manager:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-site-manager .
 	docker build -t $(IMAGE_REGISTRY)/nico-rest-site-agent:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-site-agent .
-	docker build -t $(IMAGE_REGISTRY)/nico-rest-mock-core:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-mock-core .
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		docker build -t $(IMAGE_REGISTRY)/nico-rest-mock-core:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-mock-core . ; \
+	fi
 	docker build -t $(IMAGE_REGISTRY)/nico-rest-db:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-db .
 	docker build -t $(IMAGE_REGISTRY)/nico-rest-cert-manager:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-rest-cert-manager .
 	docker build -t $(IMAGE_REGISTRY)/nico-mcp:$(IMAGE_TAG) -f $(LOCAL_DOCKERFILE_DIR)/Dockerfile.nico-mcp .
@@ -392,7 +425,9 @@ kind-load:
 	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-workflow:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
 	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-site-manager:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
 	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-site-agent:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
-	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-mock-core:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		kind load docker-image $(IMAGE_REGISTRY)/nico-rest-mock-core:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME) ; \
+	fi
 	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-db:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
 	kind load docker-image $(IMAGE_REGISTRY)/nico-rest-cert-manager:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
 	kind load docker-image $(IMAGE_REGISTRY)/nico-mcp:$(IMAGE_TAG) --name $(KIND_CLUSTER_NAME)
@@ -424,7 +459,9 @@ kind-redeploy: docker-build-local kind-load
 	kubectl -n nico-rest rollout restart deployment/nico-rest-api
 	kubectl -n nico-rest rollout restart deployment/nico-rest-cloud-worker
 	kubectl -n nico-rest rollout restart deployment/nico-rest-site-worker
-	kubectl -n nico-rest rollout restart deployment/nico-rest-mock-core
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		kubectl -n nico-rest rollout restart deployment/nico-rest-mock-core ; \
+	fi
 	kubectl -n nico-rest rollout restart deployment/nico-rest-cert-manager
 	kubectl -n nico-rest rollout restart deployment/nico-rest-site-manager
 	kubectl -n nico-rest rollout restart statefulset/nico-rest-site-agent
@@ -432,7 +469,9 @@ kind-redeploy: docker-build-local kind-load
 	kubectl -n nico-rest rollout status deployment/nico-rest-api --timeout=120s
 	kubectl -n nico-rest rollout status deployment/nico-rest-cloud-worker --timeout=120s
 	kubectl -n nico-rest rollout status deployment/nico-rest-site-worker --timeout=120s
-	kubectl -n nico-rest rollout status deployment/nico-rest-mock-core --timeout=120s
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		kubectl -n nico-rest rollout status deployment/nico-rest-mock-core --timeout=120s ; \
+	fi
 	kubectl -n nico-rest rollout status deployment/nico-rest-cert-manager --timeout=120s
 	kubectl -n nico-rest rollout status deployment/nico-rest-site-manager --timeout=120s
 	kubectl -n nico-rest rollout status statefulset/nico-rest-site-agent --timeout=120s
@@ -548,9 +587,11 @@ kind-reset-infra: docker-build-local
 	kubectl apply -k deploy/kustomize/base/keycloak
 	kubectl -n nico-rest rollout status deployment/keycloak --timeout=240s
 
-	@echo "Setting up Nico Mock Core (dev only, not in Helm chart)..."
-	kubectl apply -k deploy/kustomize/overlays/mock-core
-	kubectl -n nico-rest rollout status deployment/nico-rest-mock-core --timeout=240s
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		echo "Setting up Nico Mock Core (dev only, not in Helm chart)..." ; \
+		kubectl apply -k deploy/kustomize/overlays/mock-core ; \
+		kubectl -n nico-rest rollout status deployment/nico-rest-mock-core --timeout=240s ; \
+	fi
 
 	@echo ""
 	@echo "================================================================================"
@@ -596,10 +637,22 @@ kind-reset-kustomize: kind-reset-infra
 
 	@echo "Setting up Nico REST Site Agent..."
 	kubectl apply -k deploy/kustomize/overlays/site-agent
+	@# The base ConfigMap leaves CORE_GRPC_ADDRESS empty (production-neutral).
+	@# For the default kind flow, point the agent at the in-cluster mock-core;
+	@# the LOCAL_CORE=true case is handled by configure-local-core-site-agent below.
+	@if [ "$(LOCAL_CORE)" != "true" ]; then \
+		echo "Pointing site-agent at in-cluster mock-core (CORE_GRPC_ADDRESS=nico-rest-mock-core:11079)..." ; \
+		kubectl -n nico-rest patch configmap nico-rest-site-agent-config --type merge \
+			-p '{"data":{"CORE_GRPC_ADDRESS":"nico-rest-mock-core:11079","CORE_GRPC_SEC_OPT":"0"}}' ; \
+		kubectl -n nico-rest rollout restart statefulset/nico-rest-site-agent ; \
+	fi
 	kubectl -n nico-rest rollout status statefulset/nico-rest-site-agent --timeout=240s
 
 	@echo "Setting up Site Agent secrets..."
 	./scripts/setup-local.sh site-agent
+	@if [ "$(LOCAL_CORE)" = "true" ]; then \
+		$(MAKE) configure-local-core-site-agent ; \
+	fi
 
 	@echo ""
 	@echo "================================================================================"
@@ -608,6 +661,11 @@ kind-reset-kustomize: kind-reset-infra
 	@echo "Temporal UI: http://localhost:8233"
 	@echo "API: http://localhost:8388"
 	@echo "Keycloak: http://localhost:8082"
+	@if [ "$(LOCAL_CORE)" = "true" ]; then \
+		echo "Nico Core: local nico-api at $(LOCAL_CORE_HOST):$(LOCAL_CORE_PORT) (LOCAL_CORE=true)" ; \
+	else \
+		echo "Nico Core: mock-core (in-cluster)" ; \
+	fi
 	@echo "================================================================================"
 
 # =============================================================================
@@ -627,6 +685,11 @@ kind-reset-helm: kind-reset-infra
 	@echo "Temporal UI: http://localhost:8233"
 	@echo "API: http://localhost:8388"
 	@echo "Keycloak: http://localhost:8082"
+	@if [ "$(LOCAL_CORE)" = "true" ]; then \
+		echo "Nico Core: local nico-api at $(LOCAL_CORE_HOST):$(LOCAL_CORE_PORT) (LOCAL_CORE=true)" ; \
+	else \
+		echo "Nico Core: mock-core (in-cluster)" ; \
+	fi
 	@echo "================================================================================"
 
 # Default: full reset using Helm deployment
@@ -667,15 +730,21 @@ helm-deploy:
 helm-deploy-site-agent:
 	@echo "Installing site-agent chart (will CrashLoop until bootstrapped)..."
 	helm upgrade --install nico-rest-site-agent $(SITE_AGENT_CHART)/ \
-		--namespace nico-rest $(HELM_SET) --timeout 1m || true
+		--namespace nico-rest $(HELM_SET) \
+		$(if $(filter true,$(LOCAL_CORE)),--set certificate.enabled=false) \
+		$(if $(filter-out true,$(LOCAL_CORE)),--set envConfig.CORE_GRPC_ADDRESS=nico-rest-mock-core:11079 --set envConfig.CORE_GRPC_SEC_OPT=0) \
+		--timeout 1m || true
 	@echo "Running site bootstrap (setup-local.sh site-agent)..."
 	./scripts/setup-local.sh site-agent
+	@if [ "$(LOCAL_CORE)" = "true" ]; then \
+		$(MAKE) configure-local-core-site-agent ; \
+	fi
 	@echo "Waiting for site-agent to stabilize..."
 	kubectl -n nico-rest rollout status statefulset/nico-rest-site-agent --timeout=120s
 
 # Deploy the standalone MCP server chart. The server is parameter-driven; for
 # local dev we point its default base URL at the in-cluster API so a tool call
-# only needs to supply org + token (a per-call base_url still overrides this).
+# only needs to supply org + token (a per-call base_url must match this value).
 helm-deploy-mcp:
 	helm upgrade --install nico-mcp $(MCP_CHART)/ \
 		--namespace nico-rest --create-namespace $(HELM_SET) \
@@ -714,6 +783,34 @@ helm-uninstall:
 # =============================================================================
 # Kind: Utilities
 # =============================================================================
+
+# Point the site-agent at a locally running nico-core instead of in-cluster
+# mock-core. The local nico-api TLS setup writes these certs in the repo root via
+# dev/mac-local-dev/run-nico-api.sh.
+configure-local-core-site-agent:
+	@echo "Creating core-grpc-client-site-agent-certs secret from $(LOCAL_CORE_CERTS_DIR)..."
+	@for f in ca.crt client.crt client.key; do \
+		[ -f "$(LOCAL_CORE_CERTS_DIR)/$$f" ] || { echo "ERROR: $$f not found in $(LOCAL_CORE_CERTS_DIR). Run dev/mac-local-dev/run-nico-api.sh from the repo root first."; exit 1; } ; \
+	done
+	kubectl -n nico-rest create secret generic core-grpc-client-site-agent-certs \
+		--from-file=ca.crt="$(LOCAL_CORE_CERTS_DIR)/ca.crt" \
+		--from-file=tls.crt="$(LOCAL_CORE_CERTS_DIR)/client.crt" \
+		--from-file=tls.key="$(LOCAL_CORE_CERTS_DIR)/client.key" \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@CORE_HOST="$(LOCAL_CORE_HOST)" ; \
+	IPV4=$$(docker exec $$(docker ps -qf name=$(KIND_CLUSTER_NAME)-control-plane) \
+		getent ahosts "$$CORE_HOST" 2>/dev/null \
+		| awk '/STREAM/{print $$1}' | grep -v ':' | head -1) ; \
+	if [ -n "$$IPV4" ]; then \
+		echo "Resolved $$CORE_HOST -> $$IPV4 (using IPv4 to avoid Go IPv6-first dialer issue)" ; \
+		CORE_HOST="$$IPV4" ; \
+	fi ; \
+	echo "Patching site-agent ConfigMap: CORE_GRPC_ADDRESS=$$CORE_HOST:$(LOCAL_CORE_PORT), CORE_GRPC_SEC_OPT=1, SKIP_GRPC_SERVER_AUTH=true..." ; \
+	kubectl -n nico-rest patch configmap nico-rest-site-agent-config --type merge \
+		-p "{\"data\":{\"CORE_GRPC_ADDRESS\":\"$$CORE_HOST:$(LOCAL_CORE_PORT)\",\"CORE_GRPC_SEC_OPT\":\"1\",\"CORE_GRPC_CA_CERT_PATH\":\"/etc/core-grpc/ca.crt\",\"CORE_GRPC_CLIENT_CERT_PATH\":\"/etc/core-grpc/tls.crt\",\"CORE_GRPC_CLIENT_KEY_PATH\":\"/etc/core-grpc/tls.key\",\"CARBIDE_ADDRESS\":\"$$CORE_HOST:$(LOCAL_CORE_PORT)\",\"CARBIDE_SEC_OPT\":\"1\",\"SKIP_GRPC_SERVER_AUTH\":\"true\"}}" ; \
+	echo "Restarting site-agent to pick up local core settings..." ; \
+	kubectl -n nico-rest rollout restart statefulset/nico-rest-site-agent ; \
+	kubectl -n nico-rest rollout status statefulset/nico-rest-site-agent --timeout=120s
 
 # Setup site-agent with a real site created via the API
 setup-site-agent:

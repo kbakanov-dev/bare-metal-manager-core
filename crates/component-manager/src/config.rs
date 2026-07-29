@@ -48,6 +48,13 @@ pub struct ComponentManagerConfig {
     /// Defaults to `false`.
     #[serde(default)]
     pub compute_tray_use_state_controller: bool,
+
+    /// Enables the NVOS password-rotation backend capability.
+    ///
+    /// Keep this rollout gate until every reachable RMS supports repeat-safe
+    /// current-to-target password convergence.
+    #[serde(default)]
+    pub nvos_password_rotation_enabled: bool,
 }
 
 /// Identifies a switch service that should use installed mTLS certificates.
@@ -189,6 +196,17 @@ mod tests {
         assert_eq!(cfg.nv_switch_backend, NvSwitchBackend::Rms);
         assert_eq!(cfg.power_shelf_backend, PowerShelfBackend::Rms);
         assert_eq!(cfg.compute_tray_backend, ComputeBackend::Rms);
+        assert!(!cfg.nvos_password_rotation_enabled);
+    }
+
+    #[test]
+    fn nvos_password_rotation_deserializes() {
+        for (toml, expected) in [("", false), ("nvos_password_rotation_enabled = true", true)] {
+            let cfg: ComponentManagerConfig =
+                toml::from_str(toml).expect("component-manager configuration should deserialize");
+
+            assert_eq!(cfg.nvos_password_rotation_enabled, expected);
+        }
     }
 
     /// One `BackendTlsConfig` worth of path inputs for a resolver table.
@@ -327,14 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn default_switch_mtls_services_matches_rms_defaults() {
-        assert_eq!(
-            effective_switch_mtls_services(&[]),
-            SwitchMtlsService::default_services()
-        );
-    }
-
-    #[test]
     fn default_nmx_cluster_switch_mtls_services_matches_scale_up_fabric() {
         assert_eq!(
             effective_nmx_cluster_switch_mtls_services(&[]),
@@ -350,10 +360,27 @@ mod tests {
     }
 
     #[test]
-    fn switch_mtls_services_empty_uses_all_supported_services() {
-        assert_eq!(
-            effective_switch_mtls_services(&[]),
-            SwitchMtlsService::default_services()
+    fn switch_mtls_services_use_defaults_only_when_empty() {
+        check_values(
+            [
+                Check {
+                    scenario: "empty configuration uses every supported service",
+                    input: Vec::new(),
+                    expect: SwitchMtlsService::default_services(),
+                },
+                Check {
+                    scenario: "configured services are preserved",
+                    input: vec![
+                        SwitchMtlsService::NvueApi,
+                        SwitchMtlsService::ScaleUpFabricManager,
+                    ],
+                    expect: vec![
+                        SwitchMtlsService::NvueApi,
+                        SwitchMtlsService::ScaleUpFabricManager,
+                    ],
+                },
+            ],
+            |services| effective_switch_mtls_services(&services),
         );
     }
 
@@ -372,13 +399,6 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.switch_mtls_services,
-            vec![
-                SwitchMtlsService::NvueApi,
-                SwitchMtlsService::ScaleUpFabricManager,
-            ]
-        );
-        assert_eq!(
-            effective_switch_mtls_services(&cfg.switch_mtls_services),
             vec![
                 SwitchMtlsService::NvueApi,
                 SwitchMtlsService::ScaleUpFabricManager,

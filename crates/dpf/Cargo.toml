@@ -4,6 +4,7 @@ version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "carbide_dpf"
@@ -46,6 +47,7 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 
 carbide-uuid = { path = "../uuid", features = ["sqlx"] }
+carbide-utils = { path = "../utils" }
 
 # Optional dependencies for carbide-dpf-api-harness binary
 clap = { workspace = true, features = ["derive"], optional = true }

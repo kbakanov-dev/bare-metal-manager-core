@@ -25,62 +25,72 @@ use sqlx::postgres::PgRow;
 use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
+use crate::machine_interface::InterfaceType;
 use crate::metadata::Metadata;
 use crate::network_segment::NetworkSegmentType;
 
-/// Per-host DPU operating mode declared by a site operator on an
-/// `ExpectedMachine`. Per-host values win over the site-wide
-/// `[site_explorer] dpu_mode` setting; if neither is set the host
-/// falls back to `DpuMode::DpuMode`.
+/// Operator policy for how NICo treats a host's DPU hardware.
+///
+/// This is distinct from a device's observed operating mode. At the per-host
+/// boundary, [`HostDpuPolicy::Manage`] retains the legacy inheritance behavior:
+/// it defers to the site-wide policy before falling back to managed DPUs.
 ///
 /// Backed by the Postgres enum `dpu_mode_t`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
-#[sqlx(type_name = "dpu_mode_t", rename_all = "snake_case")]
+#[sqlx(type_name = "dpu_mode_t")]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)]
-pub enum DpuMode {
-    /// DPUs are managed by NICo as normal -- upgrades, overlay networking,
-    /// DPA agents, etc. The default.
+pub enum HostDpuPolicy {
+    /// Manage DPUs normally, including upgrades, networking, and DPA agents.
     #[default]
-    DpuMode,
-    /// DPU hardware is physically present but configured as a plain NIC;
-    /// NICo skips DPU ingest / management and treats the host as zero-DPU.
-    NicMode,
-    /// No DPU hardware at all -- a plain host NIC on the underlay.
-    NoDpu,
+    #[sqlx(rename = "dpu_mode")]
+    #[serde(alias = "dpu_mode")]
+    Manage,
+    /// Configure physically present DPUs as NICs and manage the host as zero-DPU.
+    #[sqlx(rename = "nic_mode")]
+    #[serde(alias = "use_as_nic", alias = "nic_mode")]
+    Nic,
+    /// Do not configure or attach DPU hardware to the managed host.
+    #[sqlx(rename = "no_dpu")]
+    #[serde(alias = "no_dpu")]
+    Ignore,
 }
 
-impl DpuMode {
-    /// Returns `true` when the host is not being managed as a host with DPUs
-    /// (`NicMode` or `NoDpu`). Used by site-explorer and the state
-    /// controller to skip DPU-specific work.
-    pub fn is_dpu_managed(&self) -> bool {
-        matches!(self, DpuMode::DpuMode)
-    }
-
-    /// Resolve a host's effective DPU mode from the (optional) per-host
-    /// `ExpectedMachine.dpu_mode` value and the (optional) site-wide
-    /// `[site_explorer] dpu_mode` setting. Notes:
+impl HostDpuPolicy {
+    /// Resolve per-host and site-wide declarations into a concrete policy.
     ///
-    /// - An explicit per-host `NicMode` or `NoDpu` always wins.
-    /// - Per-host `DpuMode` (the default variant) or no `ExpectedMachine`
-    ///   at all == defer to the site-wide setting.
-    /// - Site-wide `NicMode` or `NoDpu` then wins.
-    /// - Site-wide `DpuMode` or missing == fall back to the absolute
-    ///   default of `DpuMode::DpuMode`.
-    pub fn resolve(expected_mode: Option<DpuMode>, site_dpu_mode: Option<DpuMode>) -> DpuMode {
-        match expected_mode {
-            Some(DpuMode::NicMode) => DpuMode::NicMode,
-            Some(DpuMode::NoDpu) => DpuMode::NoDpu,
-            // `DpuMode` (default) or missing == defer to site-wide setting.
-            _ => match site_dpu_mode {
-                Some(DpuMode::NicMode) => DpuMode::NicMode,
-                Some(DpuMode::NoDpu) => DpuMode::NoDpu,
-                // Site-wide `DpuMode` or missing == absolute default.
-                _ => DpuMode::DpuMode,
-            },
+    /// Per-host [`HostDpuPolicy::Nic`] and [`HostDpuPolicy::Ignore`]
+    /// override the site. Per-host [`HostDpuPolicy::Manage`] or a missing
+    /// declaration inherits the site. A missing site declaration resolves to
+    /// [`HostDpuPolicy::Manage`].
+    pub fn resolve(per_host_policy: Option<Self>, site_policy: Option<Self>) -> Self {
+        match per_host_policy {
+            Some(Self::Nic) => Self::Nic,
+            Some(Self::Ignore) => Self::Ignore,
+            Some(Self::Manage) | None => site_policy.unwrap_or_default(),
         }
     }
+
+    /// Whether this policy expects NICo to discover and manage the host's DPUs.
+    pub fn expects_managed_dpus(self) -> bool {
+        matches!(self, Self::Manage)
+    }
+}
+
+#[derive(Deserialize)]
+struct HostDpuPolicyFields {
+    #[serde(default)]
+    dpu_policy: Option<HostDpuPolicy>,
+    #[serde(default)]
+    dpu_mode: Option<HostDpuPolicy>,
+}
+
+fn deserialize_host_dpu_policy<'de, D>(deserializer: D) -> Result<HostDpuPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let fields = HostDpuPolicyFields::deserialize(deserializer)?;
+
+    Ok(fields.dpu_policy.or(fields.dpu_mode).unwrap_or_default())
 }
 
 /// Controls how a BMC's IP address is assigned and whether it is retained.
@@ -136,17 +146,156 @@ pub struct ExpectedMachineRequest {
     pub bmc_mac_address: Option<MacAddress>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ExpectedHostNic {
-    pub mac_address: MacAddress,
-    /// The network segment type this NIC's first DHCP lease should come from.
+/// Identifies which machine endpoint an expected interface belongs to.
+///
+/// The role determines the resulting [`InterfaceType`] and whether the
+/// interface has a role-defined primary state. It does not choose a network
+/// segment or change the allocation policy available to that interface.
+///
+/// Host BMC identity remains on [`ExpectedMachine::bmc_mac_address`].
+/// [NVIDIA/infra-controller#4103](https://github.com/NVIDIA/infra-controller/issues/4103)
+/// tracks representing its network settings with the same interface model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedInterfaceRole {
+    /// A host operating-system interface. This preserves the behavior of
+    /// declarations created before interface roles were introduced.
+    #[default]
+    Host,
+    /// The DPU operating-system interface.
+    DpuOs,
+    /// The DPU's Redfish/BMC interface.
+    DpuBmc,
+}
+
+impl std::fmt::Display for ExpectedInterfaceRole {
+    /// Write the canonical TOML/JSON spelling used for this role.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Host => "host",
+            Self::DpuOs => "dpu_os",
+            Self::DpuBmc => "dpu_bmc",
+        })
+    }
+}
+
+impl ExpectedInterfaceRole {
+    /// Return whether this role participates in machine-wide Host primary
+    /// selection.
     ///
-    /// A NIC's segment is normally determined by its DHCP relay -- the segment
-    /// whose prefix contains the relay address. Where segment prefixes nest or
-    /// overlap, one relay can match several segments; declaring this narrows the
-    /// choice to the segment of this type. `None` (with no legacy
-    /// [`Self::nic_type`]) leaves the relay's match as-is. Resolved via
-    /// [`Self::resolved_network_segment_type`].
+    /// Serde also uses this predicate to omit the default Host role from stored
+    /// JSON, keeping legacy Host declarations free of a new role field.
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    /// Return the database interface type produced by this endpoint role.
+    ///
+    /// Host and DPU OS endpoints both exchange operating-system data. A DPU
+    /// BMC endpoint uses the BMC interface type so the existing BMC-specific
+    /// routing and address behavior still applies.
+    pub fn interface_type(self) -> InterfaceType {
+        match self {
+            Self::Host | Self::DpuOs => InterfaceType::Data,
+            Self::DpuBmc => InterfaceType::Bmc,
+        }
+    }
+
+    /// Return the primary-interface value fixed by this endpoint role.
+    ///
+    /// Host primary selection needs all Host declarations on the
+    /// `ExpectedMachine`, so `None` tells the caller to use that machine-wide
+    /// result. A DPU OS interface is always its DPU's primary data interface,
+    /// while a DPU BMC interface is never primary.
+    pub fn primary_interface_override(self) -> Option<bool> {
+        match self {
+            Self::Host => None,
+            Self::DpuOs => Some(true),
+            Self::DpuBmc => Some(false),
+        }
+    }
+}
+
+/// Controls how an expected interface receives and retains its IP address.
+///
+/// When the policy is omitted, [`ExpectedHostNic::resolved_ip_allocation`]
+/// preserves the legacy configuration contract: an interface with
+/// [`ExpectedHostNic::fixed_ip`] is fixed, and one without it is dynamic.
+/// Explicit `Dynamic` differs from omission because it rejects a simultaneous
+/// `fixed_ip` instead of inferring `Fixed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedInterfaceIpAllocation {
+    /// Allocate a normal DHCP lease that may expire and change. A configured
+    /// segment-type guard must match the segment selected by the DHCP relay.
+    Dynamic,
+    /// Reserve the operator-specified [`ExpectedHostNic::fixed_ip`]. An
+    /// explicit Fixed policy or DPU role requires a configured managed prefix
+    /// to contain the address. That prefix selects the segment, and a
+    /// configured segment-type guard must match it.
+    Fixed,
+    /// Allocate through DHCP, then change that address row to Static for the
+    /// lifetime of this interface row. The address is not saved in
+    /// `ExpectedMachine` for reuse after the interface is deleted and
+    /// re-ingested, and changing the policy later does not convert that row
+    /// back to DHCP. A configured segment-type guard must match the segment
+    /// selected by the DHCP relay.
+    Retained,
+}
+
+impl ExpectedInterfaceIpAllocation {
+    /// Validate whether this explicit or resolved policy may be paired with
+    /// the interface's `fixed_ip` declaration.
+    ///
+    /// Only `Fixed` accepts a configured address. `Dynamic` and `Retained`
+    /// require DHCP to select one.
+    pub fn validate(self, has_fixed_ip: bool) -> Result<(), &'static str> {
+        match self {
+            Self::Fixed if !has_fixed_ip => Err("ip_allocation=fixed requires fixed_ip"),
+            Self::Dynamic if has_fixed_ip => {
+                Err("ip_allocation=dynamic cannot be combined with fixed_ip")
+            }
+            Self::Retained if has_fixed_ip => {
+                Err("ip_allocation=retained cannot be combined with fixed_ip; use fixed")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Configures one interface that NICo may encounter while ingesting an
+/// `ExpectedMachine`.
+///
+/// Every role uses the same allocation and optional segment-guard fields. The
+/// role only supplies endpoint-specific interface type and primary behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ExpectedHostNic {
+    /// MAC address used to match DHCP and discovered interface traffic to this
+    /// declaration.
+    pub mac_address: MacAddress,
+    /// Which machine endpoint owns this interface. Missing values retain the
+    /// legacy host-interface behavior.
+    #[serde(default, skip_serializing_if = "ExpectedInterfaceRole::is_host")]
+    pub role: ExpectedInterfaceRole,
+    /// Optional IP allocation policy. Missing declarations infer `Fixed` when
+    /// [`Self::fixed_ip`] is configured and `Dynamic` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_allocation: Option<ExpectedInterfaceIpAllocation>,
+    /// Optional guard for the interface's network segment type.
+    ///
+    /// For an explicit allocation policy or DPU role, Dynamic and Retained use
+    /// this as a guard on the segment selected by the DHCP relay, while Fixed
+    /// uses it as a guard on the segment containing the configured address.
+    ///
+    /// A legacy Host declaration that omits `ip_allocation` keeps the earlier
+    /// behavior where this field only narrows initial DHCP segment selection.
+    /// This compatibility rule is exposed by [`Self::segment_type_guard`].
+    /// `None` (with no legacy [`Self::nic_type`]) leaves DHCP selection
+    /// unconstrained. Fixed uses the managed prefix containing the address;
+    /// only a legacy Host declaration with an omitted policy may fall back to
+    /// `static-assignments` when no configured prefix contains it. Updates
+    /// retain the existing full-replacement behavior, so omission clears this
+    /// field.
     #[serde(default)]
     pub network_segment_type: Option<NetworkSegmentType>,
     /// Legacy free-form NIC-type segment hint (`bf3`, `onboard`, `oob`, ...).
@@ -156,20 +305,102 @@ pub struct ExpectedHostNic {
     pub fixed_mask: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_ip_addr_lossy")]
     pub fixed_gateway: Option<IpAddr>,
-    /// When true, `primary` flags this NIC as the host's boot (primary)
-    /// interface. At most one NIC per ExpectedMachine may be marked primary
-    /// (which is enforced in the API). This ultimately propagates into the
-    /// machine_interfaces table, but, in today's world, only really applies
-    /// to zero-DPU. A machine *with* a DPU will end up taking over when
-    /// site-explorer finds a DPU for the machine (and update the primary
-    /// interface accordingly).
+    /// Host-role interfaces may set `primary=true` to declare the host's boot
+    /// interface. When one Host interface is declared primary, the other Host
+    /// interfaces become non-primary. An explicit `false` remains accepted for
+    /// compatibility but does not replace that machine-wide selection. DPU OS
+    /// interfaces are primary data interfaces and DPU BMC interfaces are
+    /// non-primary; those roles must omit this field.
     #[serde(default)]
     pub primary: Option<bool>,
 }
 
 impl ExpectedHostNic {
-    /// The network segment type to narrow this NIC's DHCP segment selection to,
-    /// if the declaration names one. Prefers the typed
+    /// Return the configured allocation policy or infer the legacy policy from
+    /// whether this interface has a fixed IP.
+    ///
+    /// Omission must remain distinguishable from explicit `Dynamic`: old
+    /// declarations supplied only `fixed_ip`, while explicit `Dynamic` rejects
+    /// that same combination during validation. Inferring `Fixed` here does not
+    /// opt a legacy Host declaration into the newer segment-type guard; see
+    /// [`Self::segment_type_guard`].
+    pub fn resolved_ip_allocation(&self) -> ExpectedInterfaceIpAllocation {
+        self.ip_allocation.unwrap_or_else(|| {
+            if self.fixed_ip.is_some() {
+                ExpectedInterfaceIpAllocation::Fixed
+            } else {
+                ExpectedInterfaceIpAllocation::Dynamic
+            }
+        })
+    }
+
+    /// Validate the effective allocation policy against this interface's
+    /// fixed-IP declaration.
+    pub fn validate_ip_allocation(&self) -> Result<(), &'static str> {
+        self.resolved_ip_allocation()
+            .validate(self.fixed_ip.is_some())
+    }
+
+    /// Validate the declaration and require one resolved allocation policy.
+    ///
+    /// Callers that materialize Fixed or Retained state use this shared check
+    /// so policy validation cannot drift between API, DHCP, and Site Explorer
+    /// paths.
+    pub fn require_ip_allocation(
+        &self,
+        required: ExpectedInterfaceIpAllocation,
+    ) -> Result<(), &'static str> {
+        self.validate_ip_allocation()?;
+        if self.resolved_ip_allocation() == required {
+            return Ok(());
+        }
+
+        Err(match required {
+            ExpectedInterfaceIpAllocation::Dynamic => {
+                "expected interface does not use dynamic IP allocation"
+            }
+            ExpectedInterfaceIpAllocation::Fixed => {
+                "expected interface does not use fixed IP allocation"
+            }
+            ExpectedInterfaceIpAllocation::Retained => {
+                "expected interface does not use retained IP allocation"
+            }
+        })
+    }
+
+    /// Return the configured address after validating that this interface uses
+    /// Fixed allocation.
+    pub fn fixed_reservation_ip(&self) -> Result<IpAddr, &'static str> {
+        self.require_ip_allocation(ExpectedInterfaceIpAllocation::Fixed)?;
+        self.fixed_ip.ok_or("ip_allocation=fixed requires fixed_ip")
+    }
+
+    /// Return whether this declaration keeps the legacy Host allocation
+    /// behavior.
+    ///
+    /// Before roles and allocation policies existed, Host fixed IPs outside
+    /// every managed prefix used `static-assignments`, and
+    /// `network_segment_type` only narrowed the first DHCP segment selection.
+    /// An explicit policy or either DPU role opts into the generalized
+    /// ExpectedInterface contract instead.
+    pub fn uses_legacy_host_allocation(&self) -> bool {
+        self.role.is_host() && self.ip_allocation.is_none()
+    }
+
+    /// Return the typed segment guard for declarations using the generalized
+    /// ExpectedInterface policy contract.
+    ///
+    /// Before roles and allocation policies existed, a Host declaration could
+    /// use `network_segment_type` only to narrow initial DHCP selection. Keep
+    /// that behavior when both new fields are omitted. An explicit policy or a
+    /// DPU role opts into the same guard semantics for every allocation path.
+    pub fn segment_type_guard(&self) -> Option<NetworkSegmentType> {
+        self.network_segment_type
+            .filter(|_| !self.uses_legacy_host_allocation())
+    }
+
+    /// Return the network segment type that narrows Dynamic or Retained DHCP
+    /// segment selection, if the declaration names one. Prefers the typed
     /// [`Self::network_segment_type`]; otherwise maps the legacy
     /// [`Self::nic_type`] string so machines declared before the typed field
     /// keep their segment. `None` -> selection stays with whatever segment(s)
@@ -234,12 +465,14 @@ pub struct ExpectedMachineData {
     /// factory-default credentials in Vault as-is.
     #[serde(default)]
     pub bmc_retain_credentials: Option<bool>,
-    /// Per-host DPU operating mode (default `DpuMode::DpuMode` for
-    /// backward compat). See `DpuMode` for semantics. Operators set
-    /// this to `NicMode` when a physically-present DPU should be treated
-    /// as a plain NIC, or to `NoDpu` when there's no DPU hardware at all.
-    #[serde(default)]
-    pub dpu_mode: DpuMode,
+    /// Per-host DPU policy. The default [`HostDpuPolicy::Manage`] inherits the
+    /// site policy. The legacy `dpu_mode` field and its values remain accepted
+    /// during deserialization.
+    ///
+    /// This type is deserialization-only. The nested flattening is intentional
+    /// for dual-key compatibility and is incompatible with `deny_unknown_fields`.
+    #[serde(flatten, deserialize_with = "deserialize_host_dpu_policy")]
+    pub dpu_policy: HostDpuPolicy,
     /// Per-host control over how this BMC's IP is assigned and retained.
     /// Defaults to `BmcIpAllocationType::Auto`, which infers `Fixed` from a
     /// configured `bmc_ip_address` and otherwise `Retained` (pins an
@@ -267,7 +500,7 @@ impl ExpectedMachineData {
     pub fn declared_primary_mac(&self) -> Option<MacAddress> {
         self.host_nics
             .iter()
-            .find(|nic| nic.primary == Some(true))
+            .find(|nic| nic.role.is_host() && nic.primary == Some(true))
             .map(|nic| nic.mac_address)
     }
 }
@@ -322,7 +555,7 @@ impl<'r> FromRow<'r, PgRow> for ExpectedMachine {
                 dpf_enabled: row.try_get("dpf_enabled")?,
                 bmc_ip_address: row.try_get("bmc_ip_address")?,
                 bmc_retain_credentials: row.try_get("bmc_retain_credentials")?,
-                dpu_mode: row.try_get("dpu_mode")?,
+                dpu_policy: row.try_get("dpu_mode")?,
                 bmc_ip_allocation: row.try_get("bmc_ip_allocation")?,
                 host_lifecycle_profile: row
                     .try_get::<sqlx::types::Json<HostLifecycleProfile>, _>("host_lifecycle_profile")
@@ -357,106 +590,298 @@ pub struct UnexpectedMachine {
 #[cfg(test)]
 mod tests {
     use carbide_test_support::Outcome::*;
-    use carbide_test_support::scenarios;
+    use carbide_test_support::{Check, check_values, scenarios, value_scenarios};
 
     use super::*;
 
-    /// Nothing set anywhere -- the host falls back to the absolute
-    /// default, `DpuMode::DpuMode`.
     #[test]
-    fn resolve_no_expected_mode_no_site_setting_returns_dpu_mode() {
-        assert_eq!(DpuMode::resolve(None, None), DpuMode::DpuMode);
-    }
-
-    /// Explicit per-host `DpuMode` is indistinguishable from "not set"
-    /// in the storage type (the default variant), so it also defers to
-    /// the site-wide setting.
-    #[test]
-    fn resolve_explicit_per_host_dpu_mode_defers_to_site_setting() {
-        assert_eq!(
-            DpuMode::resolve(Some(DpuMode::DpuMode), None),
-            DpuMode::DpuMode
-        );
-        assert_eq!(
-            DpuMode::resolve(Some(DpuMode::DpuMode), Some(DpuMode::NicMode)),
-            DpuMode::NicMode
-        );
-    }
-
-    /// An explicit per-host `NicMode` always wins, regardless of the
-    /// site-wide setting. This is the "I want this specific host in
-    /// NIC mode" override.
-    #[test]
-    fn resolve_per_host_nic_mode_always_wins() {
-        for site_dpu_mode in [None, Some(DpuMode::DpuMode), Some(DpuMode::NoDpu)] {
-            assert_eq!(
-                DpuMode::resolve(Some(DpuMode::NicMode), site_dpu_mode),
-                DpuMode::NicMode,
-                "site_dpu_mode={site_dpu_mode:?}"
-            );
+    fn host_dpu_policy_resolves_legacy_declarations() {
+        struct Declarations {
+            per_host: Option<HostDpuPolicy>,
+            site: Option<HostDpuPolicy>,
         }
-    }
 
-    /// An explicit per-host `NoDpu` always wins. Useful for hosts where
-    /// the operator knows there's genuinely no DPU hardware (as opposed
-    /// to "DPU present but used as NIC", which is `NicMode`).
-    #[test]
-    fn resolve_per_host_no_dpu_always_wins() {
-        for site_dpu_mode in [None, Some(DpuMode::DpuMode), Some(DpuMode::NicMode)] {
-            assert_eq!(
-                DpuMode::resolve(Some(DpuMode::NoDpu), site_dpu_mode),
-                DpuMode::NoDpu,
-                "site_dpu_mode={site_dpu_mode:?}"
-            );
-        }
-    }
-
-    /// Site-wide `NicMode` applies to hosts that don't declare a
-    /// per-host mode -- this is the whole point of the site-wide
-    /// setting (flip an entire site without per-host edits).
-    #[test]
-    fn resolve_site_wide_nic_mode_applies_when_per_host_is_unset() {
-        assert_eq!(
-            DpuMode::resolve(None, Some(DpuMode::NicMode)),
-            DpuMode::NicMode
+        check_values(
+            [
+                Check {
+                    scenario: "unset host, unset site",
+                    input: Declarations {
+                        per_host: None,
+                        site: None,
+                    },
+                    expect: HostDpuPolicy::Manage,
+                },
+                Check {
+                    scenario: "unset host, managed site",
+                    input: Declarations {
+                        per_host: None,
+                        site: Some(HostDpuPolicy::Manage),
+                    },
+                    expect: HostDpuPolicy::Manage,
+                },
+                Check {
+                    scenario: "unset host, NIC-mode site",
+                    input: Declarations {
+                        per_host: None,
+                        site: Some(HostDpuPolicy::Nic),
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "unset host, no-DPU site",
+                    input: Declarations {
+                        per_host: None,
+                        site: Some(HostDpuPolicy::Ignore),
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+                Check {
+                    scenario: "inheriting host, unset site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Manage),
+                        site: None,
+                    },
+                    expect: HostDpuPolicy::Manage,
+                },
+                Check {
+                    scenario: "inheriting host, managed site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Manage),
+                        site: Some(HostDpuPolicy::Manage),
+                    },
+                    expect: HostDpuPolicy::Manage,
+                },
+                Check {
+                    scenario: "inheriting host, NIC-mode site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Manage),
+                        site: Some(HostDpuPolicy::Nic),
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "inheriting host, no-DPU site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Manage),
+                        site: Some(HostDpuPolicy::Ignore),
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+                Check {
+                    scenario: "NIC-mode host, unset site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Nic),
+                        site: None,
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "NIC-mode host, managed site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Nic),
+                        site: Some(HostDpuPolicy::Manage),
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "NIC-mode host, NIC-mode site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Nic),
+                        site: Some(HostDpuPolicy::Nic),
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "NIC-mode host, no-DPU site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Nic),
+                        site: Some(HostDpuPolicy::Ignore),
+                    },
+                    expect: HostDpuPolicy::Nic,
+                },
+                Check {
+                    scenario: "no-DPU host, unset site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Ignore),
+                        site: None,
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+                Check {
+                    scenario: "no-DPU host, managed site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Ignore),
+                        site: Some(HostDpuPolicy::Manage),
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+                Check {
+                    scenario: "no-DPU host, NIC-mode site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Ignore),
+                        site: Some(HostDpuPolicy::Nic),
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+                Check {
+                    scenario: "no-DPU host, no-DPU site",
+                    input: Declarations {
+                        per_host: Some(HostDpuPolicy::Ignore),
+                        site: Some(HostDpuPolicy::Ignore),
+                    },
+                    expect: HostDpuPolicy::Ignore,
+                },
+            ],
+            |Declarations { per_host, site }| HostDpuPolicy::resolve(per_host, site),
         );
-        assert_eq!(
-            DpuMode::resolve(Some(DpuMode::DpuMode), Some(DpuMode::NicMode)),
-            DpuMode::NicMode
+    }
+
+    #[test]
+    fn host_dpu_policy_expects_managed_dpus() {
+        value_scenarios!(
+            run = HostDpuPolicy::expects_managed_dpus;
+            "manage" {
+                HostDpuPolicy::Manage => true,
+            }
+            "use as NIC" {
+                HostDpuPolicy::Nic => false,
+            }
+            "ignore" {
+                HostDpuPolicy::Ignore => false,
+            }
         );
     }
 
-    /// Same as above for `NoDpu`: site-wide setting applies when the
-    /// per-host value is unset (or the default `DpuMode` placeholder).
     #[test]
-    fn resolve_site_wide_no_dpu_applies_when_per_host_is_unset() {
-        assert_eq!(DpuMode::resolve(None, Some(DpuMode::NoDpu)), DpuMode::NoDpu);
-        assert_eq!(
-            DpuMode::resolve(Some(DpuMode::DpuMode), Some(DpuMode::NoDpu)),
-            DpuMode::NoDpu
+    fn host_dpu_policy_deserializes_new_and_legacy_values() {
+        scenarios!(
+            run = |json| serde_json::from_str::<HostDpuPolicy>(json).map_err(drop);
+            "canonical policy values" {
+                r#""manage""# => Yields(HostDpuPolicy::Manage),
+                r#""nic""# => Yields(HostDpuPolicy::Nic),
+                r#""ignore""# => Yields(HostDpuPolicy::Ignore),
+            }
+
+            "compatibility values" {
+                r#""use_as_nic""# => Yields(HostDpuPolicy::Nic),
+                r#""dpu_mode""# => Yields(HostDpuPolicy::Manage),
+                r#""nic_mode""# => Yields(HostDpuPolicy::Nic),
+                r#""no_dpu""# => Yields(HostDpuPolicy::Ignore),
+            }
         );
     }
 
-    /// Site-wide `DpuMode` is indistinguishable from "not set" -- both
-    /// fall back to the absolute `DpuMode` default. Symmetric with the
-    /// per-host `DpuMode` behavior.
     #[test]
-    fn resolve_site_wide_dpu_mode_resolves_to_dpu_mode() {
-        assert_eq!(
-            DpuMode::resolve(None, Some(DpuMode::DpuMode)),
-            DpuMode::DpuMode
+    fn host_dpu_policy_serializes_and_round_trips_canonical_values() {
+        scenarios!(
+            run = |policy| {
+                let json = serde_json::to_string(&policy).map_err(drop)?;
+                let recovered = serde_json::from_str::<HostDpuPolicy>(&json).map_err(drop)?;
+                Ok::<_, ()>((json, recovered))
+            };
+            "default/manage" {
+                HostDpuPolicy::default() => Yields((
+                    r#""manage""#.to_string(),
+                    HostDpuPolicy::Manage,
+                )),
+            }
+
+            "NIC" {
+                HostDpuPolicy::Nic => Yields((
+                    r#""nic""#.to_string(),
+                    HostDpuPolicy::Nic,
+                )),
+            }
+
+            "ignore" {
+                HostDpuPolicy::Ignore => Yields((
+                    r#""ignore""#.to_string(),
+                    HostDpuPolicy::Ignore,
+                )),
+            }
         );
     }
 
-    /// `is_dpu_managed()` returns true only for the default `DpuMode`
-    /// variant -- the two "not managed by NICo as DPU" cases both return
-    /// false, which is what site-explorer and state handlers use to skip
-    /// DPU-specific work.
     #[test]
-    fn is_dpu_managed_covers_both_skip_cases() {
-        assert!(DpuMode::DpuMode.is_dpu_managed());
-        assert!(!DpuMode::NicMode.is_dpu_managed());
-        assert!(!DpuMode::NoDpu.is_dpu_managed());
+    fn expected_machine_deserializes_new_and_legacy_policy_fields() {
+        scenarios!(
+            run = |json| {
+                serde_json::from_str::<ExpectedMachine>(json)
+                    .map(|em| em.data.dpu_policy)
+                    .map_err(drop)
+            };
+            "policy omitted" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1"
+                }"# => Yields(HostDpuPolicy::Manage),
+            }
+
+            "canonical field and value" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_policy": "nic"
+                }"# => Yields(HostDpuPolicy::Nic),
+            }
+
+            "previous canonical field value remains accepted" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_policy": "use_as_nic"
+                }"# => Yields(HostDpuPolicy::Nic),
+            }
+
+            "legacy field and value" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_mode": "no_dpu"
+                }"# => Yields(HostDpuPolicy::Ignore),
+            }
+
+            "matching new and legacy fields" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_policy": "nic",
+                    "dpu_mode": "nic_mode"
+                }"# => Yields(HostDpuPolicy::Nic),
+            }
+
+            "new field wins over conflicting legacy field" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_policy": "ignore",
+                    "dpu_mode": "dpu_mode"
+                }"# => Yields(HostDpuPolicy::Ignore),
+            }
+
+            "explicit manage wins when legacy field comes first" {
+                r#"{
+                    "bmc_mac_address": "AA:BB:CC:DD:EE:FF",
+                    "bmc_username": "root",
+                    "bmc_password": "pass",
+                    "serial_number": "SN-1",
+                    "dpu_mode": "nic_mode",
+                    "dpu_policy": "manage"
+                }"# => Yields(HostDpuPolicy::Manage),
+            }
+        );
     }
 
     /// JSON deserialization of `ExpectedMachine`, projecting to the
@@ -513,6 +938,266 @@ mod tests {
         let nic: ExpectedHostNic = serde_json::from_str(json).unwrap();
 
         assert_eq!(nic.fixed_gateway, None);
+    }
+
+    #[test]
+    fn expected_interface_role_preserves_legacy_json_format() {
+        let legacy = r#"{
+            "mac_address": "AA:BB:CC:DD:EE:FF",
+            "nic_type": "dpu"
+        }"#;
+        let interface: ExpectedHostNic = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(interface.role, ExpectedInterfaceRole::Host);
+        assert_eq!(interface.ip_allocation, None);
+        let serialized = serde_json::to_value(interface).unwrap();
+        assert_eq!(serialized.get("role"), None);
+        assert_eq!(serialized.get("ip_allocation"), None);
+    }
+
+    #[test]
+    fn expected_interface_roles_use_canonical_names() {
+        check_values(
+            [
+                Check {
+                    scenario: "Host remains omitted from stored JSON",
+                    input: ExpectedInterfaceRole::Host,
+                    expect: ("host".to_string(), None),
+                },
+                Check {
+                    scenario: "DPU OS uses its canonical name",
+                    input: ExpectedInterfaceRole::DpuOs,
+                    expect: ("dpu_os".to_string(), Some(serde_json::json!("dpu_os"))),
+                },
+                Check {
+                    scenario: "DPU BMC uses its canonical name",
+                    input: ExpectedInterfaceRole::DpuBmc,
+                    expect: ("dpu_bmc".to_string(), Some(serde_json::json!("dpu_bmc"))),
+                },
+            ],
+            |role| {
+                let serialized = serde_json::to_value(ExpectedHostNic {
+                    role,
+                    ..Default::default()
+                })
+                .unwrap();
+                (role.to_string(), serialized.get("role").cloned())
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_roles_map_to_interface_behavior() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy host",
+                    input: ExpectedInterfaceRole::Host,
+                    expect: (true, InterfaceType::Data),
+                },
+                Check {
+                    scenario: "DPU OS",
+                    input: ExpectedInterfaceRole::DpuOs,
+                    expect: (false, InterfaceType::Data),
+                },
+                Check {
+                    scenario: "DPU BMC",
+                    input: ExpectedInterfaceRole::DpuBmc,
+                    expect: (false, InterfaceType::Bmc),
+                },
+            ],
+            |role| (role.is_host(), role.interface_type()),
+        );
+    }
+
+    #[test]
+    fn expected_interface_roles_resolve_role_primary_state() {
+        check_values(
+            [
+                Check {
+                    scenario: "legacy Host keeps machine-wide selection",
+                    input: ExpectedInterfaceRole::Host,
+                    expect: None,
+                },
+                Check {
+                    scenario: "DPU OS is always primary",
+                    input: ExpectedInterfaceRole::DpuOs,
+                    expect: Some(true),
+                },
+                Check {
+                    scenario: "DPU BMC is never primary",
+                    input: ExpectedInterfaceRole::DpuBmc,
+                    expect: Some(false),
+                },
+            ],
+            ExpectedInterfaceRole::primary_interface_override,
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_infers_and_validates_policy() {
+        struct Declaration {
+            policy: Option<ExpectedInterfaceIpAllocation>,
+            fixed_ip: Option<IpAddr>,
+        }
+
+        let fixed_ip = Some("192.0.2.10".parse().unwrap());
+        check_values(
+            [
+                Check {
+                    scenario: "omitted policy without fixed IP infers dynamic",
+                    input: Declaration {
+                        policy: None,
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "omitted policy with fixed IP infers fixed",
+                    input: Declaration {
+                        policy: None,
+                        fixed_ip,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Fixed, None),
+                },
+                Check {
+                    scenario: "explicit dynamic without fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Dynamic, None),
+                },
+                Check {
+                    scenario: "explicit dynamic with fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                        fixed_ip,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Dynamic,
+                        Some("ip_allocation=dynamic cannot be combined with fixed_ip"),
+                    ),
+                },
+                Check {
+                    scenario: "explicit fixed with fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Fixed),
+                        fixed_ip,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Fixed, None),
+                },
+                Check {
+                    scenario: "explicit fixed without fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Fixed),
+                        fixed_ip: None,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Fixed,
+                        Some("ip_allocation=fixed requires fixed_ip"),
+                    ),
+                },
+                Check {
+                    scenario: "explicit retained without fixed IP is valid",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Retained),
+                        fixed_ip: None,
+                    },
+                    expect: (ExpectedInterfaceIpAllocation::Retained, None),
+                },
+                Check {
+                    scenario: "explicit retained with fixed IP is rejected",
+                    input: Declaration {
+                        policy: Some(ExpectedInterfaceIpAllocation::Retained),
+                        fixed_ip,
+                    },
+                    expect: (
+                        ExpectedInterfaceIpAllocation::Retained,
+                        Some("ip_allocation=retained cannot be combined with fixed_ip; use fixed"),
+                    ),
+                },
+            ],
+            |declaration| {
+                let interface = ExpectedHostNic {
+                    mac_address: "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+                    ip_allocation: declaration.policy,
+                    fixed_ip: declaration.fixed_ip,
+                    ..Default::default()
+                };
+                (
+                    interface.resolved_ip_allocation(),
+                    interface.validate_ip_allocation().err(),
+                )
+            },
+        );
+    }
+
+    /// Fixed reservation callers share one policy-and-address invariant.
+    #[test]
+    fn expected_interface_fixed_reservation_ip_validates_policy() {
+        let fixed_ip = "192.0.2.10".parse().unwrap();
+        check_values(
+            [
+                Check {
+                    scenario: "legacy fixed address",
+                    input: (None, Some(fixed_ip)),
+                    expect: Ok(fixed_ip),
+                },
+                Check {
+                    scenario: "explicit fixed address",
+                    input: (Some(ExpectedInterfaceIpAllocation::Fixed), Some(fixed_ip)),
+                    expect: Ok(fixed_ip),
+                },
+                Check {
+                    scenario: "dynamic policy",
+                    input: (Some(ExpectedInterfaceIpAllocation::Dynamic), None),
+                    expect: Err("expected interface does not use fixed IP allocation"),
+                },
+                Check {
+                    scenario: "fixed policy without an address",
+                    input: (Some(ExpectedInterfaceIpAllocation::Fixed), None),
+                    expect: Err("ip_allocation=fixed requires fixed_ip"),
+                },
+                Check {
+                    scenario: "retained policy",
+                    input: (Some(ExpectedInterfaceIpAllocation::Retained), None),
+                    expect: Err("expected interface does not use fixed IP allocation"),
+                },
+            ],
+            |(ip_allocation, fixed_ip)| {
+                ExpectedHostNic {
+                    ip_allocation,
+                    fixed_ip,
+                    ..Default::default()
+                }
+                .fixed_reservation_ip()
+            },
+        );
+    }
+
+    #[test]
+    fn expected_interface_ip_allocation_json_uses_canonical_names() {
+        check_values(
+            [
+                Check {
+                    scenario: "dynamic",
+                    input: ExpectedInterfaceIpAllocation::Dynamic,
+                    expect: r#""dynamic""#.to_string(),
+                },
+                Check {
+                    scenario: "fixed",
+                    input: ExpectedInterfaceIpAllocation::Fixed,
+                    expect: r#""fixed""#.to_string(),
+                },
+                Check {
+                    scenario: "retained",
+                    input: ExpectedInterfaceIpAllocation::Retained,
+                    expect: r#""retained""#.to_string(),
+                },
+            ],
+            |policy| serde_json::to_string(&policy).unwrap(),
+        );
     }
 
     #[test]
@@ -693,17 +1378,26 @@ mod tests {
         let mac_a: MacAddress = "AA:BB:CC:00:00:01".parse().unwrap();
         let mac_b: MacAddress = "AA:BB:CC:00:00:02".parse().unwrap();
 
-        let nic = |mac: MacAddress, primary: Option<bool>| ExpectedHostNic {
-            mac_address: mac,
-            primary,
-            ..Default::default()
+        let nic = |mac: MacAddress,
+                   role: ExpectedInterfaceRole,
+                   primary: Option<bool>|
+         -> ExpectedHostNic {
+            ExpectedHostNic {
+                mac_address: mac,
+                role,
+                primary,
+                ..Default::default()
+            }
         };
 
         // Nothing declared -- empty, or only explicit non-primaries.
         assert_eq!(ExpectedMachineData::default().declared_primary_mac(), None);
         assert_eq!(
             ExpectedMachineData {
-                host_nics: vec![nic(mac_a, None), nic(mac_b, Some(false))],
+                host_nics: vec![
+                    nic(mac_a, ExpectedInterfaceRole::Host, None),
+                    nic(mac_b, ExpectedInterfaceRole::Host, Some(false)),
+                ],
                 ..Default::default()
             }
             .declared_primary_mac(),
@@ -713,11 +1407,23 @@ mod tests {
         // The declared NIC wins.
         assert_eq!(
             ExpectedMachineData {
-                host_nics: vec![nic(mac_a, Some(false)), nic(mac_b, Some(true))],
+                host_nics: vec![
+                    nic(mac_a, ExpectedInterfaceRole::Host, Some(false)),
+                    nic(mac_b, ExpectedInterfaceRole::Host, Some(true)),
+                ],
                 ..Default::default()
             }
             .declared_primary_mac(),
             Some(mac_b)
+        );
+
+        assert_eq!(
+            ExpectedMachineData {
+                host_nics: vec![nic(mac_a, ExpectedInterfaceRole::DpuBmc, Some(true))],
+                ..Default::default()
+            }
+            .declared_primary_mac(),
+            None
         );
     }
 
@@ -808,6 +1514,116 @@ mod tests {
                 case.want,
                 "{}",
                 case.name
+            );
+        }
+    }
+
+    /// Explicit policies and DPU roles opt into universal segment guards,
+    /// while a legacy Host declaration keeps first-DHCP selection behavior.
+    #[test]
+    fn segment_type_guard_preserves_legacy_host_compatibility() {
+        struct Case {
+            name: &'static str,
+            role: ExpectedInterfaceRole,
+            ip_allocation: Option<ExpectedInterfaceIpAllocation>,
+            fixed_ip: Option<IpAddr>,
+            network_segment_type: Option<NetworkSegmentType>,
+            expected_guard: Option<NetworkSegmentType>,
+            uses_legacy_host_allocation: bool,
+        }
+
+        for case in [
+            Case {
+                name: "legacy Host declaration",
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: None,
+                fixed_ip: None,
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: None,
+                uses_legacy_host_allocation: true,
+            },
+            Case {
+                name: "legacy Host fixed IP inference",
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: None,
+                fixed_ip: Some("192.0.2.10".parse().unwrap()),
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: None,
+                uses_legacy_host_allocation: true,
+            },
+            Case {
+                name: "explicit Host Dynamic policy",
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                fixed_ip: None,
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: Some(NetworkSegmentType::Admin),
+                uses_legacy_host_allocation: false,
+            },
+            Case {
+                name: "explicit Host Fixed policy",
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Fixed),
+                fixed_ip: Some("192.0.2.10".parse().unwrap()),
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: Some(NetworkSegmentType::Admin),
+                uses_legacy_host_allocation: false,
+            },
+            Case {
+                name: "explicit Host Retained policy",
+                role: ExpectedInterfaceRole::Host,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Retained),
+                fixed_ip: None,
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: Some(NetworkSegmentType::Admin),
+                uses_legacy_host_allocation: false,
+            },
+            Case {
+                name: "DPU OS role",
+                role: ExpectedInterfaceRole::DpuOs,
+                ip_allocation: None,
+                fixed_ip: None,
+                network_segment_type: Some(NetworkSegmentType::Admin),
+                expected_guard: Some(NetworkSegmentType::Admin),
+                uses_legacy_host_allocation: false,
+            },
+            Case {
+                name: "DPU BMC role",
+                role: ExpectedInterfaceRole::DpuBmc,
+                ip_allocation: None,
+                fixed_ip: None,
+                network_segment_type: Some(NetworkSegmentType::Underlay),
+                expected_guard: Some(NetworkSegmentType::Underlay),
+                uses_legacy_host_allocation: false,
+            },
+            Case {
+                name: "no typed segment",
+                role: ExpectedInterfaceRole::DpuOs,
+                ip_allocation: Some(ExpectedInterfaceIpAllocation::Dynamic),
+                fixed_ip: None,
+                network_segment_type: None,
+                expected_guard: None,
+                uses_legacy_host_allocation: false,
+            },
+        ] {
+            let interface = ExpectedHostNic {
+                role: case.role,
+                ip_allocation: case.ip_allocation,
+                fixed_ip: case.fixed_ip,
+                network_segment_type: case.network_segment_type,
+                ..Default::default()
+            };
+            assert_eq!(
+                interface.segment_type_guard(),
+                case.expected_guard,
+                "{}",
+                case.name,
+            );
+            assert_eq!(
+                interface.uses_legacy_host_allocation(),
+                case.uses_legacy_host_allocation,
+                "{}",
+                case.name,
             );
         }
     }

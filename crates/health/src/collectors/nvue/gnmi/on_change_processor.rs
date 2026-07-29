@@ -119,8 +119,8 @@ impl GnmiOnChangeProcessor {
             Some(proto::subscribe_response::Response::Error(e)) => {
                 stream_metrics.stream_errors_total.inc();
                 tracing::warn!(
-                    code = e.code,
-                    message = %e.message,
+                    grpc_status_code = e.code,
+                    error = %e.message,
                     stream = %self.collector_name,
                     "nvue_gnmi ON_CHANGE: server error in stream"
                 );
@@ -383,6 +383,7 @@ mod tests {
             collector_type,
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         }
     }
 
@@ -779,6 +780,7 @@ mod tests {
                     mac: MacAddress::from_str("AA:BB:CC:DD:EE:FF").unwrap(),
                 },
                 collector_type: ON_CHANGE_STREAM_ID_SYSTEM_EVENTS,
+                labels: Default::default(),
                 metadata: Some(EndpointMetadata::Switch(SwitchData {
                     id: Some(switch_id),
                     serial: "SN-SWITCH-001".to_string(),

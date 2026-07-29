@@ -89,7 +89,11 @@ async fn host_uefi_device_version(
 /// Read the host UEFI credential at `key`, mapping a store error or a missing
 /// secret to a `CarbideError`. Used to resolve the password the low-level
 /// `redfish` UEFI calls apply (they no longer read the store themselves).
-async fn read_uefi_credentials(
+///
+/// Takes no database connection: the reader can be Vault-backed, so callers
+/// resolve the version-to-`key` half against the DB first, commit, then call
+/// this -- the remote read must not run while a connection is held.
+pub(crate) async fn read_uefi_credentials(
     reader: &dyn CredentialReader,
     key: &CredentialKey,
 ) -> Result<Credentials, CarbideError> {
@@ -107,31 +111,39 @@ async fn read_uefi_credentials(
         })
 }
 
-/// Resolve the site-wide host UEFI credential to *set* on a device: the secret
-/// at the current `host_uefi` target version (table-driven; v0 = the legacy
-/// unversioned site-default).
-pub(crate) async fn host_uefi_set_credentials(
+/// The `CredentialKey` for the site-wide host UEFI password to *set* on a
+/// device: the secret at the current `host_uefi` target version (table-driven;
+/// v0 = the legacy unversioned site-default).
+///
+/// This is the database half of resolving the credential -- it reads only the
+/// version and returns the key. The caller reads the secret with
+/// `read_uefi_credentials` after committing, so no connection is held across the
+/// remote reader (Vault) request.
+pub(crate) async fn host_uefi_set_credential_key(
     conn: &mut sqlx::PgConnection,
-    reader: &dyn CredentialReader,
-) -> Result<Credentials, CarbideError> {
+) -> Result<CredentialKey, CarbideError> {
     let version = host_uefi_target_version(conn).await.map_err(|e| {
         CarbideError::internal(format!("failed to read host UEFI target version: {e}"))
     })?;
-    read_uefi_credentials(reader, &CredentialKey::host_uefi_site_default(version)).await
+    Ok(CredentialKey::host_uefi_site_default(version))
 }
 
-/// Resolve the host UEFI credential a device currently carries, to authenticate
-/// a *clear* against its existing password (the device's converged version; see
-/// [`host_uefi_device_version`]).
-pub(crate) async fn host_uefi_clear_credentials(
+/// The `CredentialKey` for the host UEFI password a device currently holds, to
+/// authenticate a *clear* against its existing password (the device's converged
+/// version; see [`host_uefi_device_version`]).
+///
+/// Like `host_uefi_set_credential_key`, this is only the database half: it reads
+/// the device version and returns the key. The caller reads the secret with
+/// `read_uefi_credentials` after committing, so no connection is held across the
+/// remote reader (Vault) request.
+pub(crate) async fn host_uefi_clear_credential_key(
     conn: &mut sqlx::PgConnection,
-    reader: &dyn CredentialReader,
     bmc_mac: mac_address::MacAddress,
-) -> Result<Credentials, CarbideError> {
+) -> Result<CredentialKey, CarbideError> {
     let version = host_uefi_device_version(conn, bmc_mac).await.map_err(|e| {
         CarbideError::internal(format!("failed to read host UEFI device version: {e}"))
     })?;
-    read_uefi_credentials(reader, &CredentialKey::host_uefi_site_default(version)).await
+    Ok(CredentialKey::host_uefi_site_default(version))
 }
 
 pub(crate) async fn clear_host_uefi_password(
@@ -170,7 +182,7 @@ pub(crate) async fn clear_host_uefi_password(
 
     if !machine_id.machine_type().is_host() {
         return Err(CarbideError::InvalidArgument(
-            "Carbide only supports clearing the UEFI password on discovered hosts".into(),
+            "carbide only supports clearing the UEFI password on discovered hosts".into(),
         )
         .into());
     }
@@ -208,16 +220,16 @@ pub(crate) async fn clear_host_uefi_password(
     }
 
     let addr = snapshot.host_snapshot.bmc_addr().ok_or_else(|| {
-        CarbideError::InvalidArgument("Specified machine does not have BMC address".into())
+        CarbideError::InvalidArgument("specified machine does not have BMC address".into())
     })?;
 
     // Clearing must authenticate with the password the device currently carries,
     // which is resolved per-device by BMC MAC. Without the MAC we cannot pick the
     // right credential, so fail rather than guess the site default and present a
     // wrong password to the BMC.
-    let bmc_mac = snapshot.host_snapshot.bmc_info.mac.ok_or_else(|| {
+    let bmc_mac = snapshot.host_snapshot.status.bmc_info.mac.ok_or_else(|| {
         CarbideError::InvalidArgument(
-            "Specified machine does not have a known BMC MAC address".into(),
+            "specified machine does not have a known BMC MAC address".into(),
         )
     })?;
 
@@ -225,23 +237,27 @@ pub(crate) async fn clear_host_uefi_password(
         db::machine_interface::lookup_bmc_access_info(&mut txn, addr.ip(), Some(addr.port()))
             .await?;
 
-    // Resolve the credential the device currently carries so the clear
-    // authenticates with the right password (table-driven; see
-    // `host_uefi_clear_credentials`). Done before the commit while the txn is
-    // open.
-    let clear_credentials =
-        host_uefi_clear_credentials(&mut txn, api.redfish_pool.credential_reader(), bmc_mac)
-            .await?;
+    // Resolve which credential the clear must authenticate with -- the password
+    // the device currently holds, keyed by its converged version (table-driven;
+    // see `host_uefi_clear_credential_key`). This is the DB half; do it while the
+    // txn is open.
+    let clear_key = host_uefi_clear_credential_key(&mut txn, bmc_mac).await?;
 
-    // Don't hold the transaction across an await point
+    // Commit before the remote reader (Vault) request so the connection is not
+    // held across it, then read the actual secret.
     txn.commit().await?;
+    let clear_credentials =
+        read_uefi_credentials(api.redfish_pool.credential_reader(), &clear_key).await?;
 
     let redfish_client = api
         .redfish_pool
         .client_by_info(&bmc_access_info)
         .await
         .map_err(|e| {
-            tracing::error!("unable to create redfish client: {}", e);
+            tracing::error!(
+                error = %e,
+                "unable to create redfish client",
+            );
             CarbideError::Internal {
                 message: format!(
                     "Could not create connection to Redfish API to {machine_id}, check logs"
@@ -254,9 +270,9 @@ pub(crate) async fn clear_host_uefi_password(
         .clear_host_uefi_password(redfish_client.as_ref(), clear_credentials)
         .await
         .map_err(|e| {
-            tracing::error!(%e, "Failed to run clear_host_uefi_password call");
+            tracing::error!(error = %e, "Failed to run clear_host_uefi_password call");
             CarbideError::internal(format!(
-                "Failed redfish clear_host_uefi_password subtask: {e}"
+                "failed redfish clear_host_uefi_password subtask: {e}"
             ))
         })?;
 
@@ -299,7 +315,7 @@ pub(crate) async fn set_host_uefi_password(
 
     if !machine_id.machine_type().is_host() {
         return Err(CarbideError::InvalidArgument(
-            "Carbide only supports setting the UEFI password on discovered hosts".into(),
+            "carbide only supports setting the UEFI password on discovered hosts".into(),
         )
         .into());
     }
@@ -320,16 +336,16 @@ pub(crate) async fn set_host_uefi_password(
     })?;
 
     let addr = snapshot.host_snapshot.bmc_addr().ok_or_else(|| {
-        CarbideError::InvalidArgument("Specified machine does not have BMC address".into())
+        CarbideError::InvalidArgument("specified machine does not have BMC address".into())
     })?;
 
     // A known BMC MAC is a hard precondition for setting the UEFI password: it
     // keys the host_uefi rotation bookkeeping recorded below, so reject the
     // request up front rather than driving the device and only then discovering
     // we cannot track its convergence.
-    let host_bmc_mac = snapshot.host_snapshot.bmc_info.mac.ok_or_else(|| {
+    let host_bmc_mac = snapshot.host_snapshot.status.bmc_info.mac.ok_or_else(|| {
         CarbideError::InvalidArgument(
-            "Specified machine does not have a known BMC MAC address".into(),
+            "specified machine does not have a known BMC MAC address".into(),
         )
     })?;
 
@@ -337,20 +353,26 @@ pub(crate) async fn set_host_uefi_password(
         db::machine_interface::lookup_bmc_access_info(&mut txn, addr.ip(), Some(addr.port()))
             .await?;
 
-    // Resolve the site-wide host UEFI credential to set (table-driven; v0 = the
-    // legacy unversioned site-default). Resolved before the commit.
-    let host_uefi_credentials =
-        host_uefi_set_credentials(&mut txn, api.redfish_pool.credential_reader()).await?;
+    // Resolve the site-wide host UEFI credential key to set (table-driven; v0 =
+    // the legacy unversioned site-default). This is the DB half; do it while the
+    // txn is open.
+    let host_uefi_key = host_uefi_set_credential_key(&mut txn).await?;
 
-    // Let txn drop so we don't hold it across a redfish request
+    // Commit before the remote reader (Vault) request and the redfish call so the
+    // connection is not held across them, then read the actual secret.
     txn.commit().await?;
+    let host_uefi_credentials =
+        read_uefi_credentials(api.redfish_pool.credential_reader(), &host_uefi_key).await?;
 
     let redfish_client = api
         .redfish_pool
         .client_by_info(&bmc_access_info)
         .await
         .map_err(|e| {
-            tracing::error!("unable to create redfish client: {}", e);
+            tracing::error!(
+                error = %e,
+                "unable to create redfish client",
+            );
             CarbideError::RedfishClientCreation {
                 inner: e.into(),
                 machine_id,
@@ -362,8 +384,8 @@ pub(crate) async fn set_host_uefi_password(
         .uefi_setup(redfish_client.as_ref(), false, host_uefi_credentials)
         .await
         .map_err(|e| {
-            tracing::error!(%e, "Failed to run uefi_setup call");
-            CarbideError::internal(format!("Failed redfish uefi_setup subtask: {e}"))
+            tracing::error!(error = %e, "Failed to run uefi_setup call");
+            CarbideError::internal(format!("failed redfish uefi_setup subtask: {e}"))
         })?;
     // uefi_setup returns a BMC job_id; the password change completes
     // asynchronously on the device and we do not poll it here. We optimistically
@@ -392,7 +414,10 @@ pub(crate) async fn set_host_uefi_password(
     })
     .await?
     .map_err(|e| {
-        tracing::error!("Failed to update bios_password_set_time: {}", e);
+        tracing::error!(
+            error = %e,
+            "Failed to update bios_password_set_time",
+        );
         CarbideError::Internal {
             message: format!("Failed to update BIOS password timestamp: {e}"),
         }

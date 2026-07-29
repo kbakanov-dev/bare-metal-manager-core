@@ -20,6 +20,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use carbide_utils::none_if_empty::NoneIfEmpty;
+
 use super::client::{typed_value_to_f64, typed_value_to_string};
 use super::proto::{self, PathElem};
 use super::subscriber::GnmiStreamMetrics;
@@ -46,8 +48,8 @@ impl GnmiSampleProcessor {
             Some(proto::subscribe_response::Response::Error(e)) => {
                 stream_metrics.stream_errors_total.inc();
                 tracing::warn!(
-                    code = e.code,
-                    message = %e.message,
+                    grpc_status_code = e.code,
+                    error = %e.message,
                     "nvue_gnmi SAMPLE: server error in stream"
                 );
                 return;
@@ -170,7 +172,7 @@ impl GnmiSampleProcessor {
                 PHY_MANAGER_STATES,
             );
         } else if leaf_matches(elems, &["infiniband", "state", "vl-capabilities"])
-            && let Some(caps) = typed_value_to_string(val).filter(|s| !s.is_empty())
+            && let Some(caps) = typed_value_to_string(val).none_if_empty()
         {
             self.emit_iface_info(
                 "interface_vl_capabilities_info",
@@ -302,7 +304,7 @@ impl GnmiSampleProcessor {
             None
         };
         if let Some((metric_type, info_label_name)) = info {
-            if let Some(s) = typed_value_to_string(val).filter(|s| !s.is_empty()) {
+            if let Some(s) = typed_value_to_string(val).none_if_empty() {
                 self.emit_switch_info(metric_type, info_label_name, &s);
             }
             return;
@@ -1100,6 +1102,7 @@ mod tests {
             collector_type: NVUE_GNMI_SAMPLE_STREAM_ID,
             metadata: None,
             rack_id: None,
+            labels: Default::default(),
         };
         GnmiSampleProcessor {
             data_sink: None,
@@ -1165,6 +1168,7 @@ mod tests {
                     mac: MacAddress::from_str("AA:BB:CC:DD:EE:FF").unwrap(),
                 },
                 collector_type: NVUE_GNMI_SAMPLE_STREAM_ID,
+                labels: Default::default(),
                 metadata: Some(EndpointMetadata::Switch(SwitchData {
                     id: Some(switch_id),
                     serial: "SN-SWITCH-001".to_string(),

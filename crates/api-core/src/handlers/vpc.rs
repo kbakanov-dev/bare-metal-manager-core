@@ -91,7 +91,7 @@ pub(crate) async fn create(
         .is_none()
         {
             return Err(CarbideError::FailedPrecondition(format!(
-                "NetworkSecurityGroup `{}` does not exist or is not owned by Tenant `{}`",
+                "NetworkSecurityGroup `{}` does not exist or is not owned by tenant `{}`",
                 id, vpc_creation_request.tenant_organization_id,
             ))
             .into());
@@ -203,7 +203,7 @@ pub(crate) async fn update(
         .is_none()
         {
             return Err(CarbideError::FailedPrecondition(format!(
-                "NetworkSecurityGroup `{}` does not exist or is not owned by Tenant `{}`",
+                "NetworkSecurityGroup `{}` does not exist or is not owned by tenant `{}`",
                 id, vpc.config.tenant_organization_id
             ))
             .into());
@@ -414,44 +414,70 @@ async fn allocate_vpc_vni(
         &api.common_pools.ethernet.pool_external_vpc_vni
     };
 
-    match db::resource_pool::allocate(
-        source_pool,
-        txn,
-        resource_pool::OwnerType::Vpc,
-        owner_id,
+    match (
+        db::resource_pool::allocate(
+            source_pool,
+            txn,
+            resource_pool::OwnerType::Vpc,
+            owner_id,
+            requested_vni,
+        )
+        .await,
         requested_vni,
-    )
-    .await
-    {
-        Ok(val) => Ok(val),
-        Err(ResourcePoolDatabaseError::ResourcePool(resource_pool::ResourcePoolError::Empty)) => {
-            tracing::error!(
+    ) {
+        (Ok(val), _) => Ok(val),
+        (
+            Err(
+                error @ ResourcePoolDatabaseError::ResourcePool(
+                    resource_pool::ResourcePoolError::Empty,
+                ),
+            ),
+            requested_vni,
+        ) => {
+            db::resource_pool::emit_allocation_failure(
+                source_pool.value_type,
                 owner_id,
-                pool = source_pool.name(),
-                "Pool exhausted, cannot allocate"
+                requested_vni.is_some(),
+                source_pool.name(),
+                &error,
             );
             Err(CarbideError::ResourceExhausted(format!(
                 "pool {}",
                 source_pool.name
             )))
         }
-        Err(ResourcePoolDatabaseError::Database(e)) if requested_vni.is_some() => Err(match *e {
-            db::DatabaseError::FailedPrecondition(_s) => {
-                tracing::error!(
-                    owner_id,
-                    pool = source_pool.name(),
-                    value = requested_vni,
-                    "invalid pool value requested, cannot allocate"
-                );
-                CarbideError::FailedPrecondition(format!(
-                    "VNI `{}` cannot be requested or is already allocated",
-                    requested_vni.unwrap_or_default()
-                ))
-            }
-            e => e.into(),
-        }),
-        Err(err) => {
-            tracing::error!(owner_id, error = %err, pool = source_pool.name, "Error allocating from resource pool");
+        (Err(error), Some(requested_vni))
+            if db::resource_pool::is_requested_value_unavailable(&error) =>
+        {
+            db::resource_pool::emit_requested_vni_unavailable(
+                source_pool.value_type,
+                owner_id,
+                requested_vni,
+                source_pool.name(),
+            );
+            Err(CarbideError::FailedPrecondition(format!(
+                "VNI `{}` cannot be requested or is already allocated",
+                requested_vni
+            )))
+        }
+        (Err(ResourcePoolDatabaseError::Database(error)), Some(_)) => {
+            db::resource_pool::emit_database_allocation_failure(
+                source_pool.value_type,
+                owner_id,
+                true,
+                source_pool.name(),
+                &error,
+            );
+            Err((*error).into())
+        }
+        (Err(err), requested_vni) => {
+            db::resource_pool::emit_allocation_failure(
+                source_pool.value_type,
+                owner_id,
+                requested_vni.is_some(),
+                source_pool.name(),
+                &err,
+            );
             Err(err.into())
         }
     }

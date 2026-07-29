@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	otrace "go.opentelemetry.io/otel/trace"
 
 	cutil "github.com/NVIDIA/infra-controller/rest-api/common/pkg/util"
@@ -1243,6 +1244,16 @@ func TestExpectedMachineSQLDAO_Clear(t *testing.T) {
 	emsExp := testExpectedMachineSQLDAOCreateExpectedMachines(ctx, t, dbSession)
 	emsd := NewExpectedMachineDAO(dbSession)
 	assert.NotNil(t, emsd)
+	bmcEM, err := emsd.Create(ctx, nil, ExpectedMachineCreateInput{
+		ExpectedMachineID:   uuid.New(),
+		SiteID:              emsExp[0].SiteID,
+		BmcMacAddress:       "00:1B:44:11:3A:CA",
+		ChassisSerialNumber: "CHASSIS-CLEAR-BMC-IP",
+		BmcIpAddress:        cutil.GetPtr("192.0.2.10"),
+		CreatedBy:           emsExp[0].CreatedBy,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, bmcEM)
 
 	// OTEL Spanner configuration
 	_, _, ctx = testCommonTraceProviderSetup(t, ctx)
@@ -1267,6 +1278,14 @@ func TestExpectedMachineSQLDAO_Clear(t *testing.T) {
 			em:   emsExp[0],
 			input: ExpectedMachineClearInput{
 				Labels: true,
+			},
+			expectedUpdate: true,
+		},
+		{
+			desc: "can clear BmcIpAddress",
+			em:   *bmcEM,
+			input: ExpectedMachineClearInput{
+				BmcIpAddress: true,
 			},
 			expectedUpdate: true,
 		},
@@ -1297,6 +1316,9 @@ func TestExpectedMachineSQLDAO_Clear(t *testing.T) {
 			}
 			if tc.input.Labels {
 				assert.Nil(t, tmp.Labels)
+			}
+			if tc.input.BmcIpAddress {
+				assert.Nil(t, tmp.BmcIpAddress)
 			}
 
 			if tc.expectedUpdate {
@@ -1696,6 +1718,72 @@ func TestExpectedMachineSQLDAO_UpdateMultiple(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestExpectedMachineSQLDAO_UpdateMultiple_BmcIpAddress guards against a BMC
+// address supplied for one row clearing an address omitted by another row.
+func TestExpectedMachineSQLDAO_UpdateMultiple_BmcIpAddress(t *testing.T) {
+	ctx := context.Background()
+	dbSession := testInitDB(t)
+	defer dbSession.Close()
+	testExpectedMachineSetupSchema(t, dbSession)
+
+	user := TestBuildUser(t, dbSession, "test-user", "test-org", []string{"admin"})
+	ip := TestBuildInfrastructureProvider(t, dbSession, "test-provider", "test-org", user)
+	site := TestBuildSite(t, dbSession, ip, "test-site", user)
+	emsd := NewExpectedMachineDAO(dbSession)
+
+	originalUpdatedIP := "192.0.2.50"
+	originalPreservedIP := "192.0.2.51"
+	updatedIP := "192.0.2.52"
+	originalUpdatedName := "original-updated-ip-machine"
+	originalPreservedName := "original-preserved-ip-machine"
+	updatedIPName := "updated-ip-machine"
+	preservedIPName := "preserved-ip-machine"
+	emUpdated, err := emsd.Create(ctx, nil, ExpectedMachineCreateInput{
+		ExpectedMachineID:   uuid.New(),
+		SiteID:              site.ID,
+		BmcMacAddress:       "00:1B:44:11:3A:F4",
+		ChassisSerialNumber: "CHASSIS-BMC-IP-A",
+		BmcIpAddress:        &originalUpdatedIP,
+		Name:                &originalUpdatedName,
+		CreatedBy:           user.ID,
+	})
+	require.NoError(t, err)
+	emPreserved, err := emsd.Create(ctx, nil, ExpectedMachineCreateInput{
+		ExpectedMachineID:   uuid.New(),
+		SiteID:              site.ID,
+		BmcMacAddress:       "00:1B:44:11:3A:F5",
+		ChassisSerialNumber: "CHASSIS-BMC-IP-B",
+		BmcIpAddress:        &originalPreservedIP,
+		Name:                &originalPreservedName,
+		CreatedBy:           user.ID,
+	})
+	require.NoError(t, err)
+
+	got, err := emsd.UpdateMultiple(ctx, nil, []ExpectedMachineUpdateInput{
+		{
+			ExpectedMachineID: emUpdated.ID,
+			BmcIpAddress:      &updatedIP,
+			Name:              &updatedIPName,
+		},
+		{
+			ExpectedMachineID: emPreserved.ID,
+			Name:              &preservedIPName,
+		},
+	})
+	require.NoError(t, err)
+	if assert.Len(t, got, 2) {
+		assert.Equal(t, &updatedIP, got[0].BmcIpAddress)
+		assert.Equal(t, &updatedIPName, got[0].Name)
+		assert.Equal(t, &originalPreservedIP, got[1].BmcIpAddress)
+		assert.Equal(t, &preservedIPName, got[1].Name)
+	}
+
+	stored, err := emsd.Get(ctx, nil, emPreserved.ID, nil, false)
+	require.NoError(t, err)
+	assert.Equal(t, &originalPreservedIP, stored.BmcIpAddress)
+	assert.Equal(t, &preservedIPName, stored.Name)
 }
 
 // TestExpectedMachineSQLDAO_UpdateMultiple_HostLifecycleProfile guards against a

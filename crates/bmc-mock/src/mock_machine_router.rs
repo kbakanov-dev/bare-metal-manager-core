@@ -24,9 +24,14 @@ use crate::bmc_state::BmcState;
 use crate::injection::InjectionStore;
 use crate::redfish::manager::ManagerState;
 use crate::{
-    Callbacks, HostHardwareType, MachineInfo, SystemPowerControl, auth_router, middleware_router,
-    redfish,
+    Callbacks, HostHardwareType, MachineInfo, SystemPowerControl, VirtualMediaDeviceConfig,
+    auth_router, middleware_router, redfish,
 };
+
+#[derive(Debug, Default)]
+pub struct MachineRouterOptions {
+    pub virtual_media_devices: Option<Vec<VirtualMediaDeviceConfig>>,
+}
 
 #[derive(Debug)]
 pub enum BmcCommand {
@@ -41,9 +46,9 @@ pub type SetSystemPowerResult = Result<(), SetSystemPowerError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetSystemPowerError {
-    #[error("Mock BMC reported bad request when setting system power: {0}")]
+    #[error("mock BMC reported bad request when setting system power: {0}")]
     BadRequest(String),
-    #[error("Mock BMC failed to send power command: {0}")]
+    #[error("mock BMC failed to send power command: {0}")]
     CommandSendError(String),
 }
 
@@ -66,6 +71,43 @@ pub fn machine_router(
     callbacks: Arc<dyn Callbacks>,
     mat_host_id: String,
     redfish_auth: bool,
+    options: MachineRouterOptions,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        Arc::new(InjectionStore::new()),
+        options,
+    )
+}
+
+/// Return a machine router backed by a caller-provided injection store.
+pub fn machine_router_with_injection_store(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    injection: Arc<InjectionStore>,
+) -> (Router, BmcState) {
+    machine_router_inner(
+        machine_info,
+        callbacks,
+        mat_host_id,
+        redfish_auth,
+        injection,
+        MachineRouterOptions::default(),
+    )
+}
+
+fn machine_router_inner(
+    machine_info: &MachineInfo,
+    callbacks: Arc<dyn Callbacks>,
+    mat_host_id: String,
+    redfish_auth: bool,
+    injection: Arc<InjectionStore>,
+    options: MachineRouterOptions,
 ) -> (Router, BmcState) {
     let system_config = machine_info.system_config(callbacks.clone());
     let chassis_config = machine_info.chassis_config();
@@ -86,6 +128,7 @@ pub fn machine_router(
         .add_routes(crate::redfish::account_service::add_routes)
         .add_routes(crate::redfish::session_service::add_routes)
         .add_routes(|routes| crate::redfish::computer_system::add_routes(routes, bmc_vendor))
+        .add_routes(crate::redfish::virtual_media::add_routes)
         .add_routes(crate::ipmi::add_routes);
     let router = match machine_info {
         MachineInfo::Dpu(_) => {
@@ -98,6 +141,7 @@ pub fn machine_router(
     let manager = Arc::new(ManagerState::new(&machine_info.manager_config()));
     let system_state = Arc::new(crate::redfish::computer_system::SystemState::from_config(
         system_config,
+        &options,
     ));
     let chassis_state = Arc::new(crate::redfish::chassis::ChassisState::from_config(
         chassis_config,
@@ -110,7 +154,6 @@ pub fn machine_router(
     );
     let session_service_state =
         Arc::new(crate::redfish::session_service::SessionServiceState::new());
-    let injection = Arc::new(InjectionStore::new());
     let state = BmcState {
         bmc_vendor,
         bmc_product,
@@ -124,12 +167,16 @@ pub fn machine_router(
         session_service_state,
         injection: injection.clone(),
         callbacks: Some(callbacks.clone()),
+        exposes_computer_systems: machine_info.exposes_computer_systems(),
     };
     let account_service_state = state.account_service_state.clone();
     let session_service_state = state.session_service_state.clone();
     let permit_factory_default_password = matches!(
         &machine_info,
-        MachineInfo::Host(h) if h.hw_type == HostHardwareType::LiteOnPowerShelf
+        MachineInfo::Host(h) if matches!(
+            h.hw_type,
+            HostHardwareType::LiteOnPowerShelf | HostHardwareType::DeltaPowerShelf
+        )
     );
     let router = ([
         Box::new(redfish::expander_router::append),

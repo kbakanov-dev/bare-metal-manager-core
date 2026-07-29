@@ -105,7 +105,7 @@ use model::rack_type::{
 use model::resource_pool::common::CommonPools;
 use model::resource_pool::{self};
 use model::tenant::TenantOrganizationId;
-use model::test_support::dpu::DPU_BF3_INFO_JSON;
+use model::test_support::dpu::{DPU_BF3_INFO_JSON, DPU_BF4_INFO_JSON};
 use model::test_support::{DpuConfig, HardwareInfoTemplate, ManagedHostConfig};
 use nras::{
     DeviceAttestationInfo, NrasError, ProcessedAttestationOutcome, RawAttestationOutcome,
@@ -336,7 +336,10 @@ impl TestEnv {
             redfish_client_pool: self.redfish_sim.clone(),
             ipmi_tool: self.ipmi_tool.clone(),
             site_config: self.config.machine_state_handler_site_config().into(),
+            component_manager: self.test_component_manager.clone(),
+            credential_manager: self.test_credential_manager.clone(),
             per_object_metrics_registry: self.per_object_metrics_registry(),
+            per_object_info: None,
         }
     }
 
@@ -420,6 +423,7 @@ impl TestEnv {
                 ManagedHostState::HostInit { machine_state: mc }
             }
             ManagedHostState::Ready => state.clone(),
+            ManagedHostState::Maintenance { .. } => state.clone(),
             ManagedHostState::Assigned { .. } => state.clone(),
             ManagedHostState::WaitingForCleanup { .. } => state.clone(),
             ManagedHostState::Created => state.clone(),
@@ -431,7 +435,7 @@ impl TestEnv {
             } => ManagedHostState::Failed {
                 details: FailureDetails {
                     cause: details.cause,
-                    failed_at: machine.failure_details.failed_at,
+                    failed_at: machine.status.failure_details.failed_at,
                     source: details.source,
                 },
                 machine_id,
@@ -476,6 +480,10 @@ impl TestEnv {
                         MachineValidatingState::RebootHost { .. } => state.clone(),
                         MachineValidatingState::PrepareBootRepair { .. }
                         | MachineValidatingState::UnlockForBootRepair { .. }
+                        | MachineValidatingState::CheckBootConfigForRepair { .. }
+                        | MachineValidatingState::ConfigureBootBios { .. }
+                        | MachineValidatingState::WaitingForBootBiosJob { .. }
+                        | MachineValidatingState::PollingBootBiosSetup { .. }
                         | MachineValidatingState::RepairBootConfig { .. }
                         | MachineValidatingState::LockAfterBootRepair { .. } => state.clone(),
                     }
@@ -1151,7 +1159,7 @@ pub async fn create_test_env(db_pool: sqlx::PgPool) -> TestEnv {
 
 /// `create_test_env` with the fixture admin + host-inband site prefixes
 /// routable and the host-inband network segment created -- the standard
-/// setup for zero-DPU / NicMode ingestion tests.
+/// setup for zero-DPU / `Nic`-policy ingestion tests.
 pub async fn create_test_env_with_host_inband(db_pool: sqlx::PgPool) -> TestEnv {
     let env = create_test_env_with_overrides(
         db_pool,
@@ -1396,6 +1404,7 @@ pub async fn create_test_env_with_overrides(
             power_shelf_backend: component_manager::power_shelf_manager::Backend::Rms,
             compute_tray_backend: component_manager::compute_tray_manager::Backend::Mock,
             nv_switch_use_state_controller: true,
+            power_shelf_use_state_controller: true,
             ..Default::default()
         },
         component_manager_rack_profiles,
@@ -1459,9 +1468,7 @@ pub async fn create_test_env_with_overrides(
         db_pool.clone(),
         test_meter.meter(),
         config.nvlink_config.clone().unwrap(),
-        rms_sim.as_rms_client(),
-        composite_manager.clone(),
-        config.rack_profiles.clone(),
+        test_component_manager.clone(),
         api.work_lock_manager_handle.clone(),
     );
 
@@ -1477,6 +1484,9 @@ pub async fn create_test_env_with_overrides(
         power_down_wait: Duration::seconds(0),
         failure_retry_time: Duration::seconds(0),
         scout_reporting_timeout: config.machine_state_controller.scout_reporting_timeout,
+        waiting_for_measurements_timeout: config
+            .machine_state_controller
+            .waiting_for_measurements_timeout,
         uefi_boot_wait: Duration::seconds(0),
     };
 
@@ -1539,7 +1549,10 @@ pub async fn create_test_env_with_overrides(
                 redfish_client_pool: redfish_sim.clone(),
                 ipmi_tool: ipmi_tool.clone(),
                 site_config: config.machine_state_handler_site_config().into(),
+                component_manager: test_component_manager.clone(),
+                credential_manager: credential_manager.clone(),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
+                per_object_info: None,
             }
             .into(),
         )
@@ -1645,6 +1658,7 @@ pub async fn create_test_env_with_overrides(
                 component_manager: test_component_manager.clone(),
                 credential_manager: credential_manager.clone(),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
+                rack_firmware_reprovisioning_enabled: false,
             }
             .into(),
         )
@@ -1728,16 +1742,14 @@ pub async fn create_test_env_with_overrides(
             create_switches: Arc::new(true.into()),
             switches_created_per_run: 1,
             rotate_switch_nvos_credentials: Arc::new(false.into()),
-            dpu_mode: None,
+            dpu_policy: None,
             // Tests use MockEndpointExplorer. So this doesn't affect anything.
             explore_mode: SiteExplorerExploreMode::NvRedfish,
         },
         test_meter.meter(),
-        api.endpoint_explorer.clone(),
-        Arc::new(config.get_firmware_config()),
+        api.endpoint_exploration_service.clone(),
         common_pools.clone(),
         api.work_lock_manager_handle.clone(),
-        api.endpoint_exploration_locks.clone(),
         site_explorer_rack_profiles,
         rms_sim.as_rms_client(),
         credential_manager.clone(),
@@ -2311,10 +2323,10 @@ pub async fn network_configured_with_health_and_ext_services(
         astra_config_status: None,
     };
     tracing::trace!(
-        "network_configured machine={} instance_network={} instance={}",
-        status.network_config_version.as_ref().unwrap(),
-        instance_network_config_version.clone().unwrap_or_default(),
-        instance_config_version.clone().unwrap_or_default(),
+        network_config_version = %status.network_config_version.as_ref().unwrap(),
+        instance_network_config_version = ?instance_network_config_version,
+        instance_config_version = ?instance_config_version,
+        "machine network configured",
     );
     let _ = env
         .api
@@ -2411,10 +2423,27 @@ pub async fn create_managed_host_with_dpf_multi(
     env: &TestEnv,
     dpu_count: usize,
 ) -> TestManagedHost {
+    create_managed_host_with_dpf_multi_hw(env, dpu_count, DPU_BF3_INFO_JSON).await
+}
+
+/// Create a managed host with a single BF4 DPU using the DPF path. The DPU's
+/// `dmi_data.product_name` identifies it as BlueField-4, which the DPU platform
+/// handler uses to skip the BF3-only vendor `machine_setup`/platform steps.
+pub async fn create_managed_host_with_dpf_bf4(env: &TestEnv) -> TestManagedHost {
+    create_managed_host_with_dpf_multi_hw(env, 1, DPU_BF4_INFO_JSON).await
+}
+
+/// Create a managed host with `dpu_count` DPUs using the DPF path, each DPU built
+/// from the given hardware-info template (BF3 vs BF4 differ by `product_name`).
+pub async fn create_managed_host_with_dpf_multi_hw(
+    env: &TestEnv,
+    dpu_count: usize,
+    hardware_info_json: &'static [u8],
+) -> TestManagedHost {
     assert!(dpu_count >= 1, "need to specify at least 1 dpu");
     let dpu_configs: Vec<DpuConfig> = (0..dpu_count)
         .map(|_| {
-            DpuConfig::with_hardware_info_template(HardwareInfoTemplate::Custom(DPU_BF3_INFO_JSON))
+            DpuConfig::with_hardware_info_template(HardwareInfoTemplate::Custom(hardware_info_json))
         })
         .collect();
     let mh_config = ManagedHostConfig::default().with_dpus(dpu_configs);
@@ -2606,16 +2635,17 @@ pub async fn update_time_params(
         time: if let Some(last_reboot_requested) = last_reboot_requested {
             last_reboot_requested
         } else {
-            machine.last_reboot_requested.as_ref().unwrap().time - Duration::minutes(1)
+            machine.status.last_reboot_requested.as_ref().unwrap().time - Duration::minutes(1)
         },
-        mode: machine.last_reboot_requested.as_ref().unwrap().mode,
+        mode: machine.status.last_reboot_requested.as_ref().unwrap().mode,
         restart_verified: None,
         verification_attempts: None,
     };
 
-    let last_reboot_time = machine.last_reboot_time.unwrap() - Duration::minutes(2i64);
+    let last_reboot_time = machine.status.last_reboot_time.unwrap() - Duration::minutes(2i64);
 
-    let ts = machine.last_reboot_requested.as_ref().unwrap().time - Duration::minutes(retry_count);
+    let ts = machine.status.last_reboot_requested.as_ref().unwrap().time
+        - Duration::minutes(retry_count);
     let last_discovery_time = ts - Duration::minutes(1);
 
     let version = format!(
@@ -2641,7 +2671,10 @@ pub async fn reboot_completed(
     env: &TestEnv,
     machine_id: carbide_uuid::machine::MachineId,
 ) -> rpc::forge::MachineRebootCompletedResponse {
-    tracing::info!("Machine ={} rebooted", machine_id);
+    tracing::info!(
+        machine_id = %machine_id,
+        "Machine rebooted",
+    );
     env.api
         .reboot_completed(Request::new(rpc::forge::MachineRebootCompletedRequest {
             machine_id: Some(machine_id),

@@ -18,18 +18,22 @@
 mod discovery;
 mod entity_metrics;
 mod firmware;
+mod gpu_inventory;
 pub(crate) mod inventory;
 mod leak_detector;
 mod logs;
 mod nmxc;
 mod nmxt;
 mod nvue;
+#[cfg(test)]
+pub(in crate::collectors) mod projection_test_support;
 mod runtime;
 mod sensors;
 
 pub use discovery::{EntityDiscoveryCollector, EntityDiscoveryCollectorConfig};
 pub use entity_metrics::{MetricsCollector, MetricsCollectorConfig};
 pub use firmware::{FirmwareCollector, FirmwareCollectorConfig};
+pub use gpu_inventory::{GpuInventoryCollector, GpuInventoryCollectorConfig};
 pub(crate) use inventory::SharedInventory;
 pub use leak_detector::{LeakDetectorCollector, LeakDetectorCollectorConfig};
 pub(crate) use logs::auto::{AutoFailureBudget, BudgetDecision, FailureKind};

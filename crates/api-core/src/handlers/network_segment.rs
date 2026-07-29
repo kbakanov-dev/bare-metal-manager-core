@@ -141,7 +141,7 @@ pub(crate) async fn create(
 
         let vpc = vpcs
             .first()
-            .ok_or_else(|| CarbideError::internal(format!("VPC ID: {vpc_id} not found.")))?;
+            .ok_or_else(|| CarbideError::internal(format!("VPC ID: {vpc_id} not found")))?;
 
         let virtualization_type = vpc.config.network_virtualization_type;
 
@@ -208,7 +208,7 @@ pub(crate) async fn attach_to_vpc(
 
     if segment.config.segment_type != NetworkSegmentType::HostInband {
         return Err(CarbideError::InvalidArgument(format!(
-            "Only host_inband network segments can be attached to a VPC with this API, got {}",
+            "only host_inband network segments can be attached to a VPC with this API, got {}",
             segment.config.segment_type
         ))
         .into());
@@ -223,7 +223,7 @@ pub(crate) async fn attach_to_vpc(
         Some(current_vpc_id) if current_vpc_id == vpc_id => segment,
         Some(current_vpc_id) if !allow_replace => {
             return Err(CarbideError::FailedPrecondition(format!(
-                "Network segment {} is already attached to VPC {}",
+                "network segment {} is already attached to VPC {}",
                 segment.id, current_vpc_id
             ))
             .into());
@@ -363,7 +363,7 @@ pub(crate) async fn save(
             ..
         })) if e.constraint() == Some("network_prefixes_prefix_excl") => {
             return Err(CarbideError::InvalidArgument(
-                "Prefix overlaps with an existing one".to_string(),
+                "prefix overlaps with an existing one".to_string(),
             ));
         }
         Err(err) => {
@@ -417,14 +417,28 @@ pub async fn allocate_vni(
     .await
     {
         Ok(val) => Ok(val),
-        Err(ResourcePoolDatabaseError::ResourcePool(
-            model::resource_pool::ResourcePoolError::Empty,
-        )) => {
-            tracing::error!(owner_id, pool = "vni", "Pool exhausted, cannot allocate");
+        Err(
+            error @ ResourcePoolDatabaseError::ResourcePool(
+                model::resource_pool::ResourcePoolError::Empty,
+            ),
+        ) => {
+            db::resource_pool::emit_allocation_failure(
+                api.common_pools.ethernet.pool_vni.value_type,
+                owner_id,
+                false,
+                "vni",
+                &error,
+            );
             Err(CarbideError::ResourceExhausted("pool vni".to_string()))
         }
         Err(err) => {
-            tracing::error!(owner_id, error = %err, pool = "vni", "Error allocating from resource pool");
+            db::resource_pool::emit_allocation_failure(
+                api.common_pools.ethernet.pool_vni.value_type,
+                owner_id,
+                false,
+                "vni",
+                &err,
+            );
             Err(err.into())
         }
     }
@@ -448,18 +462,28 @@ pub async fn allocate_vlan_id(
     .await
     {
         Ok(val) => Ok(val),
-        Err(ResourcePoolDatabaseError::ResourcePool(
-            model::resource_pool::ResourcePoolError::Empty,
-        )) => {
-            tracing::error!(
+        Err(
+            error @ ResourcePoolDatabaseError::ResourcePool(
+                model::resource_pool::ResourcePoolError::Empty,
+            ),
+        ) => {
+            db::resource_pool::emit_allocation_failure(
+                api.common_pools.ethernet.pool_vlan_id.value_type,
                 owner_id,
-                pool = "vlan_id",
-                "Pool exhausted, cannot allocate"
+                false,
+                "vlan_id",
+                &error,
             );
             Err(CarbideError::ResourceExhausted("pool vlan_id".to_string()))
         }
         Err(err) => {
-            tracing::error!(owner_id, error = %err, pool = "vlan_id", "Error allocating from resource pool");
+            db::resource_pool::emit_allocation_failure(
+                api.common_pools.ethernet.pool_vlan_id.value_type,
+                owner_id,
+                false,
+                "vlan_id",
+                &err,
+            );
             Err(err.into())
         }
     }

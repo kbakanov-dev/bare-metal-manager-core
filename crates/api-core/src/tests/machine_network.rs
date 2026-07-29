@@ -157,6 +157,7 @@ async fn test_clear_use_admin_network_changed_keeps_newer_version_flag(pool: sql
 
 #[crate::sqlx_test]
 async fn test_managed_host_network_config(pool: sqlx::PgPool) {
+    // The default fixture omits `lo-ip-v6`, which must preserve the existing IPv4-only response.
     let env = api_fixtures::create_test_env(pool).await;
     let host_config = env.managed_host_config();
     let mh = dpu::create_dpu_machine_in_waiting_for_network_install(&env, &host_config).await;
@@ -168,9 +169,18 @@ async fn test_managed_host_network_config(pool: sqlx::PgPool) {
         .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
             dpu_machine_id: Some(dpu_machine_id),
         }))
-        .await;
+        .await
+        .unwrap()
+        .into_inner();
 
-    assert!(response.is_ok());
+    assert!(
+        response
+            .managed_host_config
+            .expect("managed host config")
+            .loopback_ip_v6
+            .is_none(),
+        "sites without lo-ip-v6 must remain IPv4-only"
+    );
 }
 
 #[crate::sqlx_test]
@@ -1059,8 +1069,16 @@ async fn test_managed_host_network_config_multi_dpu(pool: sqlx::PgPool) {
     let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
 
     let host_machine = mh.host().rpc_machine().await;
-    let dpu_1_id = host_machine.associated_dpu_machine_ids[0];
-    let dpu_2_id = host_machine.associated_dpu_machine_ids[1];
+    let dpu_1_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[0];
+    let dpu_2_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[1];
 
     // And: Multiple admin segments exist when the DPU network config is rendered.
     let _second_admin_segment = create_network_segment(
@@ -1174,14 +1192,97 @@ async fn test_managed_host_network_config_multi_dpu(pool: sqlx::PgPool) {
 }
 
 #[crate::sqlx_test]
+async fn test_managed_host_network_config_multi_dpu_fnn_ipv6_loopbacks(pool: sqlx::PgPool) {
+    let mut overrides = TestEnvOverrides::default().with_fnn_config(None);
+    overrides.fnn_config.as_mut().unwrap().admin_vpc = Some(AdminFnnConfig {
+        enabled: true,
+        vpc_vni: Some(10000),
+        routing_profile: FnnRoutingProfileConfig::default(),
+    });
+    let env = api_fixtures::create_test_env_with_overrides(pool, overrides).await;
+    crate::db_init::create_admin_vpc(&env.pool, Some(10000))
+        .await
+        .unwrap();
+    crate::db_init::update_network_segments_svi_ip(&env.pool)
+        .await
+        .unwrap();
+    env.api
+        .admin_grow_resource_pool(tonic::Request::new(rpc::forge::GrowResourcePoolRequest {
+            text: r#"
+[lo-ip-v6]
+type = "ipv6"
+prefix = "2001:db8:2390::/126"
+"#
+            .to_string(),
+        }))
+        .await
+        .unwrap();
+
+    let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
+    let host_machine = mh.host().rpc_machine().await;
+    let dpu_ids = &host_machine
+        .status
+        .as_ref()
+        .expect("host status")
+        .associated_dpu_machine_ids;
+
+    let dpu_1_network_config = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_ids[0]),
+        }))
+        .await
+        .expect("DPU 1 network config")
+        .into_inner();
+    let dpu_2_network_config = env
+        .api
+        .get_managed_host_network_config(tonic::Request::new(ManagedHostNetworkConfigRequest {
+            dpu_machine_id: Some(dpu_ids[1]),
+        }))
+        .await
+        .expect("DPU 2 network config")
+        .into_inner();
+
+    // Each response must use the requesting DPU's allocation even though both
+    // responses share the host-level managed config version.
+    let dpu_1_loopback_ip_v6 = dpu_1_network_config
+        .managed_host_config
+        .as_ref()
+        .expect("DPU 1 managed host config")
+        .loopback_ip_v6
+        .as_deref()
+        .expect("DPU 1 IPv6 loopback");
+    let dpu_2_loopback_ip_v6 = dpu_2_network_config
+        .managed_host_config
+        .as_ref()
+        .expect("DPU 2 managed host config")
+        .loopback_ip_v6
+        .as_deref()
+        .expect("DPU 2 IPv6 loopback");
+    assert_ne!(dpu_1_loopback_ip_v6, dpu_2_loopback_ip_v6);
+    assert_eq!(
+        dpu_1_network_config.managed_host_config_version,
+        dpu_2_network_config.managed_host_config_version,
+    );
+}
+
+#[crate::sqlx_test]
 async fn test_managed_host_network_config_uses_non_dpu_primary_admin_interface(pool: sqlx::PgPool) {
     let env = api_fixtures::create_test_env(pool).await;
 
     // Given: A managed host with 2 DPUs and a separate host admin NIC marked primary.
     let mh = api_fixtures::create_managed_host_multi_dpu(&env, 2).await;
     let host_machine = mh.host().rpc_machine().await;
-    let dpu_1_id = host_machine.associated_dpu_machine_ids[0];
-    let dpu_2_id = host_machine.associated_dpu_machine_ids[1];
+    let dpu_1_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[0];
+    let dpu_2_id = host_machine
+        .status
+        .as_ref()
+        .unwrap()
+        .associated_dpu_machine_ids[1];
 
     let mut txn = env.pool.begin().await.unwrap();
     let admin_segment = db::network_segment::admin(&mut txn)
@@ -1373,6 +1474,8 @@ async fn test_managed_host_network_status(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
     let mut reported_health = reported_health.unwrap();
     assert!(reported_health.observed_at.is_some());
@@ -1390,8 +1493,8 @@ async fn test_managed_host_network_status(pool: sqlx::PgPool) {
     assert_eq!(response.instances.len(), 1);
     let instance = &response.instances[0];
     tracing::info!(
-        "instance_network_config_version: {}",
-        instance.network_config_version
+        network_config_version = %instance.network_config_version,
+        "Instance network config version",
     );
     assert_eq!(
         instance.status.as_ref().unwrap().configs_synced,
@@ -1635,6 +1738,8 @@ async fn test_retain_in_alert_since(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
 
     let reported_health = reported_health.unwrap();
@@ -1662,6 +1767,8 @@ async fn test_retain_in_alert_since(pool: sqlx::PgPool) {
         .into_inner()
         .machines
         .remove(0)
+        .status
+        .unwrap()
         .health;
     let reported_health = reported_health.unwrap();
     assert!(reported_health.observed_at.is_some());

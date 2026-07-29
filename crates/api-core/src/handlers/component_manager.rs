@@ -24,12 +24,16 @@ use carbide_rack::firmware_object::rms_access_token_or_noauth;
 use carbide_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialManager, Credentials,
 };
+use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::power_shelf::PowerShelfId;
 use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::SwitchId;
-use component_manager::component_manager::ComponentManager;
-use component_manager::compute_tray_manager::{ComputeTrayEndpoint, ComputeTrayVendor};
+use component_manager::component_manager::{ComponentManager, SwitchMaintenanceRequestResult};
+use component_manager::compute_tray_manager::{
+    ComputeTrayEndpoint, ComputeTrayManager, ComputeTrayVendor,
+};
+use component_manager::core_compute_manager::CoreComputeTrayManager;
 use component_manager::error::ComponentManagerError;
 use component_manager::nv_switch_manager::SwitchEndpoint;
 use component_manager::power_shelf_manager::{PowerShelfEndpoint, PowerShelfVendor};
@@ -42,8 +46,9 @@ use model::component_manager::{
     PowerShelfComponent,
 };
 use model::firmware::FirmwareComponentType;
-use model::machine::Machine;
 use model::machine::machine_search_config::MachineSearchConfig;
+use model::machine::{Machine, MachineMaintenanceOperation};
+use model::power_shelf::PowerShelfMaintenanceOperation;
 use model::rack::{FirmwareUpgradeJob, MaintenanceActivity};
 use model::switch::SwitchMaintenanceOperation;
 use tonic::{Code, Request, Response, Status};
@@ -67,11 +72,14 @@ fn unsupported_from_json_firmware_versions(target: &str) -> Status {
     ))
 }
 
-fn component_manager_error_to_status(err: ComponentManagerError) -> Status {
+pub(crate) fn component_manager_error_to_status(err: ComponentManagerError) -> Status {
     match err {
         ComponentManagerError::Unavailable(msg) => Status::unavailable(msg),
         ComponentManagerError::NotFound(msg) => Status::not_found(msg),
         ComponentManagerError::InvalidArgument(msg) => Status::invalid_argument(msg),
+        ComponentManagerError::Unsupported(msg) => Status::unimplemented(msg),
+        ComponentManagerError::RejectedBeforeDispatch(msg) => Status::failed_precondition(msg),
+        ComponentManagerError::OperationOutcomeUnknown(msg) => Status::unavailable(msg),
         ComponentManagerError::Internal(msg) => Status::internal(msg),
         ComponentManagerError::Transport(e) => Status::unavailable(format!("transport error: {e}")),
         ComponentManagerError::Status(s) => s,
@@ -303,59 +311,172 @@ fn map_switch_maintenance_operation(action: PowerAction) -> SwitchMaintenanceOpe
     }
 }
 
+fn map_machine_maintenance_operation(action: PowerAction) -> MachineMaintenanceOperation {
+    match action {
+        PowerAction::On => MachineMaintenanceOperation::PowerOn,
+        PowerAction::GracefulShutdown | PowerAction::ForceOff => {
+            MachineMaintenanceOperation::PowerOff
+        }
+        PowerAction::GracefulRestart | PowerAction::ForceRestart | PowerAction::AcPowercycle => {
+            MachineMaintenanceOperation::Reset
+        }
+    }
+}
+
+fn map_power_shelf_maintenance_operation(
+    action: PowerAction,
+) -> Result<PowerShelfMaintenanceOperation, &'static str> {
+    match action {
+        PowerAction::On => Ok(PowerShelfMaintenanceOperation::PowerOn),
+        PowerAction::GracefulShutdown | PowerAction::ForceOff => {
+            Ok(PowerShelfMaintenanceOperation::PowerOff)
+        }
+        PowerAction::GracefulRestart | PowerAction::ForceRestart | PowerAction::AcPowercycle => {
+            Err("power shelf state controller supports PowerOn and PowerOff only")
+        }
+    }
+}
+
 async fn queue_switch_power_control_via_state_controller(
     api: &Api,
+    cm: &ComponentManager,
     switch_ids: &[SwitchId],
     action: PowerAction,
 ) -> Result<Vec<rpc::ComponentResult>, Status> {
     let operation = map_switch_maintenance_operation(action);
-    queue_switch_maintenance_via_state_controller(api, switch_ids, operation).await
+    queue_switch_maintenance_via_state_controller(api, cm, switch_ids, operation).await
 }
 
 async fn queue_switch_maintenance_via_state_controller(
     api: &Api,
+    cm: &ComponentManager,
     switch_ids: &[SwitchId],
     operation: SwitchMaintenanceOperation,
 ) -> Result<Vec<rpc::ComponentResult>, Status> {
+    let results = cm
+        .request_switch_maintenance_via_state_controller(
+            &api.database_connection,
+            switch_ids,
+            operation,
+            "component-manager",
+        )
+        .await
+        .map_err(component_manager_error_to_status)?;
+
+    Ok(results
+        .iter()
+        .map(switch_maintenance_request_result_to_component_result)
+        .collect())
+}
+
+fn switch_maintenance_request_result_to_component_result(
+    result: &SwitchMaintenanceRequestResult,
+) -> rpc::ComponentResult {
+    match &result.error {
+        Some(error) => error_result(&result.switch_id.to_string(), error.clone()),
+        None => success_result(&result.switch_id.to_string()),
+    }
+}
+
+async fn queue_machine_power_control_via_state_controller(
+    api: &Api,
+    cm: &ComponentManager,
+    machine_ids: &[carbide_uuid::machine::MachineId],
+    action: PowerAction,
+) -> Result<Vec<rpc::ComponentResult>, Status> {
+    let operation = map_machine_maintenance_operation(action);
+    queue_machine_maintenance_via_state_controller(api, cm, machine_ids, operation).await
+}
+
+async fn queue_machine_maintenance_via_state_controller(
+    api: &Api,
+    cm: &ComponentManager,
+    machine_ids: &[carbide_uuid::machine::MachineId],
+    operation: MachineMaintenanceOperation,
+) -> Result<Vec<rpc::ComponentResult>, Status> {
+    let results = cm
+        .request_machine_maintenance_via_state_controller(
+            &api.database_connection,
+            machine_ids,
+            operation,
+            "component-manager",
+        )
+        .await
+        .map_err(component_manager_error_to_status)?;
+
+    Ok(results
+        .iter()
+        .map(machine_maintenance_request_result_to_component_result)
+        .collect())
+}
+
+fn machine_maintenance_request_result_to_component_result(
+    result: &component_manager::component_manager::MachineMaintenanceRequestResult,
+) -> rpc::ComponentResult {
+    match &result.error {
+        Some(error) => error_result(&result.machine_id.to_string(), error.clone()),
+        None => success_result(&result.machine_id.to_string()),
+    }
+}
+
+async fn queue_power_shelf_power_control_via_state_controller(
+    api: &Api,
+    power_shelf_ids: &[PowerShelfId],
+    action: PowerAction,
+) -> Result<Vec<rpc::ComponentResult>, Status> {
+    let operation = match map_power_shelf_maintenance_operation(action) {
+        Ok(operation) => operation,
+        Err(reason) => {
+            return Ok(power_shelf_ids
+                .iter()
+                .map(|id| error_result(&id.to_string(), reason.to_string()))
+                .collect());
+        }
+    };
+    queue_power_shelf_maintenance_via_state_controller(api, power_shelf_ids, operation).await
+}
+
+async fn queue_power_shelf_maintenance_via_state_controller(
+    api: &Api,
+    power_shelf_ids: &[PowerShelfId],
+    operation: PowerShelfMaintenanceOperation,
+) -> Result<Vec<rpc::ComponentResult>, Status> {
     let mut txn = api.txn_begin().await?;
-    let existing = db::switch::find_by(
+    let existing = db::power_shelf::find_by(
         &mut txn,
-        db::ObjectColumnFilter::List(db::switch::IdColumn, switch_ids),
+        db::ObjectColumnFilter::List(db::power_shelf::IdColumn, power_shelf_ids),
     )
     .await
     .map_err(CarbideError::from)?;
 
-    let by_id: HashMap<SwitchId, model::switch::Switch> =
-        existing.into_iter().map(|sw| (sw.id, sw)).collect();
-    let mut results = Vec::with_capacity(switch_ids.len());
+    let by_id: HashMap<PowerShelfId, model::power_shelf::PowerShelf> =
+        existing.into_iter().map(|ps| (ps.id, ps)).collect();
+    let mut results = Vec::with_capacity(power_shelf_ids.len());
 
-    for switch_id in switch_ids {
-        let Some(switch) = by_id.get(switch_id) else {
-            results.push(error_result(
-                &switch_id.to_string(),
-                format!("switch {switch_id} not found"),
-            ));
+    for power_shelf_id in power_shelf_ids {
+        let Some(power_shelf) = by_id.get(power_shelf_id) else {
+            results.push(not_found_result(&power_shelf_id.to_string()));
             continue;
         };
 
-        if switch.is_marked_as_deleted() {
+        if power_shelf.is_marked_as_deleted() {
             results.push(error_result(
-                &switch_id.to_string(),
-                format!("switch {switch_id} is marked for deletion"),
+                &power_shelf_id.to_string(),
+                format!("power shelf {power_shelf_id} is marked for deletion"),
             ));
             continue;
         }
 
-        db::switch::set_switch_maintenance_requested(
+        db::power_shelf::set_power_shelf_maintenance_requested(
             &mut txn,
-            *switch_id,
+            *power_shelf_id,
             "component-manager",
             operation,
         )
         .await
         .map_err(CarbideError::from)?;
 
-        results.push(success_result(&switch_id.to_string()));
+        results.push(success_result(&power_shelf_id.to_string()));
     }
 
     txn.commit().await?;
@@ -380,7 +501,7 @@ fn map_compute_tray_component_names(raw: &[i32]) -> Result<Vec<String>, Status> 
             Ok(rpc::ComputeTrayComponent::Gpu) => Ok("GPU".to_string()),
             Ok(rpc::ComputeTrayComponent::Cx7) => Ok("CX7".to_string()),
             Ok(rpc::ComputeTrayComponent::Unknown) => Err(Status::invalid_argument(
-                "compute tray component must not be Unknown",
+                "compute tray component must not be unknown",
             )),
             Err(e) => Err(Status::invalid_argument(format!(
                 "unrecognized compute tray component value {v}: {e}"
@@ -415,7 +536,7 @@ fn map_nv_switch_components(raw: &[i32]) -> Result<Vec<NvSwitchComponent>, Statu
             Ok(rpc::NvSwitchComponent::Bios) => Ok(NvSwitchComponent::Bios),
             Ok(rpc::NvSwitchComponent::Nvos) => Ok(NvSwitchComponent::Nvos),
             _ => Err(Status::invalid_argument(format!(
-                "unknown NV-Switch component: {v}"
+                "unknown NV-switch component: {v}"
             ))),
         })
         .collect()
@@ -429,7 +550,7 @@ fn map_compute_tray_components(raw: &[i32]) -> Result<Vec<ModelComputeTrayCompon
             Ok(rpc::ComputeTrayComponent::CpldMb) => Ok(ModelComputeTrayComponent::Cpld),
             Ok(rpc::ComputeTrayComponent::Cx7) => Ok(ModelComputeTrayComponent::Cx7),
             Ok(rpc::ComputeTrayComponent::Unknown) => Err(Status::invalid_argument(
-                "compute tray component must not be Unknown",
+                "compute tray component must not be unknown",
             )),
             Ok(other) => Err(Status::invalid_argument(format!(
                 "compute tray component {other:?} is not supported for direct dispatch"
@@ -532,6 +653,7 @@ struct RackFirmwareMaintenanceTarget {
     rack_id: RackId,
     machine_ids: Vec<String>,
     switch_ids: Vec<String>,
+    power_shelf_ids: Vec<String>,
 }
 
 fn push_rack_firmware_target(
@@ -539,6 +661,7 @@ fn push_rack_firmware_target(
     rack_id: RackId,
     machine_id: Option<String>,
     switch_id: Option<String>,
+    power_shelf_id: Option<String>,
 ) {
     let target = match targets.iter_mut().find(|target| target.rack_id == rack_id) {
         Some(target) => target,
@@ -547,6 +670,7 @@ fn push_rack_firmware_target(
                 rack_id,
                 machine_ids: Vec::new(),
                 switch_ids: Vec::new(),
+                power_shelf_ids: Vec::new(),
             });
             targets.last_mut().expect("target was just pushed")
         }
@@ -557,6 +681,9 @@ fn push_rack_firmware_target(
     }
     if let Some(switch_id) = switch_id {
         target.switch_ids.push(switch_id);
+    }
+    if let Some(power_shelf_id) = power_shelf_id {
+        target.power_shelf_ids.push(power_shelf_id);
     }
 }
 
@@ -586,7 +713,13 @@ async fn group_machine_ids_by_rack(
                 "machine {machine_id} is not associated with a rack"
             ))
         })?;
-        push_rack_firmware_target(&mut targets, rack_id, Some(machine_id.to_string()), None);
+        push_rack_firmware_target(
+            &mut targets,
+            rack_id,
+            Some(machine_id.to_string()),
+            None,
+            None,
+        );
     }
 
     Ok(targets)
@@ -595,18 +728,41 @@ async fn group_machine_ids_by_rack(
 /// Returns whether the machine is a rack-scale MNNVL server (GB200, GB300, etc.).
 fn is_rack_scale_server(machine: &Machine) -> bool {
     machine
+        .status
         .hardware_info
         .as_ref()
         .is_some_and(|hw| hw.is_mnnvl_capable())
 }
 
-/// Splits the requested compute machines into two lists: rack-scale and standalone servers.
-/// Rack-scale systems go through the rack-level state controller maintenance flow
-//  Standalone servers use the existing host reprovisioning firmware path.
-async fn partition_compute_machines_by_rack_scale(
-    api: &Api,
+/// Splits already-loaded compute machines into rack-scale and standalone lists.
+/// Rack-scale systems go through the rack-level state controller maintenance flow.
+/// Standalone servers use the existing host reprovisioning firmware path.
+///
+/// Unknown ids are a hard error here (firmware path); power control collects
+/// them as per-machine results instead via [`machine_is_rack_scale`].
+fn partition_loaded_compute_machines_by_rack_scale(
+    machines_by_id: &HashMap<MachineId, Machine>,
     machine_ids: &[MachineId],
 ) -> Result<(Vec<MachineId>, Vec<MachineId>), Status> {
+    let mut rack_scale = Vec::new();
+    let mut standalone = Vec::new();
+    for &machine_id in machine_ids {
+        if machine_is_rack_scale(machines_by_id, machine_id)? {
+            rack_scale.push(machine_id);
+        } else {
+            standalone.push(machine_id);
+        }
+    }
+    Ok((rack_scale, standalone))
+}
+
+/// Load the requested machines keyed by id. A DB lookup failure is a hard
+/// error, since nothing can be classified without it; ids that don't exist are
+/// simply absent from the returned map, left for the caller to handle.
+async fn load_machines_by_id(
+    api: &Api,
+    machine_ids: &[MachineId],
+) -> Result<HashMap<MachineId, Machine>, Status> {
     let machines = db::machine::find(
         api.db_reader().as_mut(),
         db::ObjectFilter::List(machine_ids),
@@ -614,25 +770,24 @@ async fn partition_compute_machines_by_rack_scale(
     )
     .await
     .map_err(|e| Status::internal(format!("failed to look up machines: {e}")))?;
-    let machines_by_id: HashMap<_, _> = machines
+    Ok(machines
         .into_iter()
         .map(|machine| (machine.id, machine))
-        .collect();
+        .collect())
+}
 
-    let mut rack_scale = Vec::new();
-    let mut standalone = Vec::new();
-    for machine_id in machine_ids {
-        let machine = machines_by_id
-            .get(machine_id)
-            .ok_or_else(|| Status::not_found(format!("machine {machine_id} not found")))?;
-        if is_rack_scale_server(machine) {
-            rack_scale.push(*machine_id);
-        } else {
-            standalone.push(*machine_id);
-        }
-    }
-
-    Ok((rack_scale, standalone))
+/// Classify a single already-loaded machine as rack-scale (`true`) or
+/// standalone (`false`), returning `Err(Status::not_found)` if the id is not in
+/// the map. Callers decide whether an unknown id aborts the batch or is
+/// collected as a per-machine error.
+fn machine_is_rack_scale(
+    machines_by_id: &HashMap<MachineId, Machine>,
+    machine_id: MachineId,
+) -> Result<bool, Status> {
+    let machine = machines_by_id
+        .get(&machine_id)
+        .ok_or_else(|| Status::not_found(format!("machine {machine_id} not found")))?;
+    Ok(is_rack_scale_server(machine))
 }
 
 /// Initiate a firmware upgrade for standalone (non rack-scale) servers
@@ -711,7 +866,57 @@ async fn group_switch_ids_by_rack(
         let rack_id = switch.rack_id.clone().ok_or_else(|| {
             Status::failed_precondition(format!("switch {switch_id} is not associated with a rack"))
         })?;
-        push_rack_firmware_target(&mut targets, rack_id, None, Some(switch_id.to_string()));
+        push_rack_firmware_target(
+            &mut targets,
+            rack_id,
+            None,
+            Some(switch_id.to_string()),
+            None,
+        );
+    }
+
+    Ok(targets)
+}
+
+async fn group_power_shelf_ids_by_rack(
+    api: &Api,
+    power_shelf_ids: &[PowerShelfId],
+) -> Result<Vec<RackFirmwareMaintenanceTarget>, Status> {
+    let mut txn = api
+        .database_connection
+        .begin()
+        .await
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+    let power_shelves = db::power_shelf::find_by(
+        &mut txn,
+        db::ObjectColumnFilter::List(db::power_shelf::IdColumn, power_shelf_ids),
+    )
+    .await
+    .map_err(|e| Status::internal(format!("failed to look up power shelves: {e}")))?;
+    drop(txn);
+
+    let power_shelves_by_id: HashMap<_, _> = power_shelves
+        .into_iter()
+        .map(|power_shelf| (power_shelf.id, power_shelf))
+        .collect();
+
+    let mut targets = Vec::new();
+    for power_shelf_id in power_shelf_ids {
+        let power_shelf = power_shelves_by_id
+            .get(power_shelf_id)
+            .ok_or_else(|| Status::not_found(format!("power shelf {power_shelf_id} not found")))?;
+        let rack_id = power_shelf.rack_id.clone().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "power shelf {power_shelf_id} is not associated with a rack"
+            ))
+        })?;
+        push_rack_firmware_target(
+            &mut targets,
+            rack_id,
+            None,
+            None,
+            Some(power_shelf_id.to_string()),
+        );
     }
 
     Ok(targets)
@@ -739,6 +944,7 @@ async fn submit_rack_firmware_maintenance_requests(
             .machine_ids
             .iter()
             .chain(target.switch_ids.iter())
+            .chain(target.power_shelf_ids.iter())
             .cloned()
             .collect();
         let maintenance_req = Request::new(rpc::RackMaintenanceOnDemandRequest {
@@ -746,7 +952,7 @@ async fn submit_rack_firmware_maintenance_requests(
             scope: Some(rpc::RackMaintenanceScope {
                 machine_ids: target.machine_ids,
                 switch_ids: target.switch_ids,
-                power_shelf_ids: vec![],
+                power_shelf_ids: target.power_shelf_ids,
                 activities: activities.clone(),
             }),
         });
@@ -928,7 +1134,7 @@ async fn resolve_switch_endpoints(
                 id: row.switch_id,
                 reason: "NVOS MAC or IP not available".into(),
             };
-            tracing::warn!(%u, "skipping switch");
+            tracing::warn!(switch_id = %u.id, reason = %u.reason, "skipping switch");
             unresolved.push(u);
             resolved_ids.insert(row.switch_id);
             continue;
@@ -947,7 +1153,7 @@ async fn resolve_switch_endpoints(
                     id: row.switch_id,
                     reason: format!("BMC credentials unavailable: {e}"),
                 };
-                tracing::warn!(%u, "skipping switch");
+                tracing::warn!(switch_id = %u.id, reason = %u.reason, "skipping switch");
                 unresolved.push(u);
                 continue;
             }
@@ -962,7 +1168,7 @@ async fn resolve_switch_endpoints(
                         id: row.switch_id,
                         reason: format!("NVOS credentials unavailable: {e}"),
                     };
-                    tracing::warn!(%u, "skipping switch");
+                    tracing::warn!(switch_id = %u.id, reason = %u.reason, "skipping switch");
                     unresolved.push(u);
                     continue;
                 }
@@ -976,7 +1182,7 @@ async fn resolve_switch_endpoints(
             nvos_mac,
             bmc_credentials,
             nvos_credentials,
-            nvos_host_name: row.nvos_hostname.filter(|hostname| !hostname.is_empty()),
+            nvos_host_name: row.nvos_hostname.none_if_empty(),
         });
     }
 
@@ -986,14 +1192,14 @@ async fn resolve_switch_endpoints(
                 id: *id,
                 reason: "switch not found in database".into(),
             };
-            tracing::warn!(%u, "skipping switch");
+            tracing::warn!(switch_id = %u.id, reason = %u.reason, "skipping switch");
             unresolved.push(u);
         }
     }
 
     if !unresolved.is_empty() {
         tracing::warn!(
-            count = unresolved.len(),
+            unresolved_switch_count = unresolved.len(),
             "some switches could not be resolved to endpoints"
         );
     }
@@ -1036,21 +1242,23 @@ async fn resolve_power_shelf_endpoints(
     for row in rows {
         resolved_ids.insert(row.power_shelf_id);
 
-        let pmc_credentials =
-            match fetch_powershelf_pmc_credentials(api.credential_manager.as_ref(), row.pmc_mac)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    let u = UnresolvedDevice {
-                        id: row.power_shelf_id,
-                        reason: format!("PMC credentials unavailable: {e}"),
-                    };
-                    tracing::warn!(%u, "skipping power shelf");
-                    unresolved.push(u);
-                    continue;
-                }
-            };
+        let pmc_credentials = match fetch_powershelf_pmc_credentials(
+            api.credential_manager.as_ref(),
+            row.pmc_mac,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let u = UnresolvedDevice {
+                    id: row.power_shelf_id,
+                    reason: format!("PMC credentials unavailable: {e}"),
+                };
+                tracing::warn!(power_shelf_id = %u.id, reason = %u.reason, "skipping power shelf");
+                unresolved.push(u);
+                continue;
+            }
+        };
 
         mac_to_id.insert(row.pmc_mac, row.power_shelf_id);
         endpoints.push(PowerShelfEndpoint {
@@ -1068,14 +1276,14 @@ async fn resolve_power_shelf_endpoints(
                 id: *id,
                 reason: "power shelf not found in database".into(),
             };
-            tracing::warn!(%u, "skipping power shelf");
+            tracing::warn!(power_shelf_id = %u.id, reason = %u.reason, "skipping power shelf");
             unresolved.push(u);
         }
     }
 
     if !unresolved.is_empty() {
         tracing::warn!(
-            count = unresolved.len(),
+            unresolved_power_shelf_count = unresolved.len(),
             "some power shelves could not be resolved to endpoints"
         );
     }
@@ -1089,17 +1297,6 @@ async fn resolve_power_shelf_endpoints(
     })
 }
 
-fn map_bmc_vendor_to_compute_tray(vendor: bmc_vendor::BMCVendor) -> ComputeTrayVendor {
-    match vendor {
-        bmc_vendor::BMCVendor::Dell => ComputeTrayVendor::Dell,
-        bmc_vendor::BMCVendor::Hpe => ComputeTrayVendor::Hpe,
-        bmc_vendor::BMCVendor::Lenovo => ComputeTrayVendor::Lenovo,
-        bmc_vendor::BMCVendor::Supermicro => ComputeTrayVendor::Supermicro,
-        bmc_vendor::BMCVendor::Nvidia => ComputeTrayVendor::Nvidia,
-        _ => ComputeTrayVendor::Unknown,
-    }
-}
-
 struct ResolvedComputeTrayEndpoints {
     endpoints: Vec<ComputeTrayEndpoint>,
     ip_to_machine_id: HashMap<IpAddr, carbide_uuid::machine::MachineId>,
@@ -1110,26 +1307,21 @@ struct ComputeTrayEndpoints {
     unresolved: Vec<UnresolvedDevice<carbide_uuid::machine::MachineId>>,
 }
 
-async fn resolve_compute_tray_endpoints(
-    api: &Api,
-    machine_ids: &[carbide_uuid::machine::MachineId],
-) -> Result<ComputeTrayEndpoints, Status> {
-    let machines = db::machine::find(
-        api.db_reader().as_mut(),
-        db::ObjectFilter::List(machine_ids),
-        MachineSearchConfig::default(),
-    )
-    .await
-    .map_err(|e| Status::internal(format!("failed to look up machines: {e}")))?;
-
-    let machine_by_id: HashMap<_, _> = machines.into_iter().map(|m| (m.id, m)).collect();
-
+/// Resolve BMC endpoints from an already-loaded machine map.
+///
+/// Callers that previously loaded machines for classification (power / firmware
+/// partition) reuse that map here so the machine table is not queried again.
+async fn resolve_compute_tray_endpoints_from_machines(
+    credential_manager: &dyn CredentialManager,
+    machines_by_id: &HashMap<MachineId, Machine>,
+    machine_ids: &[MachineId],
+) -> ComputeTrayEndpoints {
     let mut endpoints = Vec::with_capacity(machine_ids.len());
     let mut ip_to_machine_id = HashMap::with_capacity(machine_ids.len());
     let mut unresolved = Vec::new();
 
     for &machine_id in machine_ids {
-        let Some(machine) = machine_by_id.get(&machine_id) else {
+        let Some(machine) = machines_by_id.get(&machine_id) else {
             unresolved.push(UnresolvedDevice {
                 id: machine_id,
                 reason: "machine not found in database".into(),
@@ -1137,7 +1329,7 @@ async fn resolve_compute_tray_endpoints(
             continue;
         };
 
-        let Some(bmc_mac) = machine.bmc_info.mac else {
+        let Some(bmc_mac) = machine.status.bmc_info.mac else {
             unresolved.push(UnresolvedDevice {
                 id: machine_id,
                 reason: "BMC MAC not available".into(),
@@ -1145,7 +1337,7 @@ async fn resolve_compute_tray_endpoints(
             continue;
         };
 
-        let Some(bmc_ip) = machine.bmc_info.ip else {
+        let Some(bmc_ip) = machine.status.bmc_info.ip else {
             unresolved.push(UnresolvedDevice {
                 id: machine_id,
                 reason: "BMC IP not configured".into(),
@@ -1153,23 +1345,19 @@ async fn resolve_compute_tray_endpoints(
             continue;
         };
 
-        let bmc_credentials = match fetch_compute_tray_bmc_credentials(
-            api.credential_manager.as_ref(),
-            bmc_mac,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                unresolved.push(UnresolvedDevice {
-                    id: machine_id,
-                    reason: format!("BMC credentials unavailable: {e}"),
-                });
-                continue;
-            }
-        };
+        let bmc_credentials =
+            match fetch_compute_tray_bmc_credentials(credential_manager, bmc_mac).await {
+                Ok(c) => c,
+                Err(e) => {
+                    unresolved.push(UnresolvedDevice {
+                        id: machine_id,
+                        reason: format!("BMC credentials unavailable: {e}"),
+                    });
+                    continue;
+                }
+            };
 
-        let vendor = map_bmc_vendor_to_compute_tray(machine.bmc_vendor());
+        let vendor = ComputeTrayVendor::from(machine.bmc_vendor());
 
         ip_to_machine_id.insert(bmc_ip, machine_id);
         endpoints.push(ComputeTrayEndpoint {
@@ -1181,18 +1369,18 @@ async fn resolve_compute_tray_endpoints(
 
     if !unresolved.is_empty() {
         tracing::warn!(
-            count = unresolved.len(),
+            unresolved_compute_tray_count = unresolved.len(),
             "some compute trays could not be resolved to endpoints"
         );
     }
 
-    Ok(ComputeTrayEndpoints {
+    ComputeTrayEndpoints {
         resolved: ResolvedComputeTrayEndpoints {
             endpoints,
             ip_to_machine_id,
         },
         unresolved,
-    })
+    }
 }
 
 fn switch_mac_to_id_str(mac: &MacAddress, mac_to_id: &HashMap<MacAddress, SwitchId>) -> String {
@@ -1304,7 +1492,7 @@ fn derive_machine_firmware_update_status(
     }
 
     // No version match (or no version data): use machine update/state signals.
-    let state = if machine.update_complete {
+    let state = if machine.status.update_complete {
         rpc::FirmwareUpdateState::FwStateCompleted
     } else if state_str.contains("HostReprovision") && state_str.contains("FailedFirmwareUpgrade") {
         rpc::FirmwareUpdateState::FwStateFailed
@@ -1425,7 +1613,8 @@ pub(crate) async fn component_power_control(
         rpc::component_power_control_request::Target::SwitchIds(list) => {
             if cm.nv_switch_use_state_controller && !bypass_state_controller {
                 let results =
-                    queue_switch_power_control_via_state_controller(api, &list.ids, action).await?;
+                    queue_switch_power_control_via_state_controller(api, cm, &list.ids, action)
+                        .await?;
                 (results, Vec::new())
             } else {
                 let endpoints = resolve_switch_endpoints(api, &list.ids).await?;
@@ -1438,7 +1627,7 @@ pub(crate) async fn component_power_control(
 
                 tracing::info!(
                     backend = cm.nv_switch.name(),
-                    count = endpoints.resolved.endpoints.len(),
+                    switch_count = endpoints.resolved.endpoints.len(),
                     ?action,
                     "power control for switches"
                 );
@@ -1468,141 +1657,32 @@ pub(crate) async fn component_power_control(
         }
         rpc::component_power_control_request::Target::PowerShelfIds(list) => {
             if cm.power_shelf_use_state_controller && !bypass_state_controller {
-                // TODO: implement state controller path for power shelf power control
-                return Err(Status::unimplemented(
-                    "power shelf power control through the state controller is not yet supported",
-                ));
-            }
-            let endpoints = resolve_power_shelf_endpoints(api, &list.ids).await?;
-
-            let mut results: Vec<_> = endpoints
-                .unresolved
-                .iter()
-                .map(|u| error_result(&u.id.to_string(), u.reason.clone()))
-                .collect();
-
-            tracing::info!(
-                backend = cm.power_shelf.name(),
-                count = endpoints.resolved.endpoints.len(),
-                ?action,
-                "power control for power shelves"
-            );
-            let backend_results = cm
-                .power_shelf
-                .power_control(&endpoints.resolved.endpoints, action)
-                .await
-                .map_err(component_manager_error_to_status)?;
-            results.extend(backend_results.into_iter().map(|r| {
-                let id = ps_mac_to_id_str(&r.pmc_mac, &endpoints.resolved.mac_to_id);
-                if r.success {
-                    success_result(&id)
-                } else {
-                    error_result(&id, r.error.unwrap_or_default())
-                }
-            }));
-
-            let ips: Vec<IpAddr> = endpoints
-                .resolved
-                .endpoints
-                .iter()
-                .map(|ep| ep.pmc_ip)
-                .collect();
-
-            (results, ips)
-        }
-        rpc::component_power_control_request::Target::MachineIds(list) => {
-            if cm.compute_tray_use_state_controller && !bypass_state_controller {
-                // TODO: implement state controller path for compute tray power control
-                return Err(Status::unimplemented(
-                    "compute tray power control through the state controller is not yet supported",
-                ));
+                let results =
+                    queue_power_shelf_power_control_via_state_controller(api, &list.ids, action)
+                        .await?;
+                (results, Vec::new())
             } else {
-                let resolved = resolve_compute_tray_endpoints(api, &list.machine_ids).await?;
+                let endpoints = resolve_power_shelf_endpoints(api, &list.ids).await?;
 
-                let mut results: Vec<_> = resolved
+                let mut results: Vec<_> = endpoints
                     .unresolved
                     .iter()
                     .map(|u| error_result(&u.id.to_string(), u.reason.clone()))
                     .collect();
 
-                let resolved_machine_ids: Vec<_> = resolved
-                    .resolved
-                    .endpoints
-                    .iter()
-                    .filter_map(|ep| resolved.resolved.ip_to_machine_id.get(&ep.bmc_ip).copied())
-                    .collect();
-
-                // Insert health overrides and update power-manager desired state
-                // before issuing Redfish commands.
-                let desired_state = desired_power_state(action) as i32;
-                let mut overrides_inserted = Vec::new();
-                for &machine_id in &resolved_machine_ids {
-                    let inserted = power_control_health_override(api, machine_id, true).await;
-                    if inserted {
-                        overrides_inserted.push(machine_id);
-                    }
-
-                    let power_req = rpc::PowerOptionUpdateRequest {
-                        machine_id: Some(machine_id),
-                        power_state: desired_state,
-                    };
-                    match crate::handlers::power_options::update_power_option(
-                        api,
-                        Request::new(power_req),
-                    )
-                    .await
-                    {
-                        Ok(_) => {}
-                        Err(e)
-                            if e.code() == Code::InvalidArgument
-                                && e.message().contains("already set as") =>
-                        {
-                            tracing::debug!(
-                                %machine_id,
-                                desired_state,
-                                "power option already in desired state, skipping"
-                            );
-                        }
-                        Err(e) => {
-                            results.push(error_result(
-                                &machine_id.to_string(),
-                                format!("failed to update power option: {e}"),
-                            ));
-                        }
-                    }
-                }
-
                 tracing::info!(
-                    backend = cm.compute_tray.name(),
-                    count = resolved.resolved.endpoints.len(),
+                    backend = cm.power_shelf.name(),
+                    power_shelf_count = endpoints.resolved.endpoints.len(),
                     ?action,
-                    "power control for compute trays"
+                    "power control for power shelves"
                 );
                 let backend_results = cm
-                    .compute_tray
-                    .power_control(&resolved.resolved.endpoints, action)
+                    .power_shelf
+                    .power_control(&endpoints.resolved.endpoints, action)
                     .await
                     .map_err(component_manager_error_to_status)?;
-
-                // Clear health overrides after Redfish dispatch.
-                for machine_id in &overrides_inserted {
-                    power_control_health_override(api, *machine_id, false).await;
-                }
-
-                let ips: Vec<IpAddr> = resolved
-                    .resolved
-                    .endpoints
-                    .iter()
-                    .map(|ep| ep.bmc_ip)
-                    .collect();
-
                 results.extend(backend_results.into_iter().map(|r| {
-                    let id = resolved
-                        .resolved
-                        .ip_to_machine_id
-                        .get(&r.bmc_ip)
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| r.bmc_ip.to_string());
+                    let id = ps_mac_to_id_str(&r.pmc_mac, &endpoints.resolved.mac_to_id);
                     if r.success {
                         success_result(&id)
                     } else {
@@ -1610,8 +1690,172 @@ pub(crate) async fn component_power_control(
                     }
                 }));
 
+                let ips: Vec<IpAddr> = endpoints
+                    .resolved
+                    .endpoints
+                    .iter()
+                    .map(|ep| ep.pmc_ip)
+                    .collect();
+
                 (results, ips)
             }
+        }
+        rpc::component_power_control_request::Target::MachineIds(list) => {
+            // Divide the requested machines the same way compute firmware
+            // updates do: rack-scale (MNNVL) systems vs standalone servers. Only
+            // rack-scale systems have a compute-tray backend (RMS) and a
+            // state-controller maintenance flow; standalone servers are always
+            // driven synchronously through NICo-core's Redfish stack, because
+            // RMS cannot power-control them.
+            //
+            // Classify each machine and persist its power-manager desired state
+            // in a single pass. A machine joins `rack_scale_ids`/`standalone_ids`
+            // only after both steps succeed, so unknown ids and power-option
+            // failures are reported per-machine and never dispatched (no
+            // duplicate result, no actuation without a recorded intent).
+            //
+            // The state controller does not update the power manager today, so
+            // the handler owns it regardless of which dispatch path (rack vs
+            // standalone) a machine ultimately takes.
+            //
+            // The health override exists only to satisfy `update_power_option`'s
+            // precondition for powering a host off (it requires an
+            // `internal_maintenance` / `suppress_external_alerting` alert). The
+            // Redfish dispatch does not need it, so it brackets just the
+            // power-manager change. Durable alert suppression for an
+            // intentionally-off host comes from `desired_power_state` itself.
+            let machines_by_id = load_machines_by_id(api, &list.machine_ids).await?;
+            let desired_state = desired_power_state(action) as i32;
+            let mut results: Vec<rpc::ComponentResult> = Vec::new();
+            let (mut rack_scale_ids, mut standalone_ids) = (Vec::new(), Vec::new());
+            for &machine_id in &list.machine_ids {
+                // Unknown ids are reported per-machine and never dispatched.
+                let is_rack_scale = match machine_is_rack_scale(&machines_by_id, machine_id) {
+                    Ok(v) => v,
+                    Err(status) => {
+                        // Preserve the tonic status code (NotFound for an unknown
+                        // id) in the per-machine result instead of flattening it to
+                        // InternalError.
+                        results.push(status_result(&machine_id.to_string(), status));
+                        continue;
+                    }
+                };
+
+                let override_inserted = power_control_health_override(api, machine_id, true).await;
+
+                let power_req = rpc::PowerOptionUpdateRequest {
+                    machine_id: Some(machine_id),
+                    power_state: desired_state,
+                };
+                let power_option_ok = match crate::handlers::power_options::update_power_option(
+                    api,
+                    Request::new(power_req),
+                )
+                .await
+                {
+                    Ok(_) => true,
+                    Err(e)
+                        if e.code() == Code::InvalidArgument
+                            && e.message().contains("already set as") =>
+                    {
+                        tracing::debug!(
+                            %machine_id,
+                            desired_state,
+                            "power option already in desired state, skipping"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        results.push(error_result(
+                            &machine_id.to_string(),
+                            format!("failed to update power option: {e}"),
+                        ));
+                        false
+                    }
+                };
+
+                if override_inserted {
+                    power_control_health_override(api, machine_id, false).await;
+                }
+
+                // Only machines whose desired state was recorded proceed to
+                // dispatch, so a power-option failure never actuates hardware
+                // without a matching intent.
+                if power_option_ok {
+                    if is_rack_scale {
+                        rack_scale_ids.push(machine_id);
+                    } else {
+                        standalone_ids.push(machine_id);
+                    }
+                }
+            }
+
+            let mut ips: Vec<IpAddr> = Vec::new();
+
+            // Rack-scale systems: the state-controller maintenance flow when
+            // enabled, otherwise a synchronous dispatch through the configured
+            // backend (RMS).
+            if !rack_scale_ids.is_empty() {
+                if cm.compute_tray_use_state_controller && !bypass_state_controller {
+                    match queue_machine_power_control_via_state_controller(
+                        api,
+                        cm,
+                        &rack_scale_ids,
+                        action,
+                    )
+                    .await
+                    {
+                        Ok(sc_results) => results.extend(sc_results),
+                        Err(status) => {
+                            results.extend(partition_error_results(&rack_scale_ids, &status))
+                        }
+                    }
+                } else {
+                    match dispatch_compute_tray_power_control(
+                        api,
+                        cm.compute_tray.as_ref(),
+                        &machines_by_id,
+                        &rack_scale_ids,
+                        action,
+                    )
+                    .await
+                    {
+                        Ok((rack_results, rack_ips)) => {
+                            results.extend(rack_results);
+                            ips.extend(rack_ips);
+                        }
+                        Err(status) => {
+                            results.extend(partition_error_results(&rack_scale_ids, &status))
+                        }
+                    }
+                }
+            }
+
+            // Standalone servers: always synchronous, always NICo-core's Redfish
+            // stack (never the state machine, which has no non-rack path), so
+            // power control works even when the configured backend is RMS.
+            if !standalone_ids.is_empty() {
+                let core_backend = CoreComputeTrayManager::new(api.redfish_pool.clone());
+                match dispatch_compute_tray_power_control(
+                    api,
+                    &core_backend,
+                    &machines_by_id,
+                    &standalone_ids,
+                    action,
+                )
+                .await
+                {
+                    Ok((standalone_results, standalone_ips)) => {
+                        results.extend(standalone_results);
+                        ips.extend(standalone_ips);
+                    }
+                    Err(status) => {
+                        results.extend(partition_error_results(&standalone_ids, &status))
+                    }
+                }
+            }
+
+            (results, ips)
         }
     };
 
@@ -1624,6 +1868,83 @@ pub(crate) async fn component_power_control(
     Ok(Response::new(rpc::ComponentPowerControlResponse {
         results,
     }))
+}
+
+/// Fan a whole-partition dispatch failure out to one result per machine in that
+/// partition, so a failure in one partition never discards results already
+/// committed for the other partition or for the power-option updates. The tonic
+/// status code is preserved per machine (e.g. `Unavailable` for a backend that
+/// is down) rather than flattened to `InternalError`.
+fn partition_error_results(
+    machine_ids: &[MachineId],
+    status: &Status,
+) -> Vec<rpc::ComponentResult> {
+    machine_ids
+        .iter()
+        .map(|id| status_result(&id.to_string(), status.clone()))
+        .collect()
+}
+
+/// Resolve BMC endpoints for `machine_ids` from an already-loaded machine map,
+/// issue power control through `backend`, and return per-machine results (keyed
+/// by machine id via the resolved `ip_to_machine_id` map) alongside the BMC IPs
+/// that were dispatched to, so the caller can request site re-exploration.
+///
+/// Shared by the rack-scale synchronous path (configured backend, e.g. RMS) and
+/// the standalone path (always NICo-core's Redfish backend).
+async fn dispatch_compute_tray_power_control(
+    api: &Api,
+    backend: &dyn ComputeTrayManager,
+    machines_by_id: &HashMap<MachineId, Machine>,
+    machine_ids: &[MachineId],
+    action: PowerAction,
+) -> Result<(Vec<rpc::ComponentResult>, Vec<IpAddr>), Status> {
+    let resolved = resolve_compute_tray_endpoints_from_machines(
+        api.credential_manager.as_ref(),
+        machines_by_id,
+        machine_ids,
+    )
+    .await;
+
+    let mut results: Vec<rpc::ComponentResult> = resolved
+        .unresolved
+        .iter()
+        .map(|u| error_result(&u.id.to_string(), u.reason.clone()))
+        .collect();
+
+    tracing::info!(
+        backend = backend.name(),
+        compute_tray_count = resolved.resolved.endpoints.len(),
+        ?action,
+        "power control for compute trays"
+    );
+    let backend_results = backend
+        .power_control(&resolved.resolved.endpoints, action)
+        .await
+        .map_err(component_manager_error_to_status)?;
+
+    let ips: Vec<IpAddr> = resolved
+        .resolved
+        .endpoints
+        .iter()
+        .map(|ep| ep.bmc_ip)
+        .collect();
+
+    results.extend(backend_results.into_iter().map(|r| {
+        let id = resolved
+            .resolved
+            .ip_to_machine_id
+            .get(&r.bmc_ip)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| r.bmc_ip.to_string());
+        if r.success {
+            success_result(&id)
+        } else {
+            error_result(&id, r.error.unwrap_or_default())
+        }
+    }));
+
+    Ok((results, ips))
 }
 
 pub(crate) async fn component_configure_switch_certificate(
@@ -1642,6 +1963,7 @@ pub(crate) async fn component_configure_switch_certificate(
     if cm.nv_switch_use_state_controller && !bypass_state_controller {
         let results = queue_switch_maintenance_via_state_controller(
             api,
+            cm,
             &switch_ids.ids,
             SwitchMaintenanceOperation::ReconfigureCertificate,
         )
@@ -1660,7 +1982,7 @@ pub(crate) async fn component_configure_switch_certificate(
 
     tracing::info!(
         backend = cm.nv_switch.name(),
-        count = endpoints.resolved.endpoints.len(),
+        switch_count = endpoints.resolved.endpoints.len(),
         "configure switch certificate for switches"
     );
 
@@ -1744,7 +2066,8 @@ async fn power_control_health_override(
         tracing::warn!(
             %machine_id,
             error = %e,
-            "failed to {action} health report override for power control"
+            action,
+            "Failed to apply health report override for power control",
         );
     }
 
@@ -1773,7 +2096,7 @@ async fn request_re_exploration(api: &Api, ips: &[IpAddr]) {
         })
         .await;
     if let Err(e) | Ok(Err(e)) = result {
-        tracing::warn!(?e, "failed to request re-exploration after power control");
+        tracing::warn!(error = ?e, "failed to request re-exploration after power control");
     }
 }
 
@@ -2006,8 +2329,11 @@ pub(crate) async fn update_component_firmware(
             // systems (currently GB200 NVL, backed by RMS via the
             // ComputeTrayManager interface) can choose between the rack-level
             // state controller maintenance flow and a direct backend dispatch.
-            let (rack_scale_ids, standalone_ids) =
-                partition_compute_machines_by_rack_scale(api, &list.machine_ids).await?;
+            let machines_by_id = load_machines_by_id(api, &list.machine_ids).await?;
+            let (rack_scale_ids, standalone_ids) = partition_loaded_compute_machines_by_rack_scale(
+                &machines_by_id,
+                &list.machine_ids,
+            )?;
 
             let mut results = Vec::new();
 
@@ -2038,7 +2364,12 @@ pub(crate) async fn update_component_firmware(
                 } else {
                     reject_firmware_object_json_for_direct_dispatch("compute tray", &access_token)?;
                     let components = map_compute_tray_components(&t.components)?;
-                    let resolved = resolve_compute_tray_endpoints(api, &rack_scale_ids).await?;
+                    let resolved = resolve_compute_tray_endpoints_from_machines(
+                        api.credential_manager.as_ref(),
+                        &machines_by_id,
+                        &rack_scale_ids,
+                    )
+                    .await;
 
                     results.extend(
                         resolved
@@ -2085,54 +2416,70 @@ pub(crate) async fn update_component_firmware(
             let route_through_state_controller =
                 cm.power_shelf_use_state_controller && !bypass_state_controller;
             if route_through_state_controller {
-                // TODO: implement state controller path for power shelf firmware control
-                return Err(Status::unimplemented(
-                    "power shelf firmware control through the state controller is not yet supported",
-                ));
-            }
-
-            let options = if cm.power_shelf.supports_firmware_object_json() {
-                require_firmware_object_json_for_direct_rms(
+                let token = require_firmware_object_json_for_rack_maintenance(
                     "power shelf",
                     &access_token,
                     &req.target_version,
+                )?;
+                let components = map_power_shelf_components(&t.components)?;
+                let component_names = components
+                    .iter()
+                    .map(|component| match component {
+                        PowerShelfComponent::Pmc => "pmc".to_string(),
+                        PowerShelfComponent::Psu => "psu".to_string(),
+                    })
+                    .collect();
+                maintenance_activities = vec![firmware_upgrade_activity(
+                    req.target_version.clone(),
+                    component_names,
+                    Some(token),
                     force_update,
-                )?
+                )];
+                rack_maintenance_targets = group_power_shelf_ids_by_rack(api, &list.ids).await?;
             } else {
-                reject_power_shelf_firmware_object_json(&access_token)?;
-                FirmwareUpdateOptions {
-                    force_update,
-                    ..FirmwareUpdateOptions::default()
-                }
-            };
-            let components = map_power_shelf_components(&t.components)?;
-            let endpoints = resolve_power_shelf_endpoints(api, &list.ids).await?;
-
-            let mut results: Vec<_> = endpoints
-                .unresolved
-                .iter()
-                .map(|u| error_result(&u.id.to_string(), u.reason.clone()))
-                .collect();
-
-            let backend_results = cm
-                .power_shelf
-                .update_firmware(
-                    &endpoints.resolved.endpoints,
-                    &req.target_version,
-                    &components,
-                    &options,
-                )
-                .await
-                .map_err(component_manager_error_to_status)?;
-            results.extend(backend_results.into_iter().map(|r| {
-                let id = ps_mac_to_id_str(&r.pmc_mac, &endpoints.resolved.mac_to_id);
-                if r.success {
-                    success_result(&id)
+                let options = if cm.power_shelf.supports_firmware_object_json() {
+                    require_firmware_object_json_for_direct_rms(
+                        "power shelf",
+                        &access_token,
+                        &req.target_version,
+                        force_update,
+                    )?
                 } else {
-                    error_result(&id, r.error.unwrap_or_default())
-                }
-            }));
-            power_shelf_results = Some(results);
+                    reject_power_shelf_firmware_object_json(&access_token)?;
+                    FirmwareUpdateOptions {
+                        force_update,
+                        ..FirmwareUpdateOptions::default()
+                    }
+                };
+                let components = map_power_shelf_components(&t.components)?;
+                let endpoints = resolve_power_shelf_endpoints(api, &list.ids).await?;
+
+                let mut results: Vec<_> = endpoints
+                    .unresolved
+                    .iter()
+                    .map(|u| error_result(&u.id.to_string(), u.reason.clone()))
+                    .collect();
+
+                let backend_results = cm
+                    .power_shelf
+                    .update_firmware(
+                        &endpoints.resolved.endpoints,
+                        &req.target_version,
+                        &components,
+                        &options,
+                    )
+                    .await
+                    .map_err(component_manager_error_to_status)?;
+                results.extend(backend_results.into_iter().map(|r| {
+                    let id = ps_mac_to_id_str(&r.pmc_mac, &endpoints.resolved.mac_to_id);
+                    if r.success {
+                        success_result(&id)
+                    } else {
+                        error_result(&id, r.error.unwrap_or_default())
+                    }
+                }));
+                power_shelf_results = Some(results);
+            }
         }
         rpc::update_component_firmware_request::Target::Racks(t) => {
             if bypass_state_controller {
@@ -2453,7 +2800,13 @@ pub(crate) async fn list_component_firmware_versions(
                 return Err(unsupported_from_json_firmware_versions("compute tray"));
             }
 
-            let resolved = resolve_compute_tray_endpoints(api, &list.machine_ids).await?;
+            let machines_by_id = load_machines_by_id(api, &list.machine_ids).await?;
+            let resolved = resolve_compute_tray_endpoints_from_machines(
+                api.credential_manager.as_ref(),
+                &machines_by_id,
+                &list.machine_ids,
+            )
+            .await;
 
             let mut devices: Vec<rpc::DeviceFirmwareVersions> = resolved
                 .unresolved
@@ -2578,6 +2931,24 @@ mod tests {
                 message_contains: None,
             },
             ErrorToStatusCase {
+                scenario: "unsupported operation",
+                error: ComponentManagerError::Unsupported("not implemented".into()),
+                expected_code: Code::Unimplemented,
+                message_contains: Some("not implemented"),
+            },
+            ErrorToStatusCase {
+                scenario: "operation rejected before dispatch",
+                error: ComponentManagerError::RejectedBeforeDispatch("request rejected".into()),
+                expected_code: Code::FailedPrecondition,
+                message_contains: Some("request rejected"),
+            },
+            ErrorToStatusCase {
+                scenario: "operation outcome unknown",
+                error: ComponentManagerError::OperationOutcomeUnknown("lost job id".into()),
+                expected_code: Code::Unavailable,
+                message_contains: Some("lost job id"),
+            },
+            ErrorToStatusCase {
                 scenario: "internal",
                 error: ComponentManagerError::Internal("oops".into()),
                 expected_code: Code::Internal,
@@ -2680,17 +3051,37 @@ mod tests {
         let rack_b = RackId::new("rack-b".to_string());
         let mut targets = Vec::new();
 
-        push_rack_firmware_target(&mut targets, rack_a.clone(), Some("machine-a".into()), None);
-        push_rack_firmware_target(&mut targets, rack_b.clone(), None, Some("switch-b".into()));
-        push_rack_firmware_target(&mut targets, rack_a.clone(), Some("machine-c".into()), None);
+        push_rack_firmware_target(
+            &mut targets,
+            rack_a.clone(),
+            Some("machine-a".into()),
+            None,
+            None,
+        );
+        push_rack_firmware_target(
+            &mut targets,
+            rack_b.clone(),
+            None,
+            Some("switch-b".into()),
+            None,
+        );
+        push_rack_firmware_target(
+            &mut targets,
+            rack_a.clone(),
+            Some("machine-c".into()),
+            None,
+            None,
+        );
 
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].rack_id, rack_a);
         assert_eq!(targets[0].machine_ids, vec!["machine-a", "machine-c"]);
         assert!(targets[0].switch_ids.is_empty());
+        assert!(targets[0].power_shelf_ids.is_empty());
         assert_eq!(targets[1].rack_id, rack_b);
         assert_eq!(targets[1].switch_ids, vec!["switch-b"]);
         assert!(targets[1].machine_ids.is_empty());
+        assert!(targets[1].power_shelf_ids.is_empty());
     }
 
     #[test]
@@ -3081,6 +3472,54 @@ mod tests {
         assert_eq!(r.error, "boom");
     }
 
+    #[test]
+    fn status_result_maps_tonic_codes_and_defaults_to_internal_error() {
+        use super::status_result;
+
+        let cases = [
+            (
+                Status::not_found("missing"),
+                rpc::ComponentManagerStatusCode::NotFound,
+            ),
+            (
+                Status::invalid_argument("bad"),
+                rpc::ComponentManagerStatusCode::InvalidArgument,
+            ),
+            (
+                Status::failed_precondition("precondition"),
+                rpc::ComponentManagerStatusCode::InvalidArgument,
+            ),
+            (
+                Status::already_exists("dup"),
+                rpc::ComponentManagerStatusCode::AlreadyExists,
+            ),
+            (
+                Status::unavailable("down"),
+                rpc::ComponentManagerStatusCode::Unavailable,
+            ),
+            // Codes without an explicit arm collapse to InternalError.
+            (
+                Status::internal("boom"),
+                rpc::ComponentManagerStatusCode::InternalError,
+            ),
+            (
+                Status::permission_denied("nope"),
+                rpc::ComponentManagerStatusCode::InternalError,
+            ),
+        ];
+
+        for (status, expected) in cases {
+            let message = status.message().to_string();
+            let r = status_result("machine-1", status);
+            assert_eq!(r.component_id, "machine-1");
+            assert_eq!(
+                r.status, expected as i32,
+                "unexpected mapping for {message:?}"
+            );
+            assert_eq!(r.error, message);
+        }
+    }
+
     fn test_switch_id() -> SwitchId {
         use carbide_uuid::switch::{SwitchIdSource, SwitchType};
         SwitchId::new(SwitchIdSource::Tpm, [0u8; 32], SwitchType::NvLink)
@@ -3224,6 +3663,52 @@ mod tests {
     }
 
     #[test]
+    fn map_machine_maintenance_operation_variants() {
+        use model::machine::MachineMaintenanceOperation;
+
+        use super::map_machine_maintenance_operation;
+
+        assert_eq!(
+            map_machine_maintenance_operation(PowerAction::On),
+            MachineMaintenanceOperation::PowerOn,
+        );
+        assert_eq!(
+            map_machine_maintenance_operation(PowerAction::ForceOff),
+            MachineMaintenanceOperation::PowerOff,
+        );
+        assert_eq!(
+            map_machine_maintenance_operation(PowerAction::GracefulShutdown),
+            MachineMaintenanceOperation::PowerOff,
+        );
+        assert_eq!(
+            map_machine_maintenance_operation(PowerAction::ForceRestart),
+            MachineMaintenanceOperation::Reset,
+        );
+    }
+
+    #[test]
+    fn map_power_shelf_maintenance_operation_variants() {
+        use model::power_shelf::PowerShelfMaintenanceOperation;
+
+        use super::map_power_shelf_maintenance_operation;
+
+        assert_eq!(
+            map_power_shelf_maintenance_operation(PowerAction::On).unwrap(),
+            PowerShelfMaintenanceOperation::PowerOn,
+        );
+        assert_eq!(
+            map_power_shelf_maintenance_operation(PowerAction::ForceOff).unwrap(),
+            PowerShelfMaintenanceOperation::PowerOff,
+        );
+        assert_eq!(
+            map_power_shelf_maintenance_operation(PowerAction::GracefulShutdown).unwrap(),
+            PowerShelfMaintenanceOperation::PowerOff,
+        );
+        assert!(map_power_shelf_maintenance_operation(PowerAction::ForceRestart).is_err());
+        assert!(map_power_shelf_maintenance_operation(PowerAction::AcPowercycle).is_err());
+    }
+
+    #[test]
     fn firmware_versions_match_requires_non_empty_desired_subset() {
         use super::firmware_versions_match;
 
@@ -3259,5 +3744,286 @@ mod tests {
                 .as_ref()
                 .is_some_and(|result| result.error.contains("machine not found"))
         );
+    }
+
+    // ---- compute power-control (MachineIds) decision logic ----
+
+    use carbide_secrets::credentials::Credentials;
+    use carbide_secrets::test_support::credentials::TestCredentialManager;
+    use model::hardware_info::{Gpu, GpuPlatformInfo, HardwareInfo};
+    use model::test_support::machine_snapshot::{dpu_machine_id, host_machine, host_machine_id};
+
+    /// A GPU carrying NVLink platform metadata and an MNNVL family name — what
+    /// `is_mnnvl_capable` keys off of to flag a rack-scale (GB200) server.
+    fn mnnvl_gpu() -> Gpu {
+        Gpu {
+            name: "NVIDIA GB200".to_string(),
+            serial: String::new(),
+            driver_version: String::new(),
+            vbios_version: String::new(),
+            inforom_version: String::new(),
+            total_memory: String::new(),
+            frequency: String::new(),
+            pci_bus_id: String::new(),
+            platform_info: Some(GpuPlatformInfo {
+                chassis_serial: "CHASSIS-1".to_string(),
+                slot_number: 1,
+                tray_index: 1,
+                host_id: 1,
+                module_id: 1,
+                fabric_guid: String::new(),
+            }),
+        }
+    }
+
+    fn machine_with_hardware(hardware_info: Option<HardwareInfo>) -> Machine {
+        let mut machine = host_machine();
+        machine.status.hardware_info = hardware_info;
+        machine
+    }
+
+    fn machine_with_id(mut machine: Machine, id: MachineId) -> Machine {
+        machine.id = id;
+        machine
+    }
+
+    /// Rack-scale: at least one MNNVL-capable GPU.
+    fn rack_scale_machine() -> Machine {
+        machine_with_hardware(Some(HardwareInfo {
+            gpus: vec![mnnvl_gpu()],
+            ..Default::default()
+        }))
+    }
+
+    /// Standalone: no MNNVL-capable GPU.
+    fn standalone_machine() -> Machine {
+        machine_with_hardware(Some(HardwareInfo::default()))
+    }
+
+    /// Mirror the MachineIds power path's classify → power-option gate → partition
+    /// loop without a database: unknown ids become per-machine NotFound results,
+    /// and only machines with a successful power-option update join a partition.
+    fn prepare_dispatch_lists(
+        machines_by_id: &HashMap<MachineId, Machine>,
+        machine_ids: &[MachineId],
+        power_option_ok: &HashMap<MachineId, bool>,
+    ) -> (Vec<MachineId>, Vec<MachineId>, Vec<rpc::ComponentResult>) {
+        let mut results = Vec::new();
+        let mut rack_scale_ids = Vec::new();
+        let mut standalone_ids = Vec::new();
+        for &machine_id in machine_ids {
+            let is_rack_scale = match machine_is_rack_scale(machines_by_id, machine_id) {
+                Ok(v) => v,
+                Err(status) => {
+                    results.push(status_result(&machine_id.to_string(), status));
+                    continue;
+                }
+            };
+            let ok = power_option_ok.get(&machine_id).copied().unwrap_or(true);
+            if !ok {
+                results.push(error_result(
+                    &machine_id.to_string(),
+                    "failed to update power option: precondition".into(),
+                ));
+                continue;
+            }
+            if is_rack_scale {
+                rack_scale_ids.push(machine_id);
+            } else {
+                standalone_ids.push(machine_id);
+            }
+        }
+        (rack_scale_ids, standalone_ids, results)
+    }
+
+    #[test]
+    fn machine_is_rack_scale_classifies_rack_standalone_and_unknown() {
+        let id = host_machine_id();
+
+        let rack_map = HashMap::from([(id, rack_scale_machine())]);
+        assert!(
+            machine_is_rack_scale(&rack_map, id).unwrap(),
+            "MNNVL hardware should classify as rack-scale"
+        );
+
+        let standalone_map = HashMap::from([(id, standalone_machine())]);
+        assert!(
+            !machine_is_rack_scale(&standalone_map, id).unwrap(),
+            "non-MNNVL hardware should classify as standalone"
+        );
+
+        // Unknown id (absent from the map) is a per-machine NotFound carrying the id.
+        let err = machine_is_rack_scale(&HashMap::new(), id).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(err.message().contains(&id.to_string()));
+    }
+
+    #[test]
+    fn mixed_batch_routes_rack_to_rack_partition_and_standalone_to_core_partition() {
+        let rack_id = host_machine_id();
+        let standalone_id = dpu_machine_id(0);
+        let machines = HashMap::from([
+            (rack_id, machine_with_id(rack_scale_machine(), rack_id)),
+            (
+                standalone_id,
+                machine_with_id(standalone_machine(), standalone_id),
+            ),
+        ]);
+
+        let (rack, standalone, results) =
+            prepare_dispatch_lists(&machines, &[rack_id, standalone_id], &HashMap::new());
+
+        assert!(results.is_empty());
+        assert_eq!(rack, vec![rack_id]);
+        assert_eq!(standalone, vec![standalone_id]);
+    }
+
+    #[test]
+    fn all_rack_scale_batch_uses_only_rack_partition() {
+        let id = host_machine_id();
+        let machines = HashMap::from([(id, rack_scale_machine())]);
+        let (rack, standalone, results) = prepare_dispatch_lists(&machines, &[id], &HashMap::new());
+        assert!(results.is_empty());
+        assert_eq!(rack, vec![id]);
+        assert!(standalone.is_empty());
+    }
+
+    #[test]
+    fn all_standalone_batch_uses_only_standalone_partition() {
+        let id = host_machine_id();
+        let machines = HashMap::from([(id, standalone_machine())]);
+        let (rack, standalone, results) = prepare_dispatch_lists(&machines, &[id], &HashMap::new());
+        assert!(results.is_empty());
+        assert!(rack.is_empty());
+        assert_eq!(standalone, vec![id]);
+    }
+
+    #[test]
+    fn unknown_machine_id_is_not_found_and_does_not_abort_rest_of_batch() {
+        let known = host_machine_id();
+        let unknown = dpu_machine_id(1);
+        let machines = HashMap::from([(known, standalone_machine())]);
+
+        let (rack, standalone, results) =
+            prepare_dispatch_lists(&machines, &[unknown, known], &HashMap::new());
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].component_id, unknown.to_string());
+        assert_eq!(
+            results[0].status,
+            rpc::ComponentManagerStatusCode::NotFound as i32
+        );
+        assert!(rack.is_empty());
+        assert_eq!(standalone, vec![known]);
+    }
+
+    #[test]
+    fn power_option_failure_is_not_dispatched_while_siblings_are() {
+        let ok_id = host_machine_id();
+        let fail_id = dpu_machine_id(0);
+        let machines = HashMap::from([
+            (ok_id, machine_with_id(rack_scale_machine(), ok_id)),
+            (fail_id, machine_with_id(standalone_machine(), fail_id)),
+        ]);
+        let power_ok = HashMap::from([(ok_id, true), (fail_id, false)]);
+
+        let (rack, standalone, results) =
+            prepare_dispatch_lists(&machines, &[ok_id, fail_id], &power_ok);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].component_id, fail_id.to_string());
+        assert!(results[0].error.contains("failed to update power option"));
+        assert_eq!(rack, vec![ok_id]);
+        assert!(
+            standalone.is_empty(),
+            "power-option failure must not join a dispatch partition"
+        );
+    }
+
+    #[test]
+    fn partition_error_results_reports_one_error_per_machine() {
+        let ids = [host_machine_id(), dpu_machine_id(0)];
+        let status = Status::unavailable("backend down");
+
+        let results = partition_error_results(&ids, &status);
+
+        assert_eq!(results.len(), ids.len());
+        for (result, id) in results.iter().zip(ids) {
+            assert_eq!(result.component_id, id.to_string());
+            // The dispatch status code is preserved per machine, not flattened.
+            assert_eq!(
+                result.status,
+                rpc::ComponentManagerStatusCode::Unavailable as i32
+            );
+            assert!(result.error.contains("backend down"));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_from_machines_reports_missing_id_and_bmc_gaps() {
+        let missing_id = dpu_machine_id(0);
+        let no_mac_id = host_machine_id();
+        let no_ip_id = dpu_machine_id(1);
+
+        let mut no_mac = standalone_machine();
+        no_mac.id = no_mac_id;
+        no_mac.status.bmc_info.mac = None;
+
+        let mut no_ip = standalone_machine();
+        no_ip.id = no_ip_id;
+        no_ip.status.bmc_info.ip = None;
+
+        let machines = HashMap::from([(no_mac_id, no_mac), (no_ip_id, no_ip)]);
+        let creds = TestCredentialManager::new(Credentials::UsernamePassword {
+            username: "u".into(),
+            password: "p".into(),
+        });
+
+        let resolved = resolve_compute_tray_endpoints_from_machines(
+            &creds,
+            &machines,
+            &[missing_id, no_mac_id, no_ip_id],
+        )
+        .await;
+
+        assert!(resolved.resolved.endpoints.is_empty());
+        assert_eq!(resolved.unresolved.len(), 3);
+        assert!(
+            resolved
+                .unresolved
+                .iter()
+                .any(|u| u.id == missing_id && u.reason.contains("machine not found"))
+        );
+        assert!(
+            resolved
+                .unresolved
+                .iter()
+                .any(|u| u.id == no_mac_id && u.reason.contains("BMC MAC"))
+        );
+        assert!(
+            resolved
+                .unresolved
+                .iter()
+                .any(|u| u.id == no_ip_id && u.reason.contains("BMC IP"))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_from_machines_builds_endpoint_when_bmc_and_creds_present() {
+        let id = host_machine_id();
+        let machine = standalone_machine();
+        let bmc_ip = machine.status.bmc_info.ip.expect("fixture has BMC IP");
+        let machines = HashMap::from([(id, machine)]);
+        let creds = TestCredentialManager::new(Credentials::UsernamePassword {
+            username: "root".into(),
+            password: "secret".into(),
+        });
+
+        let resolved = resolve_compute_tray_endpoints_from_machines(&creds, &machines, &[id]).await;
+
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.resolved.endpoints.len(), 1);
+        assert_eq!(resolved.resolved.endpoints[0].bmc_ip, bmc_ip);
+        assert_eq!(resolved.resolved.ip_to_machine_id.get(&bmc_ip), Some(&id));
     }
 }

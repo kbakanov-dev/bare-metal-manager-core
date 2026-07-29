@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -89,6 +89,9 @@ pub struct EndpointSourcesConfig {
 
     /// Static BMC endpoints
     pub static_bmc_endpoints: Vec<StaticBmcEndpoint>,
+
+    /// Cluster inventory file source (file or cluster manager JSON RPC)
+    pub cluster: Configurable<ClusterEndpointSourceConfig>,
 }
 
 impl Default for EndpointSourcesConfig {
@@ -96,7 +99,91 @@ impl Default for EndpointSourcesConfig {
         Self {
             carbide_api: Configurable::Enabled(CarbideApiConnectionConfig::default()),
             static_bmc_endpoints: Vec::new(),
+            cluster: Configurable::Disabled,
         }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterEndpointSourceConfig {
+    /// Path to a JSON inventory file containing BMC endpoints and credentials for the cluster.
+    /// Used when `cluster_manager_url` is absent.
+    #[serde(default)]
+    pub inventory_path: PathBuf,
+
+    /// Cluster manager head-node URL (e.g. https://10.x.x.x:8081).
+    /// When set, inventory and credentials are fetched live via cluster manager JSON RPC
+    /// instead of reading `inventory_path`.
+    #[serde(default)]
+    pub cluster_manager_url: Option<url::Url>,
+
+    /// Cluster manager partition to read bmcsettings from (default: "base").
+    /// The cluster manager stores BMC username/password at partition level; this selects which partition.
+    #[serde(default = "default_cluster_manager_partition")]
+    pub cluster_manager_partition: String,
+
+    /// Fallback BMC username if cluster manager JSON RPC does not return one.
+    /// Cluster manager default is "bright" (set during head-node installation).
+    #[serde(default = "default_cluster_manager_username")]
+    pub default_username: String,
+
+    /// Fallback BMC password if cluster manager JSON RPC does not return one.
+    /// Must be set explicitly — no code-level default.
+    #[serde(default)]
+    pub default_password: Option<String>,
+
+    /// Optional BMC port override. None uses the BmcClient default (443/HTTPS).
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+fn default_cluster_manager_partition() -> String {
+    "base".to_string()
+}
+
+fn default_cluster_manager_username() -> String {
+    "bright".to_string()
+}
+
+impl Default for ClusterEndpointSourceConfig {
+    fn default() -> Self {
+        Self {
+            inventory_path: PathBuf::default(),
+            cluster_manager_url: None,
+            cluster_manager_partition: default_cluster_manager_partition(),
+            default_username: default_cluster_manager_username(),
+            default_password: None,
+            port: None,
+        }
+    }
+}
+
+impl ClusterEndpointSourceConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cluster_manager_url.is_none() && self.inventory_path.as_os_str().is_empty() {
+            return Err(
+                "cluster endpoint source requires either `inventory_path` or `cluster_manager_url`"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ClusterEndpointSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterEndpointSourceConfig")
+            .field("inventory_path", &self.inventory_path)
+            .field("cluster_manager_url", &self.cluster_manager_url)
+            .field("cluster_manager_partition", &self.cluster_manager_partition)
+            .field("default_username", &self.default_username)
+            .field(
+                "default_password",
+                &self.default_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("port", &self.port)
+            .finish()
     }
 }
 
@@ -114,13 +201,16 @@ pub struct StaticBmcEndpoint {
     pub power_shelf: Option<StaticPowerShelfEndpoint>,
     pub switch: Option<StaticSwitchEndpoint>,
     pub rack_id: Option<String>,
+    /// User-defined labels attached to telemetry emitted for this endpoint.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticMachineEndpoint {
-    /// Stable NICo machine ID for this BMC endpoint.
-    pub id: String,
+    /// Stable NICo machine ID for this BMC endpoint. Optional when running without NICo.
+    pub id: Option<String>,
 
     /// Optional chassis serial to emit as machine telemetry metadata.
     pub serial: Option<String>,
@@ -185,6 +275,7 @@ impl Debug for StaticBmcEndpoint {
             .field("power_shelf", &self.power_shelf)
             .field("switch", &self.switch)
             .field("rack_id", &self.rack_id)
+            .field("labels", &self.labels)
             .finish()
     }
 }
@@ -219,6 +310,52 @@ impl StaticBmcEndpoint {
             return Err(format!(
                 "endpoint_sources.static_bmc_endpoints[{index}].switch requires id or serial"
             ));
+        }
+
+        const RESERVED_LABELS: &[&str] = &[
+            "collector_type",
+            "endpoint_ip",
+            "endpoint_key",
+            "endpoint_mac",
+            "machine_id",
+            "machine_slot_number",
+            "machine_tray_index",
+            "nvlink_domain_uuid",
+            "rack_id",
+            "serial_number",
+            "switch_id",
+            "switch_slot_number",
+            "switch_tray_index",
+            "system_uuid",
+        ];
+
+        if self.labels.len() > 32 {
+            return Err(format!(
+                "endpoint_sources.static_bmc_endpoints[{index}].labels supports at most 32 labels"
+            ));
+        }
+
+        for (name, value) in &self.labels {
+            let mut chars = name.chars();
+            let valid_start = chars
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+            let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            if !valid_start || !valid_rest {
+                return Err(format!(
+                    "endpoint_sources.static_bmc_endpoints[{index}].labels key {name:?} must match [a-zA-Z_][a-zA-Z0-9_]*"
+                ));
+            }
+            if RESERVED_LABELS.contains(&name.as_str()) {
+                return Err(format!(
+                    "endpoint_sources.static_bmc_endpoints[{index}].labels key {name:?} is reserved"
+                ));
+            }
+            if value.len() > 1024 {
+                return Err(format!(
+                    "endpoint_sources.static_bmc_endpoints[{index}].labels value for {name:?} exceeds 1024 bytes"
+                ));
+            }
         }
 
         Ok(())
@@ -371,6 +508,13 @@ pub struct OtlpTargetConfig {
     /// Endpoint URI that receives both logs and metrics over OTLP/gRPC.
     pub endpoint: String,
 
+    /// Optional TLS or mTLS configuration for this endpoint.
+    ///
+    /// Omit this table for HTTPS endpoints that use platform trust roots. A
+    /// configured profile supplies a private CA, and supplying a client
+    /// certificate and key additionally enables mTLS.
+    pub tls: Option<OtlpTlsConfig>,
+
     /// Maximum number of events or samples exported per request. Defaults to
     /// 512.
     #[serde(default = "OtlpTargetConfig::default_batch_size")]
@@ -415,8 +559,107 @@ impl OtlpTargetConfig {
             return Err(format!("{path}.flush_interval must be greater than 0"));
         }
 
-        tonic::transport::Channel::from_shared(self.endpoint.clone())
+        let endpoint = tonic::transport::Channel::from_shared(self.endpoint.clone())
             .map_err(|_| format!("invalid {path}.endpoint: {}", self.endpoint))?;
+
+        if let Some(tls) = &self.tls {
+            if endpoint.uri().scheme_str() != Some("https") {
+                return Err(format!("{path}.tls requires an https endpoint"));
+            }
+
+            tls.validate(&path)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// TLS policy for one OTLP/gRPC target.
+///
+/// The CA bundle verifies the server certificate. Supplying both client paths
+/// adds a client identity and enables mTLS. Each signal drain periodically
+/// reloads the certificate files and adopts them only after a replacement
+/// connection succeeds. A failed reload leaves the current connection active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpTlsConfig {
+    /// Path to the CA bundle used to verify the OTLP server certificate.
+    pub ca_cert_path: PathBuf,
+
+    /// Optional path to the client certificate chain for mTLS.
+    pub client_cert_path: Option<PathBuf>,
+
+    /// Optional path to the client private key for mTLS.
+    pub client_key_path: Option<PathBuf>,
+
+    /// Optional DNS name used for TLS SNI and server certificate verification.
+    pub tls_server_name: Option<String>,
+
+    /// Interval between reloads of this target's TLS files. Defaults to five
+    /// minutes.
+    #[serde(
+        default = "OtlpTlsConfig::default_reload_interval",
+        with = "humantime_serde"
+    )]
+    pub reload_interval: Duration,
+}
+
+impl OtlpTlsConfig {
+    /// Default interval between attempts to reload an OTLP target's TLS files.
+    pub(crate) const DEFAULT_RELOAD_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+    fn default_reload_interval() -> Duration {
+        Self::DEFAULT_RELOAD_INTERVAL
+    }
+
+    fn validate(&self, target_path: &str) -> Result<(), String> {
+        let path = format!("{target_path}.tls");
+
+        if self.ca_cert_path.as_os_str().is_empty() {
+            return Err(format!("{path}.ca_cert_path must not be empty"));
+        }
+
+        match (&self.client_cert_path, &self.client_key_path) {
+            (Some(client_cert_path), Some(client_key_path)) => {
+                if client_cert_path.as_os_str().is_empty() {
+                    return Err(format!("{path}.client_cert_path must not be empty"));
+                }
+
+                if client_key_path.as_os_str().is_empty() {
+                    return Err(format!("{path}.client_key_path must not be empty"));
+                }
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "{path}.client_key_path must be set when {path}.client_cert_path is set"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{path}.client_cert_path must be set when {path}.client_key_path is set"
+                ));
+            }
+            (None, None) => {}
+        }
+
+        if let Some(tls_server_name) = self.tls_server_name.as_deref() {
+            if tls_server_name.trim().is_empty() {
+                return Err(format!("{path}.tls_server_name must not be empty"));
+            }
+
+            if tls_server_name.trim() != tls_server_name {
+                return Err(format!(
+                    "{path}.tls_server_name must not contain leading or trailing whitespace"
+                ));
+            }
+
+            DnsName::try_from(tls_server_name)
+                .map_err(|_| format!("{path}.tls_server_name must be a valid DNS name"))?;
+        }
+
+        if self.reload_interval.is_zero() {
+            return Err(format!("{path}.reload_interval must be greater than 0"));
+        }
 
         Ok(())
     }
@@ -596,6 +839,9 @@ pub struct CollectorsConfig {
 
     /// NVUE collector configuration for direct NVUE HTTP(s) polling of NVLink switches
     pub nvue: Configurable<NvueCollectorConfig>,
+
+    /// GPU inventory collector: compares OOB GPU count vs the assigned SKU.
+    pub gpu_inventory: Configurable<GpuInventoryConfig>,
 }
 
 impl Default for CollectorsConfig {
@@ -610,6 +856,7 @@ impl Default for CollectorsConfig {
             nmxt: Configurable::Disabled,
             nmxc: Configurable::Disabled,
             nvue: Configurable::Disabled,
+            gpu_inventory: Configurable::Disabled,
         }
     }
 }
@@ -724,6 +971,25 @@ impl Default for MetricsCollectorConfig {
         Self {
             fetch_interval: Duration::from_secs(120),
             fetch_concurrency: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GpuInventoryConfig {
+    /// How often to re-check the GPU count against the assigned SKU. GPU
+    /// population is near-static and each iteration re-reads the SKU from the
+    /// NICo API, so this defaults to a low frequency (1h, matching the entity
+    /// discovery refresh cadence) rather than hammering the API.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+impl Default for GpuInventoryConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(3600),
         }
     }
 }
@@ -939,6 +1205,22 @@ pub struct PeriodicLogConfig {
 
     /// Path to logs collector state file (supports {machine_id} placeholder).
     pub logs_state_file: String,
+
+    /// Substrings matched against each Redfish LogService odata id; any service
+    /// whose id contains one of these is skipped during discovery. Defaults to
+    /// `["Journal"]` to suppress the bmcweb HTTP-access log, which is
+    /// high-volume and self-referential. Set to `[]` to collect from every
+    /// discovered LogService.
+    #[serde(default)]
+    pub exclude_services: Vec<String>,
+
+    /// When true, on the first encounter of a LogService with no saved state,
+    /// anchor at the current highest entry ID without emitting existing entries.
+    /// Subsequent polls collect only new entries, matching SSE real-time
+    /// behaviour. Defaults to false (existing entries are collected on first
+    /// run). Also applies when auto-mode downgrades to periodic collection.
+    #[serde(default)]
+    pub skip_initial_history: bool,
 }
 
 impl Default for PeriodicLogConfig {
@@ -947,6 +1229,8 @@ impl Default for PeriodicLogConfig {
             logs_collection_interval: Duration::from_secs(300),
             state_refresh_interval: Duration::from_secs(1800),
             logs_state_file: "/tmp/logs_collector_{machine_id}.json".to_string(),
+            exclude_services: vec!["Journal".to_string()],
+            skip_initial_history: false,
         }
     }
 }
@@ -1424,6 +1708,10 @@ impl Config {
             endpoint.validate(index)?;
         }
 
+        if let Configurable::Enabled(ref cluster_cfg) = self.endpoint_sources.cluster {
+            cluster_cfg.validate()?;
+        }
+
         if let Configurable::Enabled(health_report) = &self.sinks.health_report
             && health_report.workers == 0
         {
@@ -1480,6 +1768,27 @@ impl Config {
 
         if let Configurable::Enabled(nmxc) = &self.collectors.nmxc {
             nmxc.validate()?;
+        }
+
+        if let Configurable::Enabled(gpu_inventory) = &self.collectors.gpu_inventory {
+            if !self.endpoint_sources.carbide_api.is_enabled() {
+                return Err(
+                    "collectors.gpu_inventory requires endpoint_sources.carbide_api to be enabled \
+                     (expected GPU counts are resolved from the machine SKU via the Carbide API)"
+                        .to_string(),
+                );
+            }
+            if !self.sinks.health_report.is_enabled() {
+                return Err(
+                    "collectors.gpu_inventory requires sinks.health_report to be enabled \
+                     (GPU shortage alerts are delivered through the health-report sink)"
+                        .to_string(),
+                );
+            }
+            if gpu_inventory.interval.is_zero() {
+                // A zero interval would busy-loop the collector and flood the BMC / API.
+                return Err("collectors.gpu_inventory.interval must be greater than 0".to_string());
+            }
         }
 
         if let Configurable::Enabled(ref otlp) = self.sinks.otlp {
@@ -1566,9 +1875,142 @@ where
 
 #[cfg(test)]
 mod tests {
-    use carbide_test_support::value_scenarios;
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{Check, check_values, scenarios, value_scenarios};
 
     use super::*;
+
+    fn config_with(configure: impl FnOnce(&mut Config)) -> Box<Config> {
+        let mut config = Config::default();
+        configure(&mut config);
+        Box::new(config)
+    }
+
+    fn static_endpoint() -> StaticBmcEndpoint {
+        StaticBmcEndpoint {
+            ip: "192.0.2.1".parse().unwrap(),
+            port: None,
+            mac: "00:11:22:33:44:55".to_string(),
+            username: "admin".to_string(),
+            password: None,
+            machine: None,
+            power_shelf: None,
+            switch: None,
+            rack_id: None,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn static_machine() -> StaticMachineEndpoint {
+        StaticMachineEndpoint {
+            id: Some("machine-id".to_string()),
+            serial: None,
+            driver_version: None,
+            slot_number: None,
+            tray_index: None,
+            nvlink_domain_uuid: None,
+        }
+    }
+
+    fn static_switch() -> StaticSwitchEndpoint {
+        StaticSwitchEndpoint {
+            id: None,
+            serial: Some("switch-serial".to_string()),
+            slot_number: None,
+            tray_index: None,
+            endpoint_role: StaticSwitchEndpointRole::Host,
+            is_primary: false,
+            nmxc_enabled: None,
+            nmxt_enabled: None,
+        }
+    }
+
+    fn otlp_target(endpoint: &str) -> OtlpTargetConfig {
+        OtlpTargetConfig {
+            endpoint: endpoint.to_string(),
+            tls: None,
+            batch_size: 512,
+            flush_interval: Duration::from_secs(2),
+            include_diagnostics: false,
+        }
+    }
+
+    fn otlp_tls() -> OtlpTlsConfig {
+        OtlpTlsConfig {
+            ca_cert_path: PathBuf::from("/site/ca.crt"),
+            client_cert_path: None,
+            client_key_path: None,
+            tls_server_name: None,
+            reload_interval: OtlpTlsConfig::DEFAULT_RELOAD_INTERVAL,
+        }
+    }
+
+    fn switch_tls() -> MtlsProfileConfig {
+        MtlsProfileConfig {
+            ca_cert_path: PathBuf::from("/switch/ca.crt"),
+            client_cert_path: PathBuf::from("/switch/tls.crt"),
+            client_key_path: PathBuf::from("/switch/tls.key"),
+            tls_server_name: None,
+        }
+    }
+
+    struct IndexedStaticEndpoint {
+        index: usize,
+        endpoint: StaticBmcEndpoint,
+    }
+
+    struct IndexedOtlpTarget {
+        index: usize,
+        target: OtlpTargetConfig,
+    }
+
+    struct OtlpTlsCase {
+        target_path: &'static str,
+        tls: OtlpTlsConfig,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LogsConfigProjection {
+        mode: LogCollectionMode,
+        validation: Result<(), String>,
+        configured_sse: Option<SseLogConfig>,
+        configured_periodic: Option<PeriodicLogConfig>,
+        configured_auto: Option<AutoModeConfig>,
+        effective_sse: SseLogConfig,
+        effective_periodic: PeriodicLogConfig,
+        effective_auto_periodic: PeriodicLogConfig,
+    }
+
+    fn project_logs_config(config: LogsCollectorConfig) -> LogsConfigProjection {
+        let validation = config.validate();
+        let effective_sse = config.sse_or_default();
+        let effective_periodic = config.periodic_or_default();
+        let effective_auto_periodic = config.auto_periodic_or_default();
+        let LogsCollectorConfig {
+            mode,
+            sse,
+            periodic,
+            auto,
+        } = config;
+
+        LogsConfigProjection {
+            mode,
+            validation,
+            configured_sse: sse,
+            configured_periodic: periodic,
+            configured_auto: auto,
+            effective_sse,
+            effective_periodic,
+            effective_auto_periodic,
+        }
+    }
+
+    fn parsed_periodic_defaults() -> PeriodicLogConfig {
+        PeriodicLogConfig {
+            exclude_services: vec![],
+            ..PeriodicLogConfig::default()
+        }
+    }
 
     #[test]
     fn test_parse_example_config() {
@@ -1791,177 +2233,364 @@ username = "root"
     }
 
     #[test]
-    fn test_config_validation() {
-        let mut config = Config::default();
+    fn cluster_endpoint_source_validation() {
+        scenarios!(run = |config: ClusterEndpointSourceConfig| config.validate();
+            "missing source" {
+                ClusterEndpointSourceConfig::default() => FailsWith(
+                    "cluster endpoint source requires either `inventory_path` or `cluster_manager_url`"
+                        .to_string()
+                ),
+            }
 
-        config.validate().expect("config should be valid");
+            "inventory file" {
+                ClusterEndpointSourceConfig {
+                    inventory_path: PathBuf::from("/etc/carbide/cluster.json"),
+                    ..ClusterEndpointSourceConfig::default()
+                } => Yields(()),
+            }
 
-        config.shard = 5;
-        config.shards_count = 3;
-        assert!(config.validate().is_err());
+            "cluster manager" {
+                ClusterEndpointSourceConfig {
+                    cluster_manager_url: Some(
+                        "https://cluster-manager.example"
+                            .parse()
+                            .expect("cluster manager URL should parse")
+                    ),
+                    ..ClusterEndpointSourceConfig::default()
+                } => Yields(()),
+            }
+        );
+    }
 
-        config.shard = 0;
-        config.shards_count = 1;
-        assert!(config.validate().is_ok());
+    #[test]
+    fn static_endpoint_validation() {
+        scenarios!(run = |IndexedStaticEndpoint { index, endpoint }| endpoint.validate(index);
+            "valid endpoint" {
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: static_endpoint(),
+                } => Yields(()),
+            }
 
-        config.endpoint_discovery_interval = Duration::from_secs(0);
-        assert!(config.validate().is_err());
-        config.endpoint_discovery_interval = Duration::from_secs(300);
-        assert!(config.validate().is_ok());
+            "multiple identities" {
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: StaticBmcEndpoint {
+                        machine: Some(static_machine()),
+                        switch: Some(static_switch()),
+                        ..static_endpoint()
+                    },
+                } => FailsWith(
+                    "endpoint_sources.static_bmc_endpoints[3] must specify at most one of machine, power_shelf, or switch"
+                        .to_string()
+                ),
+            }
 
-        config.rate_limit = Configurable::Enabled(RateLimitConfig {
-            bucket_burst: 200,
-            bucket_replenish: Duration::from_secs(0),
-            max_jitter: Duration::from_secs(0),
-        });
-        assert!(config.validate().is_err());
+            "power shelf identity" {
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: StaticBmcEndpoint {
+                        power_shelf: Some(StaticPowerShelfEndpoint {
+                            id: None,
+                            serial: None,
+                        }),
+                        ..static_endpoint()
+                    },
+                } => FailsWith(
+                    "endpoint_sources.static_bmc_endpoints[3].power_shelf requires id or serial"
+                        .to_string()
+                ),
 
-        config.rate_limit = Configurable::Enabled(RateLimitConfig::default());
-        config.processors.leak_detection = Configurable::Enabled(LeakDetectionProcessorConfig {
-            minimum_alerts_per_report: 0,
-        });
-        assert!(config.validate().is_err());
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: StaticBmcEndpoint {
+                        power_shelf: Some(StaticPowerShelfEndpoint {
+                            id: Some("power-shelf-id".to_string()),
+                            serial: None,
+                        }),
+                        ..static_endpoint()
+                    },
+                } => Yields(()),
+            }
 
-        config.processors.leak_detection =
-            Configurable::Enabled(LeakDetectionProcessorConfig::default());
-        config.sinks.health_report = Configurable::Enabled(HealthReportSinkConfig {
-            workers: 0,
-            ..HealthReportSinkConfig::default()
-        });
-        assert!(config.validate().is_err());
+            "switch identity" {
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: StaticBmcEndpoint {
+                        switch: Some(StaticSwitchEndpoint {
+                            serial: None,
+                            ..static_switch()
+                        }),
+                        ..static_endpoint()
+                    },
+                } => FailsWith(
+                    "endpoint_sources.static_bmc_endpoints[3].switch requires id or serial"
+                        .to_string()
+                ),
 
-        config.sinks.health_report = Configurable::Enabled(HealthReportSinkConfig::default());
+                IndexedStaticEndpoint {
+                    index: 3,
+                    endpoint: StaticBmcEndpoint {
+                        switch: Some(static_switch()),
+                        ..static_endpoint()
+                    },
+                } => Yields(()),
+            }
+        );
+    }
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Periodic,
-            sse: None,
-            periodic: None,
-            auto: None,
-        });
-        assert!(config.validate().is_err());
+    #[test]
+    fn config_validation() {
+        scenarios!(run = |config: Box<Config>| config.validate();
+            "valid configurations" {
+                Box::new(Config::default()) => Yields(()),
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Sse,
-            sse: None,
-            periodic: Some(PeriodicLogConfig::default()),
-            auto: None,
-        });
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.collectors.logs =
+                        Configurable::Enabled(LogsCollectorConfig::default());
+                }) => Yields(()),
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Sse,
-            sse: None,
-            periodic: None,
-            auto: None,
-        });
-        assert!(config.validate().is_ok());
+                config_with(|config| {
+                    config.collectors.nmxc =
+                        Configurable::Enabled(NmxcCollectorConfig::default());
+                }) => Yields(()),
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Auto,
-            sse: None,
-            periodic: None,
-            auto: None,
-        });
-        assert!(config.validate().is_ok());
+                config_with(|config| {
+                    config.collectors.gpu_inventory =
+                        Configurable::Enabled(GpuInventoryConfig {
+                            interval: Duration::from_secs(300),
+                        });
+                }) => Yields(()),
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Auto,
-            sse: None,
-            periodic: None,
-            auto: Some(AutoModeConfig {
-                sse_not_available_threshold: 0,
-                ..AutoModeConfig::default()
-            }),
-        });
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![otlp_target("http://localhost:4317")],
+                    });
+                }) => Yields(()),
+            }
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Auto,
-            sse: None,
-            periodic: None,
-            auto: Some(AutoModeConfig {
-                connect_failure_threshold: 0,
-                ..AutoModeConfig::default()
-            }),
-        });
-        assert!(config.validate().is_err());
+            "top-level settings" {
+                config_with(|config| {
+                    config.shard = 5;
+                    config.shards_count = 3;
+                }) => FailsWith("shard (5) must be less than shards_count (3)".to_string()),
 
-        config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
-            mode: LogCollectionMode::Auto,
-            sse: None,
-            periodic: None,
-            auto: Some(AutoModeConfig {
-                connect_failure_window: Duration::from_secs(0),
-                ..AutoModeConfig::default()
-            }),
-        });
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.endpoint_discovery_interval = Duration::ZERO;
+                }) => FailsWith(
+                    "endpoint_discovery_interval must be greater than 0".to_string()
+                ),
 
-        config.collectors.logs = Configurable::Disabled;
-        assert!(config.validate().is_ok());
+                config_with(|config| {
+                    config.rate_limit = Configurable::Enabled(RateLimitConfig {
+                        bucket_replenish: Duration::ZERO,
+                        ..RateLimitConfig::default()
+                    });
+                }) => FailsWith(
+                    "bucket_replenish must be greater than 0 when rate limiting is enabled"
+                        .to_string()
+                ),
 
-        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
-            grpc_port: 0,
-            ..NmxcCollectorConfig::default()
-        });
+                config_with(|config| {
+                    config.processors.leak_detection =
+                        Configurable::Enabled(LeakDetectionProcessorConfig {
+                            minimum_alerts_per_report: 0,
+                        });
+                }) => FailsWith(
+                    "processors.leak_detection.minimum_alerts_per_report must be greater than 0"
+                        .to_string()
+                ),
 
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.sinks.health_report =
+                        Configurable::Enabled(HealthReportSinkConfig {
+                            workers: 0,
+                            ..HealthReportSinkConfig::default()
+                        });
+                }) => FailsWith(
+                    "sinks.health_report.workers must be greater than 0".to_string()
+                ),
 
-        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
-            gateway_id: " ".to_string(),
-            ..NmxcCollectorConfig::default()
-        });
+                config_with(|config| {
+                    config.sinks.rack_health_report =
+                        Configurable::Enabled(RackHealthReportSinkConfig {
+                            workers: 0,
+                            ..RackHealthReportSinkConfig::default()
+                        });
+                }) => FailsWith(
+                    "sinks.rack_health_report.workers must be greater than 0".to_string()
+                ),
 
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.sinks.switch_health_report =
+                        Configurable::Enabled(SwitchHealthReportSinkConfig {
+                            workers: 0,
+                            ..SwitchHealthReportSinkConfig::default()
+                        });
+                }) => FailsWith(
+                    "sinks.switch_health_report.workers must be greater than 0".to_string()
+                ),
 
-        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
-            heartbeat_rate: 0,
-            ..NmxcCollectorConfig::default()
-        });
+                config_with(|config| {
+                    config.sinks.power_shelf_health_report =
+                        Configurable::Enabled(PowerShelfHealthReportSinkConfig {
+                            workers: 0,
+                            ..PowerShelfHealthReportSinkConfig::default()
+                        });
+                }) => FailsWith(
+                    "sinks.power_shelf_health_report.workers must be greater than 0".to_string()
+                ),
 
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.metrics.endpoint = "not an address".to_string();
+                }) => FailsWith(
+                    "Invalid metrics endpoint: not an address".to_string()
+                ),
+            }
 
-        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
-            max_backoff: Duration::from_millis(500),
-            initial_backoff: Duration::from_secs(1),
-            ..NmxcCollectorConfig::default()
-        });
+            "cluster endpoint source" {
+                config_with(|config| {
+                    config.endpoint_sources.cluster =
+                        Configurable::Enabled(ClusterEndpointSourceConfig::default());
+                }) => FailsWith(
+                    "cluster endpoint source requires either `inventory_path` or `cluster_manager_url`"
+                        .to_string()
+                ),
 
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.endpoint_sources.cluster =
+                        Configurable::Enabled(ClusterEndpointSourceConfig {
+                            inventory_path: PathBuf::from("/etc/carbide/cluster.json"),
+                            ..ClusterEndpointSourceConfig::default()
+                        });
+                }) => Yields(()),
+            }
 
-        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig::default());
+            "static endpoints" {
+                config_with(|config| {
+                    config.endpoint_sources.static_bmc_endpoints =
+                        vec![StaticBmcEndpoint {
+                            machine: Some(static_machine()),
+                            switch: Some(static_switch()),
+                            ..static_endpoint()
+                        }];
+                }) => FailsWith(
+                    "endpoint_sources.static_bmc_endpoints[0] must specify at most one of machine, power_shelf, or switch"
+                        .to_string()
+                ),
+            }
 
-        assert!(config.validate().is_ok());
+            "log collector" {
+                config_with(|config| {
+                    config.collectors.logs = Configurable::Enabled(LogsCollectorConfig {
+                        mode: LogCollectionMode::Periodic,
+                        ..LogsCollectorConfig::default()
+                    });
+                }) => FailsWith(
+                    "[collectors.logs.periodic] is required when mode = \"periodic\"".to_string()
+                ),
+            }
 
-        config.collectors.nmxc = Configurable::Disabled;
+            "switch TLS" {
+                config_with(|config| {
+                    config.tls.switch = Some(MtlsProfileConfig {
+                        ca_cert_path: PathBuf::new(),
+                        ..switch_tls()
+                    });
+                }) => FailsWith("[tls.switch].ca_cert_path must not be empty".to_string()),
 
-        assert!(config.validate().is_ok());
+                config_with(|config| {
+                    config.tls.switch = Some(switch_tls());
+                    config.collectors.nmxt = Configurable::Enabled(NmxtCollectorConfig {
+                        dangerously_skip_tls_verification: true,
+                        ..NmxtCollectorConfig::default()
+                    });
+                }) => FailsWith(
+                    "[collectors.nmxt].dangerously_skip_tls_verification must be false when [tls.switch] is configured"
+                        .to_string()
+                ),
 
-        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
-            targets: vec![OtlpTargetConfig {
-                endpoint: "not a valid uri\n".to_string(),
-                batch_size: 512,
-                flush_interval: Duration::from_secs(2),
-                include_diagnostics: false,
-            }],
-        });
+                config_with(|config| {
+                    config.tls.switch = Some(switch_tls());
+                    config.collectors.nvue = Configurable::Enabled(NvueCollectorConfig {
+                        gnmi: Configurable::Enabled(NvueGnmiConfig {
+                            dangerously_skip_tls_verification: true,
+                            ..NvueGnmiConfig::default()
+                        }),
+                        ..NvueCollectorConfig::default()
+                    });
+                }) => FailsWith(
+                    "[collectors.nvue.gnmi].dangerously_skip_tls_verification must be false when [tls.switch] is configured"
+                        .to_string()
+                ),
+            }
 
-        assert!(config.validate().is_err());
+            "NMX-C collector" {
+                config_with(|config| {
+                    config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+                        grpc_port: 0,
+                        ..NmxcCollectorConfig::default()
+                    });
+                }) => FailsWith(
+                    "[collectors.nmxc].grpc_port must be greater than 0".to_string()
+                ),
+            }
 
-        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig::default());
+            "GPU inventory" {
+                config_with(|config| {
+                    config.collectors.gpu_inventory =
+                        Configurable::Enabled(GpuInventoryConfig::default());
+                    config.endpoint_sources.carbide_api = Configurable::Disabled;
+                }) => FailsWith(
+                    "collectors.gpu_inventory requires endpoint_sources.carbide_api to be enabled (expected GPU counts are resolved from the machine SKU via the Carbide API)"
+                        .to_string()
+                ),
 
-        assert!(config.validate().is_err());
+                config_with(|config| {
+                    config.collectors.gpu_inventory =
+                        Configurable::Enabled(GpuInventoryConfig::default());
+                    config.sinks.health_report = Configurable::Disabled;
+                }) => FailsWith(
+                    "collectors.gpu_inventory requires sinks.health_report to be enabled (GPU shortage alerts are delivered through the health-report sink)"
+                        .to_string()
+                ),
 
-        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
-            targets: vec![OtlpTargetConfig {
-                endpoint: "http://localhost:4317".to_string(),
-                batch_size: 512,
-                flush_interval: Duration::from_secs(2),
-                include_diagnostics: false,
-            }],
-        });
+                config_with(|config| {
+                    config.collectors.gpu_inventory =
+                        Configurable::Enabled(GpuInventoryConfig {
+                            interval: Duration::ZERO,
+                        });
+                }) => FailsWith(
+                    "collectors.gpu_inventory.interval must be greater than 0".to_string()
+                ),
+            }
 
-        assert!(config.validate().is_ok());
+            "OTLP sink" {
+                config_with(|config| {
+                    config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig::default());
+                }) => FailsWith("sinks.otlp.targets must not be empty".to_string()),
+
+                config_with(|config| {
+                    config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![otlp_target("not a valid uri\n")],
+                    });
+                }) => FailsWith(
+                    "invalid sinks.otlp.targets[0].endpoint: not a valid uri\n".to_string()
+                ),
+
+                config_with(|config| {
+                    config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+                        targets: vec![
+                            otlp_target("http://site.example:4317"),
+                            otlp_target("http://site.example:4317"),
+                        ],
+                    });
+                }) => FailsWith(
+                    "sinks.otlp.targets[1].endpoint must be unique: http://site.example:4317"
+                        .to_string()
+                ),
+            }
+        );
     }
 
     /// Verifies each diagnostic-capable sink parses the opt-in flag.
@@ -2000,13 +2629,20 @@ include_diagnostics = true
             .merge(Toml::string(
                 r#"
 [[targets]]
-endpoint = "http://site.example:4317"
+endpoint = "https://site.example:4317"
 
 [[targets]]
 endpoint = "https://central.example:4317"
 batch_size = 1024
 flush_interval = "5s"
 include_diagnostics = true
+
+[targets.tls]
+ca_cert_path = "/central/ca.crt"
+client_cert_path = "/central/tls.crt"
+client_key_path = "/central/tls.key"
+tls_server_name = "central.example"
+reload_interval = "30s"
 "#,
             ))
             .extract()
@@ -2015,11 +2651,32 @@ include_diagnostics = true
         let targets = &otlp.targets;
 
         assert_eq!(targets.len(), 2);
+        assert!(targets[0].tls.is_none());
         assert_eq!(targets[0].batch_size, 512);
         assert_eq!(targets[0].flush_interval, Duration::from_secs(2));
         assert_eq!(targets[1].batch_size, 1024);
         assert_eq!(targets[1].flush_interval, Duration::from_secs(5));
         assert!(targets[1].include_diagnostics);
+
+        let tls = targets[1]
+            .tls
+            .as_ref()
+            .expect("central target should use TLS");
+
+        assert_eq!(tls.ca_cert_path, PathBuf::from("/central/ca.crt"));
+
+        assert_eq!(
+            tls.client_cert_path.as_deref(),
+            Some(Path::new("/central/tls.crt"))
+        );
+
+        assert_eq!(
+            tls.client_key_path.as_deref(),
+            Some(Path::new("/central/tls.key"))
+        );
+
+        assert_eq!(tls.tls_server_name.as_deref(), Some("central.example"));
+        assert_eq!(tls.reload_interval, Duration::from_secs(30));
 
         let mut config = Config::default();
 
@@ -2031,54 +2688,192 @@ include_diagnostics = true
     }
 
     #[test]
-    fn otlp_target_list_rejects_invalid_target_contracts() {
-        struct TestCase {
-            name: &'static str,
-            toml: &'static str,
-            expected: &'static str,
-        }
+    fn otlp_tls_reload_interval_defaults_to_five_minutes() {
+        let tls: OtlpTlsConfig = Figment::new()
+            .merge(Toml::string("ca_cert_path = \"/site/ca.crt\""))
+            .extract()
+            .expect("OTLP TLS config should parse without a reload interval");
 
-        let cases = [
-            TestCase {
-                name: "empty list",
-                toml: "targets = []",
-                expected: "sinks.otlp.targets must not be empty",
-            },
-            TestCase {
-                name: "zero batch size",
-                toml: r#"
-[[targets]]
-endpoint = "http://site.example:4317"
-batch_size = 0
-"#,
-                expected: "sinks.otlp.targets[0].batch_size must be greater than 0",
-            },
-            TestCase {
-                name: "duplicate endpoint",
-                toml: r#"
-[[targets]]
-endpoint = "http://site.example:4317"
+        assert_eq!(tls.reload_interval, OtlpTlsConfig::DEFAULT_RELOAD_INTERVAL);
+    }
 
-[[targets]]
-endpoint = "http://site.example:4317"
-"#,
-                expected: "sinks.otlp.targets[1].endpoint must be unique: http://site.example:4317",
-            },
-        ];
+    #[test]
+    fn otlp_target_validation() {
+        scenarios!(run = |IndexedOtlpTarget { index, target }| target.validate(index);
+            "valid target" {
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: otlp_target("http://site.example:4317"),
+                } => Yields(()),
+            }
 
-        for case in cases {
-            let otlp: OtlpSinkConfig = Figment::new()
-                .merge(Toml::string(case.toml))
-                .extract()
-                .expect(case.name);
+            "target settings" {
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: OtlpTargetConfig {
+                        batch_size: 0,
+                        ..otlp_target("http://site.example:4317")
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].batch_size must be greater than 0".to_string()
+                ),
 
-            let mut config = Config::default();
-            config.sinks.otlp = Configurable::Enabled(otlp);
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: OtlpTargetConfig {
+                        flush_interval: Duration::ZERO,
+                        ..otlp_target("http://site.example:4317")
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].flush_interval must be greater than 0".to_string()
+                ),
 
-            let error = config.validate().expect_err(case.name);
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: otlp_target("not a valid uri\n"),
+                } => FailsWith(
+                    "invalid sinks.otlp.targets[2].endpoint: not a valid uri\n".to_string()
+                ),
+            }
 
-            assert_eq!(error, case.expected, "{}", case.name);
-        }
+            "TLS settings" {
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: OtlpTargetConfig {
+                        tls: Some(otlp_tls()),
+                        ..otlp_target("http://site.example:4317")
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls requires an https endpoint".to_string()
+                ),
+
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: OtlpTargetConfig {
+                        tls: Some(OtlpTlsConfig {
+                            ca_cert_path: PathBuf::new(),
+                            ..otlp_tls()
+                        }),
+                        ..otlp_target("https://site.example:4317")
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.ca_cert_path must not be empty".to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn otlp_tls_validation() {
+        scenarios!(run = |OtlpTlsCase { target_path, tls }| tls.validate(target_path);
+            "server trust" {
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: otlp_tls(),
+                } => Yields(()),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        ca_cert_path: PathBuf::new(),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.ca_cert_path must not be empty".to_string()
+                ),
+            }
+
+            "client identity" {
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        client_cert_path: Some(PathBuf::new()),
+                        client_key_path: Some(PathBuf::from("/site/tls.key")),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.client_cert_path must not be empty".to_string()
+                ),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        client_cert_path: Some(PathBuf::from("/site/tls.crt")),
+                        client_key_path: Some(PathBuf::new()),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.client_key_path must not be empty".to_string()
+                ),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        client_cert_path: Some(PathBuf::from("/site/tls.crt")),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.client_key_path must be set when sinks.otlp.targets[2].tls.client_cert_path is set"
+                        .to_string()
+                ),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        client_key_path: Some(PathBuf::from("/site/tls.key")),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.client_cert_path must be set when sinks.otlp.targets[2].tls.client_key_path is set"
+                        .to_string()
+                ),
+            }
+
+            "TLS server name" {
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        tls_server_name: Some(String::new()),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.tls_server_name must not be empty".to_string()
+                ),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        tls_server_name: Some(" site.example ".to_string()),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.tls_server_name must not contain leading or trailing whitespace"
+                        .to_string()
+                ),
+
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        tls_server_name: Some("not a dns name".to_string()),
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.tls_server_name must be a valid DNS name".to_string()
+                ),
+            }
+
+            "reload policy" {
+                OtlpTlsCase {
+                    target_path: "sinks.otlp.targets[2]",
+                    tls: OtlpTlsConfig {
+                        reload_interval: Duration::ZERO,
+                        ..otlp_tls()
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].tls.reload_interval must be greater than 0".to_string()
+                ),
+            }
+        );
     }
 
     /// Verifies collectors attach diagnostics only when a capable sink opts in.
@@ -2097,6 +2892,7 @@ endpoint = "http://site.example:4317"
                             batch_size: 512,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: false,
+                            tls: None,
                         }],
                     }),
                     ..SinksConfig::default()
@@ -2133,6 +2929,7 @@ endpoint = "http://site.example:4317"
                             batch_size: 512,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: true,
+                            tls: None,
                         }],
                     }),
                     ..SinksConfig::default()
@@ -2149,12 +2946,14 @@ endpoint = "http://site.example:4317"
                                 batch_size: 512,
                                 flush_interval: Duration::from_secs(2),
                                 include_diagnostics: false,
+                                tls: None,
                             },
                             OtlpTargetConfig {
                                 endpoint: "http://central.example:4317".to_string(),
                                 batch_size: 512,
                                 flush_interval: Duration::from_secs(2),
                                 include_diagnostics: true,
+                                tls: None,
                             },
                         ],
                     }),
@@ -2199,6 +2998,7 @@ endpoint = "http://site.example:4317"
                             batch_size: 512,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: false,
+                            tls: None,
                         }],
                     }),
                     ..SinksConfig::default()
@@ -2255,6 +3055,7 @@ skip_empty_reports = false
     fn test_nvue_config_defaults() {
         let defaults = NvueCollectorConfig::default();
         assert!(defaults.rest.is_enabled());
+        assert!(!defaults.gnmi.is_enabled());
 
         if let Configurable::Enabled(ref rest) = defaults.rest {
             assert_eq!(rest.poll_interval, Duration::from_secs(300));
@@ -2327,38 +3128,70 @@ max_backoff = "20s"
     }
 
     #[test]
-    fn test_nmxc_transport_config_validation() {
-        value_scenarios!(
-            run = |config: NmxcCollectorConfig| config.validate().is_ok();
+    fn nmxc_collector_validation() {
+        scenarios!(run = |config: NmxcCollectorConfig| config.validate();
+            "valid configuration" {
+                NmxcCollectorConfig::default() => Yields(()),
+            }
 
-            "NMX-C transport validation" {
-                NmxcCollectorConfig::default() => true,
+            "connection settings" {
+                NmxcCollectorConfig {
+                    grpc_port: 0,
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.nmxc].grpc_port must be greater than 0".to_string()
+                ),
+
+                NmxcCollectorConfig {
+                    gateway_id: " ".to_string(),
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith("[collectors.nmxc].gateway_id must not be empty".to_string()),
+
+                NmxcCollectorConfig {
+                    heartbeat_rate: 0,
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.nmxc].heartbeat_rate must be greater than 0".to_string()
+                ),
 
                 NmxcCollectorConfig {
                     connect_timeout: Some(Duration::ZERO),
                     ..NmxcCollectorConfig::default()
-                } => false,
+                } => FailsWith(
+                    "[collectors.nmxc].connect_timeout must be greater than 0".to_string()
+                ),
 
                 NmxcCollectorConfig {
                     rpc_timeout: Some(Duration::ZERO),
                     ..NmxcCollectorConfig::default()
-                } => false,
+                } => FailsWith(
+                    "[collectors.nmxc].rpc_timeout must be greater than 0".to_string()
+                ),
+            }
 
+            "backoff settings" {
                 NmxcCollectorConfig {
                     initial_backoff: Duration::ZERO,
                     ..NmxcCollectorConfig::default()
-                } => false,
+                } => FailsWith(
+                    "[collectors.nmxc].initial_backoff must be greater than 0".to_string()
+                ),
 
                 NmxcCollectorConfig {
                     max_backoff: Duration::ZERO,
                     ..NmxcCollectorConfig::default()
-                } => false,
+                } => FailsWith(
+                    "[collectors.nmxc].max_backoff must be greater than 0".to_string()
+                ),
 
                 NmxcCollectorConfig {
                     initial_backoff: Duration::from_secs(30),
                     max_backoff: Duration::from_secs(1),
                     ..NmxcCollectorConfig::default()
-                } => false,
+                } => FailsWith(
+                    "[collectors.nmxc].max_backoff must be greater than or equal to initial_backoff"
+                        .to_string()
+                ),
             }
         );
     }
@@ -2408,6 +3241,12 @@ request_timeout = "45s"
 
     #[test]
     fn test_nvue_config_explicit_disable() {
+        // nvue is already off by default (test_nvue_config_disabled_by_default), so
+        // merging a bare `enabled = false` over the defaults would pass even if the key
+        // were ignored outright. Populating `[collectors.nvue.rest]` is what makes this
+        // worth running -- on its own that turns nvue *on*
+        // (test_nvue_config_rest_only), so this pins the half that can actually break:
+        // an explicit `enabled = false` still wins over a populated sub-table.
         let toml_content = r#"
 [endpoint_sources.carbide_api]
 enabled = false
@@ -2417,6 +3256,9 @@ enabled = false
 
 [collectors.nvue]
 enabled = false
+
+[collectors.nvue.rest]
+poll_interval = "1m"
 "#;
 
         let config: Config = Figment::new()
@@ -2497,34 +3339,135 @@ platform_environment_leakage_enabled = false
     }
 
     #[test]
-    fn test_nvue_gnmi_events_disabled() {
-        let toml_content = r#"
-[endpoint_sources.carbide_api]
-enabled = false
-
-[sinks.health_report]
-enabled = false
-
-[collectors.nvue.gnmi]
-gnmi_port = 9339
-system_events_enabled = false
-"#;
-
-        let config: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml_content))
-            .extract()
-            .expect("failed to parse");
-
-        if let Configurable::Enabled(ref nvue) = config.collectors.nvue {
-            if let Configurable::Enabled(ref gnmi) = nvue.gnmi {
-                assert!(!gnmi.system_events_enabled);
-            } else {
-                panic!("gnmi config should be enabled");
-            }
-        } else {
-            panic!("nvue config should be enabled");
+    fn nvue_gnmi_config_parsing() {
+        #[derive(Debug, PartialEq)]
+        enum Projection {
+            NvueDisabled,
+            GnmiDisabled,
+            Enabled {
+                port: u16,
+                sample_interval: Duration,
+                request_timeout: Duration,
+                dangerously_skip_tls_verification: bool,
+                system_events_enabled: bool,
+                components_enabled: bool,
+                interfaces_enabled: bool,
+                platform_general_enabled: bool,
+            },
         }
+
+        check_values(
+            [
+                Check {
+                    scenario: "NVUE disabled",
+                    input: "",
+                    expect: Projection::NvueDisabled,
+                },
+                Check {
+                    scenario: "gNMI disabled",
+                    input: "[collectors.nvue]",
+                    expect: Projection::GnmiDisabled,
+                },
+                Check {
+                    scenario: "gNMI defaults",
+                    input: "[collectors.nvue.gnmi]",
+                    expect: Projection::Enabled {
+                        port: 9339,
+                        sample_interval: Duration::from_secs(300),
+                        request_timeout: Duration::from_secs(30),
+                        dangerously_skip_tls_verification: false,
+                        system_events_enabled: true,
+                        components_enabled: true,
+                        interfaces_enabled: true,
+                        platform_general_enabled: true,
+                    },
+                },
+                Check {
+                    scenario: "custom gNMI settings and paths",
+                    input: r#"
+[collectors.nvue.gnmi]
+gnmi_port = 19339
+sample_interval = "45s"
+request_timeout = "7s"
+dangerously_skip_tls_verification = true
+system_events_enabled = false
+
+[collectors.nvue.gnmi.paths]
+components_enabled = false
+interfaces_enabled = true
+platform_general_enabled = false
+"#,
+                    expect: Projection::Enabled {
+                        port: 19339,
+                        sample_interval: Duration::from_secs(45),
+                        request_timeout: Duration::from_secs(7),
+                        dangerously_skip_tls_verification: true,
+                        system_events_enabled: false,
+                        components_enabled: false,
+                        interfaces_enabled: true,
+                        platform_general_enabled: false,
+                    },
+                },
+                Check {
+                    scenario: "system events subscription alias",
+                    input: r#"
+[collectors.nvue.gnmi]
+system_events_subscription_enabled = false
+"#,
+                    expect: Projection::Enabled {
+                        port: 9339,
+                        sample_interval: Duration::from_secs(300),
+                        request_timeout: Duration::from_secs(30),
+                        dangerously_skip_tls_verification: false,
+                        system_events_enabled: false,
+                        components_enabled: true,
+                        interfaces_enabled: true,
+                        platform_general_enabled: true,
+                    },
+                },
+                Check {
+                    scenario: "events enabled alias",
+                    input: r#"
+[collectors.nvue.gnmi]
+events_enabled = false
+"#,
+                    expect: Projection::Enabled {
+                        port: 9339,
+                        sample_interval: Duration::from_secs(300),
+                        request_timeout: Duration::from_secs(30),
+                        dangerously_skip_tls_verification: false,
+                        system_events_enabled: false,
+                        components_enabled: true,
+                        interfaces_enabled: true,
+                        platform_general_enabled: true,
+                    },
+                },
+            ],
+            |toml| {
+                let config: Config = Figment::new()
+                    .merge(Serialized::defaults(Config::default()))
+                    .merge(Toml::string(toml))
+                    .extract()
+                    .expect("failed to parse NVUE gNMI config");
+                let Configurable::Enabled(nvue) = config.collectors.nvue else {
+                    return Projection::NvueDisabled;
+                };
+                let Configurable::Enabled(gnmi) = nvue.gnmi else {
+                    return Projection::GnmiDisabled;
+                };
+
+                Projection::Enabled {
+                    port: gnmi.gnmi_port,
+                    sample_interval: gnmi.sample_interval,
+                    request_timeout: gnmi.request_timeout,
+                    dangerously_skip_tls_verification: gnmi.dangerously_skip_tls_verification,
+                    system_events_enabled: gnmi.system_events_enabled,
+                    components_enabled: gnmi.paths.components_enabled,
+                    interfaces_enabled: gnmi.paths.interfaces_enabled,
+                    platform_general_enabled: gnmi.paths.platform_general_enabled,
+                }
+            },
+        );
     }
 
     #[test]
@@ -2638,157 +3581,91 @@ tls_server_name = "switches.example.forge"
 
     #[test]
     fn test_tls_switch_profile_rejects_incomplete_or_unknown_fields() {
-        struct TestCase {
-            name: &'static str,
-            toml: &'static str,
-        }
+        value_scenarios!(run = |toml| {
+            Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(toml))
+                .extract::<Config>()
+                .is_err()
+        };
+            "missing required field" {
+                r#"
+[tls.switch]
+client_cert_path = "/switch/tls.crt"
+client_key_path = "/switch/tls.key"
+"# => true,
 
-        let cases = [
-            TestCase {
-                name: "missing CA",
-                toml: r#"
-[tls.switch]
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-"#,
-            },
-            TestCase {
-                name: "missing client cert",
-                toml: r#"
+                r#"
 [tls.switch]
 ca_cert_path = "/switch/ca.crt"
 client_key_path = "/switch/tls.key"
-"#,
-            },
-            TestCase {
-                name: "missing client key",
-                toml: r#"
+"# => true,
+
+                r#"
 [tls.switch]
 ca_cert_path = "/switch/ca.crt"
 client_cert_path = "/switch/tls.crt"
-"#,
-            },
-            TestCase {
-                name: "unknown field",
-                toml: r#"
+"# => true,
+            }
+
+            "unknown field" {
+                r#"
 [tls.switch]
 ca_cert_path = "/switch/ca.crt"
 client_cert_path = "/switch/tls.crt"
 client_key_path = "/switch/tls.key"
 root_ca = "/var/run/secrets/spiffe.io/ca.crt"
-"#,
-            },
-        ];
-
-        for case in cases {
-            let result = Figment::new()
-                .merge(Serialized::defaults(Config::default()))
-                .merge(Toml::string(case.toml))
-                .extract::<Config>();
-
-            assert!(result.is_err(), "{}", case.name);
-        }
+"# => true,
+            }
+        );
     }
 
     #[test]
-    fn test_tls_switch_rejects_empty_paths_and_dangerous_tls_bypass() {
-        struct TestCase {
-            name: &'static str,
-            toml: &'static str,
-            expected: &'static str,
-        }
+    fn switch_tls_validation() {
+        scenarios!(run = |tls: MtlsProfileConfig| tls.validate();
+            "valid profile" {
+                switch_tls() => Yields(()),
+            }
 
-        let base = r#"
-[endpoint_sources.carbide_api]
-enabled = false
+            "certificate paths" {
+                MtlsProfileConfig {
+                    ca_cert_path: PathBuf::new(),
+                    ..switch_tls()
+                } => FailsWith("[tls.switch].ca_cert_path must not be empty".to_string()),
 
-[sinks.health_report]
-enabled = false
-"#;
-        let cases = [
-            TestCase {
-                name: "empty CA path",
-                toml: r#"
-[tls.switch]
-ca_cert_path = ""
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-"#,
-                expected: "[tls.switch].ca_cert_path must not be empty",
-            },
-            TestCase {
-                name: "empty TLS server name",
-                toml: r#"
-[tls.switch]
-ca_cert_path = "/switch/ca.crt"
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-tls_server_name = " "
-"#,
-                expected: "[tls.switch].tls_server_name must not be empty",
-            },
-            TestCase {
-                name: "TLS server name with surrounding whitespace",
-                toml: r#"
-[tls.switch]
-ca_cert_path = "/switch/ca.crt"
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-tls_server_name = " switches.example.forge "
-"#,
-                expected: "[tls.switch].tls_server_name must not contain leading or trailing whitespace",
-            },
-            TestCase {
-                name: "invalid TLS server name",
-                toml: r#"
-[tls.switch]
-ca_cert_path = "/switch/ca.crt"
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-tls_server_name = "not a dns name"
-"#,
-                expected: "[tls.switch].tls_server_name must be a valid DNS name",
-            },
-            TestCase {
-                name: "NMX-T dangerous skip conflict",
-                toml: r#"
-[collectors.nmxt]
-dangerously_skip_tls_verification = true
+                MtlsProfileConfig {
+                    client_cert_path: PathBuf::new(),
+                    ..switch_tls()
+                } => FailsWith("[tls.switch].client_cert_path must not be empty".to_string()),
 
-[tls.switch]
-ca_cert_path = "/switch/ca.crt"
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-"#,
-                expected: "[collectors.nmxt].dangerously_skip_tls_verification must be false when [tls.switch] is configured",
-            },
-            TestCase {
-                name: "gNMI dangerous skip conflict",
-                toml: r#"
-[collectors.nvue.gnmi]
-dangerously_skip_tls_verification = true
+                MtlsProfileConfig {
+                    client_key_path: PathBuf::new(),
+                    ..switch_tls()
+                } => FailsWith("[tls.switch].client_key_path must not be empty".to_string()),
+            }
 
-[tls.switch]
-ca_cert_path = "/switch/ca.crt"
-client_cert_path = "/switch/tls.crt"
-client_key_path = "/switch/tls.key"
-"#,
-                expected: "[collectors.nvue.gnmi].dangerously_skip_tls_verification must be false when [tls.switch] is configured",
-            },
-        ];
+            "TLS server name" {
+                MtlsProfileConfig {
+                    tls_server_name: Some(" ".to_string()),
+                    ..switch_tls()
+                } => FailsWith("[tls.switch].tls_server_name must not be empty".to_string()),
 
-        for case in cases {
-            let toml = format!("{base}{}", case.toml);
-            let config: Config = Figment::new()
-                .merge(Serialized::defaults(Config::default()))
-                .merge(Toml::string(&toml))
-                .extract()
-                .expect(case.name);
+                MtlsProfileConfig {
+                    tls_server_name: Some(" switches.example.forge ".to_string()),
+                    ..switch_tls()
+                } => FailsWith(
+                    "[tls.switch].tls_server_name must not contain leading or trailing whitespace"
+                        .to_string()
+                ),
 
-            let error = config.validate().expect_err(case.name);
-
-            assert_eq!(error, case.expected, "{}", case.name);
-        }
+                MtlsProfileConfig {
+                    tls_server_name: Some("not a dns name".to_string()),
+                    ..switch_tls()
+                } => FailsWith(
+                    "[tls.switch].tls_server_name must be a valid DNS name".to_string()
+                ),
+            }
+        );
     }
 
     #[test]
@@ -2800,60 +3677,6 @@ client_key_path = "/switch/tls.key"
                 .lines()
                 .any(|line| line == "platform_environment_fan_enabled = true")
         );
-    }
-
-    #[test]
-    fn test_nvue_gnmi_dangerous_tls_skip_defaults_false_and_parses_true() {
-        let omitted = r#"
-[endpoint_sources.carbide_api]
-enabled = false
-
-[sinks.health_report]
-enabled = false
-
-[collectors.nvue.gnmi]
-gnmi_port = 9339
-"#;
-
-        let config: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(omitted))
-            .extract()
-            .expect("failed to parse omitted tls flag");
-
-        let Configurable::Enabled(nvue) = config.collectors.nvue else {
-            panic!("nvue config should be enabled");
-        };
-        let Configurable::Enabled(gnmi) = nvue.gnmi else {
-            panic!("gnmi config should be enabled");
-        };
-        assert!(!gnmi.dangerously_skip_tls_verification);
-
-        let enabled = r#"
-[endpoint_sources.carbide_api]
-enabled = false
-
-[sinks.health_report]
-enabled = false
-
-[collectors.nvue.gnmi]
-gnmi_port = 9339
-dangerously_skip_tls_verification = true
-"#;
-
-        let config: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(enabled))
-            .extract()
-            .expect("failed to parse enabled tls flag");
-
-        let Configurable::Enabled(nvue) = config.collectors.nvue else {
-            panic!("nvue config should be enabled");
-        };
-        let Configurable::Enabled(gnmi) = nvue.gnmi else {
-            panic!("gnmi config should be enabled");
-        };
-        assert!(gnmi.dangerously_skip_tls_verification);
     }
 
     #[test]
@@ -2915,7 +3738,7 @@ power_shelf = { id = "fps100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1
             config.endpoint_sources.static_bmc_endpoints[1]
                 .machine
                 .as_ref()
-                .map(|machine| machine.id.as_ref()),
+                .and_then(|machine| machine.id.as_deref()),
             Some("fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0")
         );
         assert_eq!(
@@ -2967,6 +3790,38 @@ power_shelf = { id = "fps100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1
                 .and_then(|power_shelf| power_shelf.serial.as_deref()),
             Some("SN-PS-001")
         );
+    }
+
+    #[test]
+    fn test_static_machine_endpoint_without_id() {
+        let toml_content = r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[sinks.health_report]
+enabled = false
+
+[[endpoint_sources.static_bmc_endpoints]]
+ip = "10.0.1.2"
+mac = "11:22:33:44:55:11"
+username = "admin"
+password = "pass"
+machine = { serial = "MN-001" }
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml_content))
+            .extract()
+            .expect("failed to parse static machine endpoint config without id");
+
+        assert_eq!(config.endpoint_sources.static_bmc_endpoints.len(), 1);
+        let machine = config.endpoint_sources.static_bmc_endpoints[0]
+            .machine
+            .as_ref()
+            .expect("machine metadata should be present");
+        assert_eq!(machine.id, None);
+        assert_eq!(machine.serial.as_deref(), Some("MN-001"));
     }
 
     #[test]
@@ -3042,6 +3897,7 @@ ip = "10.0.1.2"
 mac = "11:22:33:44:55:11"
 username = "admin"
 password = "pass"
+labels = { site = "rno-dev7", environment = "development" }
 machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "MN-001", driver_version = "570.82", slot_number = 15, tray_index = 5, nvlink_domain_uuid = "00000000-0000-0000-0000-000000000000" }
 "#;
 
@@ -3056,6 +3912,15 @@ machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
             .as_ref()
             .expect("machine metadata");
 
+        config.validate().expect("valid custom labels");
+        assert_eq!(
+            config.endpoint_sources.static_bmc_endpoints[0]
+                .labels
+                .get("site")
+                .map(String::as_str),
+            Some("rno-dev7")
+        );
+
         assert_eq!(machine.slot_number, Some(15));
         assert_eq!(machine.tray_index, Some(5));
         assert_eq!(machine.driver_version.as_deref(), Some("570.82"));
@@ -3063,6 +3928,34 @@ machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
             machine.nvlink_domain_uuid.as_deref(),
             Some("00000000-0000-0000-0000-000000000000")
         );
+    }
+
+    #[test]
+    fn test_static_endpoint_rejects_invalid_or_reserved_label_names() {
+        for (name, expected) in [("bad-label", "must match"), ("system_uuid", "is reserved")] {
+            let toml_content = format!(
+                r#"
+[endpoint_sources.carbide_api]
+enabled = false
+
+[[endpoint_sources.static_bmc_endpoints]]
+ip = "10.0.1.2"
+mac = "11:22:33:44:55:11"
+username = "admin"
+password = "pass"
+labels = {{ {name} = "value" }}
+machine = {{ id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0" }}
+"#
+            );
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Toml::string(&toml_content))
+                .extract()
+                .expect("label syntax should parse");
+
+            let error = config.validate().expect_err("label should be rejected");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[test]
@@ -3105,33 +3998,6 @@ switch = { serial = "SN-SW-001", physical_slot_number = 7, compute_tray_index = 
             .expect("switch metadata");
         assert_eq!(switch.slot_number, Some(7));
         assert_eq!(switch.tray_index, Some(3));
-    }
-
-    #[test]
-    fn test_static_endpoint_rejects_multiple_identity_types() {
-        let toml_content = r#"
-[endpoint_sources.carbide_api]
-enabled = false
-
-[sinks.health_report]
-enabled = false
-
-[[endpoint_sources.static_bmc_endpoints]]
-ip = "10.0.0.1"
-mac = "aa:bb:cc:dd:ee:ff"
-username = "admin"
-password = "pass"
-machine = { id = "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0" }
-switch = { serial = "SN-SW-001" }
-"#;
-
-        let config: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml_content))
-            .extract()
-            .expect("config should parse before validation");
-
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -3216,243 +4082,334 @@ switch = { serial = "SN-SW-001" }
     }
 
     #[test]
-    fn test_log_config_sse_mode_rejects_periodic_config() {
-        let toml = r#"
-            mode = "sse"
-            [periodic]
-            logs_collection_interval = "5m"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_err());
-    }
+    fn sse_log_config_validation() {
+        scenarios!(run = |config: SseLogConfig| config.validate();
+            "valid backoff" {
+                SseLogConfig::default() => Yields(()),
+            }
 
-    #[test]
-    fn test_log_config_periodic_mode_requires_periodic_config() {
-        let toml = r#"
-            mode = "periodic"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_err());
-    }
+            "zero backoff" {
+                SseLogConfig {
+                    initial_backoff: Duration::ZERO,
+                    ..SseLogConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.sse].initial_backoff must be greater than 0".to_string()
+                ),
 
-    #[test]
-    fn test_log_config_periodic_mode_with_periodic_config_valid() {
-        let toml = r#"
-            mode = "periodic"
-            [periodic]
-            logs_collection_interval = "5m"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-    }
+                SseLogConfig {
+                    max_backoff: Duration::ZERO,
+                    ..SseLogConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.sse].max_backoff must be greater than 0".to_string()
+                ),
+            }
 
-    #[test]
-    fn test_log_config_sse_mode_without_periodic_config_valid() {
-        let toml = r#"
-            mode = "sse"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_log_config_default_is_auto() {
-        let config = LogsCollectorConfig::default();
-        assert_eq!(config.mode, LogCollectionMode::Auto);
-        assert!(config.sse.is_none());
-        assert!(config.periodic.is_none());
-        assert!(config.auto.is_none());
-        let sse = config.sse_or_default();
-        assert_eq!(sse.initial_backoff, Duration::from_secs(1));
-        assert_eq!(sse.max_backoff, Duration::from_secs(30));
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_log_config_auto_mode_without_periodic_is_valid() {
-        let toml = r#"
-            mode = "auto"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_log_config_auto_mode_with_periodic_valid() {
-        let toml = r#"
-            mode = "auto"
-            [periodic]
-            logs_collection_interval = "5m"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-        assert_eq!(config.mode, LogCollectionMode::Auto);
-    }
-
-    #[test]
-    fn test_log_config_auto_mode_with_periodic_and_auto_knobs() {
-        let toml = r#"
-            mode = "auto"
-            [periodic]
-            logs_collection_interval = "5m"
-            [auto]
-            sse_not_available_threshold = 2
-            connect_failure_window = "10m"
-            connect_failure_threshold = 8
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-        let auto = config.auto.expect("auto knobs should be present");
-        assert_eq!(auto.sse_not_available_threshold, 2);
-        assert_eq!(auto.connect_failure_window, Duration::from_secs(600));
-        assert_eq!(auto.connect_failure_threshold, 8);
-    }
-
-    #[test]
-    fn test_log_config_auto_mode_with_auto_fallback_periodic_config() {
-        let toml = r#"
-            mode = "auto"
-            [auto]
-            sse_not_available_threshold = 2
-            connect_failure_window = "10m"
-            connect_failure_threshold = 8
-            logs_collection_interval = "2m"
-            state_refresh_interval = "20m"
-            logs_state_file = "/tmp/auto_{machine_id}.json"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-        let periodic = config.auto_periodic_or_default();
-        assert_eq!(periodic.logs_collection_interval, Duration::from_secs(120));
-        assert_eq!(periodic.state_refresh_interval, Duration::from_secs(1200));
-        assert_eq!(periodic.logs_state_file, "/tmp/auto_{machine_id}.json");
-    }
-
-    #[test]
-    fn test_log_config_sse_mode_with_sse_config_valid() {
-        let toml = r#"
-            mode = "sse"
-            [sse]
-            initial_backoff = "2s"
-            max_backoff = "1m"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-        let sse = config.sse.expect("sse config should be present");
-        assert_eq!(sse.initial_backoff, Duration::from_secs(2));
-        assert_eq!(sse.max_backoff, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn test_log_config_auto_mode_with_sse_config_valid() {
-        let toml = r#"
-            mode = "auto"
-            [sse]
-            initial_backoff = "3s"
-            max_backoff = "45s"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_ok());
-        let sse = config.sse_or_default();
-        assert_eq!(sse.initial_backoff, Duration::from_secs(3));
-        assert_eq!(sse.max_backoff, Duration::from_secs(45));
-    }
-
-    #[test]
-    fn test_log_config_periodic_mode_rejects_sse_config() {
-        let toml = r#"
-            mode = "periodic"
-            [periodic]
-            logs_collection_interval = "5m"
-            [sse]
-            initial_backoff = "1s"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_log_config_periodic_mode_rejects_auto_config() {
-        let toml = r#"
-            mode = "periodic"
-            [periodic]
-            logs_collection_interval = "5m"
-            [auto]
-            connect_failure_threshold = 2
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert_eq!(
-            config.validate(),
-            Err("[collectors.logs.auto] should not be set when mode = \"periodic\"".to_string())
+            "backoff ordering" {
+                SseLogConfig {
+                    initial_backoff: Duration::from_secs(30),
+                    max_backoff: Duration::from_secs(1),
+                } => FailsWith(
+                    "[collectors.logs.sse].max_backoff must be greater than or equal to initial_backoff"
+                        .to_string()
+                ),
+            }
         );
     }
 
     #[test]
-    fn test_log_config_sse_mode_rejects_auto_config() {
-        let toml = r#"
-            mode = "sse"
-            [auto]
-            connect_failure_threshold = 2
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert_eq!(
-            config.validate(),
-            Err("[collectors.logs.auto] should not be set when mode = \"sse\"".to_string())
+    fn auto_mode_config_validation() {
+        scenarios!(run = |config: AutoModeConfig| config.validate();
+            "valid thresholds" {
+                AutoModeConfig::default() => Yields(()),
+            }
+
+            "invalid thresholds" {
+                AutoModeConfig {
+                    sse_not_available_threshold: 0,
+                    ..AutoModeConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto].sse_not_available_threshold must be greater than 0"
+                        .to_string()
+                ),
+
+                AutoModeConfig {
+                    connect_failure_threshold: 0,
+                    ..AutoModeConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto].connect_failure_threshold must be greater than 0"
+                        .to_string()
+                ),
+
+                AutoModeConfig {
+                    connect_failure_window: Duration::ZERO,
+                    ..AutoModeConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto].connect_failure_window must be greater than 0"
+                        .to_string()
+                ),
+            }
         );
     }
 
     #[test]
-    fn test_log_config_sse_mode_rejects_invalid_sse_backoff() {
-        let toml = r#"
-            mode = "sse"
-            [sse]
-            initial_backoff = "30s"
-            max_backoff = "1s"
-        "#;
-        let config: LogsCollectorConfig = Figment::new()
-            .merge(Toml::string(toml))
-            .extract()
-            .expect("should parse");
-        assert!(config.validate().is_err());
+    fn logs_collector_validation() {
+        scenarios!(run = |config: LogsCollectorConfig| config.validate();
+            "auto mode" {
+                LogsCollectorConfig::default() => Yields(()),
+
+                LogsCollectorConfig {
+                    auto: Some(AutoModeConfig::default()),
+                    sse: Some(SseLogConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => Yields(()),
+
+                LogsCollectorConfig {
+                    auto: Some(AutoModeConfig {
+                        sse_not_available_threshold: 0,
+                        ..AutoModeConfig::default()
+                    }),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto].sse_not_available_threshold must be greater than 0"
+                        .to_string()
+                ),
+
+                LogsCollectorConfig {
+                    sse: Some(SseLogConfig {
+                        initial_backoff: Duration::ZERO,
+                        ..SseLogConfig::default()
+                    }),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.sse].initial_backoff must be greater than 0".to_string()
+                ),
+            }
+
+            "periodic mode" {
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Periodic,
+                    periodic: Some(PeriodicLogConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => Yields(()),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Periodic,
+                    periodic: Some(PeriodicLogConfig::default()),
+                    auto: Some(AutoModeConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto] should not be set when mode = \"periodic\""
+                        .to_string()
+                ),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Periodic,
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.periodic] is required when mode = \"periodic\"".to_string()
+                ),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Periodic,
+                    periodic: Some(PeriodicLogConfig::default()),
+                    sse: Some(SseLogConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.sse] should not be set when mode = \"periodic\"".to_string()
+                ),
+            }
+
+            "SSE mode" {
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Sse,
+                    ..LogsCollectorConfig::default()
+                } => Yields(()),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Sse,
+                    sse: Some(SseLogConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => Yields(()),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Sse,
+                    auto: Some(AutoModeConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.auto] should not be set when mode = \"sse\"".to_string()
+                ),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Sse,
+                    periodic: Some(PeriodicLogConfig::default()),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.periodic] should not be set when mode = \"sse\"".to_string()
+                ),
+
+                LogsCollectorConfig {
+                    mode: LogCollectionMode::Sse,
+                    sse: Some(SseLogConfig {
+                        initial_backoff: Duration::from_secs(30),
+                        max_backoff: Duration::from_secs(1),
+                    }),
+                    ..LogsCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.logs.sse].max_backoff must be greater than or equal to initial_backoff"
+                        .to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn log_config_parsing() {
+        scenarios!(run = |toml| {
+            Figment::new()
+                .merge(Toml::string(toml))
+                .extract::<LogsCollectorConfig>()
+                .map(project_logs_config)
+                .map_err(|_| ())
+        };
+            "default auto mode" {
+                r#"mode = "auto""# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Auto,
+                    validation: Ok(()),
+                    configured_sse: None,
+                    configured_periodic: None,
+                    configured_auto: None,
+                    effective_sse: SseLogConfig::default(),
+                    effective_periodic: PeriodicLogConfig::default(),
+                    effective_auto_periodic: PeriodicLogConfig::default(),
+                }),
+            }
+
+            "periodic mode" {
+                r#"
+mode = "periodic"
+[periodic]
+logs_collection_interval = "5m"
+"# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Periodic,
+                    validation: Ok(()),
+                    configured_sse: None,
+                    configured_periodic: Some(parsed_periodic_defaults()),
+                    configured_auto: None,
+                    effective_sse: SseLogConfig::default(),
+                    effective_periodic: parsed_periodic_defaults(),
+                    effective_auto_periodic: parsed_periodic_defaults(),
+                }),
+            }
+
+            "SSE mode" {
+                r#"
+mode = "sse"
+[sse]
+initial_backoff = "2s"
+max_backoff = "1m"
+"# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Sse,
+                    validation: Ok(()),
+                    configured_sse: Some(SseLogConfig {
+                        initial_backoff: Duration::from_secs(2),
+                        max_backoff: Duration::from_secs(60),
+                    }),
+                    configured_periodic: None,
+                    configured_auto: None,
+                    effective_sse: SseLogConfig {
+                        initial_backoff: Duration::from_secs(2),
+                        max_backoff: Duration::from_secs(60),
+                    },
+                    effective_periodic: PeriodicLogConfig::default(),
+                    effective_auto_periodic: PeriodicLogConfig::default(),
+                }),
+            }
+
+            "auto mode with periodic fallback" {
+                r#"
+mode = "auto"
+[periodic]
+logs_collection_interval = "5m"
+[auto]
+sse_not_available_threshold = 2
+connect_failure_window = "10m"
+connect_failure_threshold = 8
+"# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Auto,
+                    validation: Ok(()),
+                    configured_sse: None,
+                    configured_periodic: Some(parsed_periodic_defaults()),
+                    configured_auto: Some(AutoModeConfig {
+                        sse_not_available_threshold: 2,
+                        connect_failure_window: Duration::from_secs(600),
+                        connect_failure_threshold: 8,
+                        periodic: parsed_periodic_defaults(),
+                    }),
+                    effective_sse: SseLogConfig::default(),
+                    effective_periodic: parsed_periodic_defaults(),
+                    effective_auto_periodic: parsed_periodic_defaults(),
+                }),
+
+                r#"
+mode = "auto"
+[auto]
+sse_not_available_threshold = 2
+connect_failure_window = "10m"
+connect_failure_threshold = 8
+logs_collection_interval = "2m"
+state_refresh_interval = "20m"
+logs_state_file = "/tmp/auto_{machine_id}.json"
+"# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Auto,
+                    validation: Ok(()),
+                    configured_sse: None,
+                    configured_periodic: None,
+                    configured_auto: Some(AutoModeConfig {
+                        sse_not_available_threshold: 2,
+                        connect_failure_window: Duration::from_secs(600),
+                        connect_failure_threshold: 8,
+                        periodic: PeriodicLogConfig {
+                            logs_collection_interval: Duration::from_secs(120),
+                            state_refresh_interval: Duration::from_secs(1200),
+                            logs_state_file: "/tmp/auto_{machine_id}.json".to_string(),
+                            ..parsed_periodic_defaults()
+                        },
+                    }),
+                    effective_sse: SseLogConfig::default(),
+                    effective_periodic: PeriodicLogConfig::default(),
+                    effective_auto_periodic: PeriodicLogConfig {
+                        logs_collection_interval: Duration::from_secs(120),
+                        state_refresh_interval: Duration::from_secs(1200),
+                        logs_state_file: "/tmp/auto_{machine_id}.json".to_string(),
+                        ..parsed_periodic_defaults()
+                    },
+                }),
+            }
+
+            "auto mode with SSE settings" {
+                r#"
+mode = "auto"
+[sse]
+initial_backoff = "3s"
+max_backoff = "45s"
+"# => Yields(LogsConfigProjection {
+                    mode: LogCollectionMode::Auto,
+                    validation: Ok(()),
+                    configured_sse: Some(SseLogConfig {
+                        initial_backoff: Duration::from_secs(3),
+                        max_backoff: Duration::from_secs(45),
+                    }),
+                    configured_periodic: None,
+                    configured_auto: None,
+                    effective_sse: SseLogConfig {
+                        initial_backoff: Duration::from_secs(3),
+                        max_backoff: Duration::from_secs(45),
+                    },
+                    effective_periodic: PeriodicLogConfig::default(),
+                    effective_auto_periodic: PeriodicLogConfig::default(),
+                }),
+            }
+        );
     }
 
     #[test]

@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
+mod cluster;
 mod model;
 mod sources;
 
+pub use cluster::ClusterEndpointSource;
 pub use model::{
     BmcAddr, BmcCredentials, BmcEndpoint, EndpointMetadata, EndpointSource, MachineData,
-    PowerShelfData, SwitchData, SwitchEndpointRole,
+    PowerShelfData, SharedSystemUuid, SwitchData, SwitchEndpointRole,
 };
 pub use sources::{CompositeEndpointSource, StaticEndpointSource};
 
@@ -59,6 +61,7 @@ pub(crate) mod test_support {
             addr,
             metadata,
             rack_id,
+            labels: Default::default(),
             bmc,
         }
     }

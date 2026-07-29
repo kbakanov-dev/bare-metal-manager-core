@@ -16,6 +16,8 @@
  */
 
 mod carbide_reporting;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::SeekFrom;
@@ -228,14 +230,13 @@ fn check_constraints(
             queue_event(timestamp, event_type, log, buffer);
         }
     } else if let Some(event_pattern) = constraints.preceded_by.as_ref() {
-        let mut event_pattern_matched = true;
-        // walk through the pattern and queue and check every event name matches
-        for (event_name, prior_event) in event_pattern.iter().rev().zip(log.events.iter().rev()) {
-            if *event_name != prior_event.name {
-                event_pattern_matched = false;
-                break;
-            }
-        }
+        let event_pattern_matched = !event_pattern.is_empty()
+            && log.events.len() >= event_pattern.len()
+            && event_pattern
+                .iter()
+                .rev()
+                .zip(log.events.iter().rev())
+                .all(|(event_name, prior_event)| *event_name == prior_event.name);
         if event_pattern_matched {
             queue_event(timestamp, event_type, log, buffer);
         }
@@ -459,7 +460,7 @@ async fn read_event_definition(path: &Path) -> Result<Configuration, anyhow::Err
     let filename_format = config.filename_format.replace("\\\\", "\\");
     if filename_format.is_empty() {
         return Err(anyhow!(
-            "Invalid filename_format regex pattern {}",
+            "invalid filename_format regex pattern {}",
             config.filename_format
         ));
     }
@@ -469,7 +470,7 @@ async fn read_event_definition(path: &Path) -> Result<Configuration, anyhow::Err
         let regex_string = event_type.regex_string.replace("\\\\", "\\");
         if regex_string.is_empty() {
             return Err(anyhow!(
-                "Invalid event regex pattern {}",
+                "invalid event regex pattern {}",
                 &event_type.regex_string
             ));
         }

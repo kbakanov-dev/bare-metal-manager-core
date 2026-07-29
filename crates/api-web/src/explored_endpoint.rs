@@ -28,8 +28,8 @@ use hyper::http::StatusCode;
 use rpc::forge::forge_server::Forge;
 use rpc::forge::{self as forgerpc, BmcEndpointRequest, admin_power_control_request};
 use rpc::site_explorer::{
-    EndpointExplorationReport, ExploredEndpoint, InternalLockdownStatus, LockdownStatus,
-    MachineSetupStatus, SecureBootStatus, SiteExplorationReport,
+    ExploredEndpoint, InternalLockdownStatus, LockdownStatus, MachineSetupStatus, SecureBootStatus,
+    SiteExplorationReport,
 };
 use serde::Deserialize;
 
@@ -164,13 +164,13 @@ impl From<&ExploredEndpoint> for ExploredEndpointDisplay {
                 .map(|report| report.endpoint_type.clone())
                 .unwrap_or_default(),
             last_exploration_error: report_ref
-                .map(last_exploration_error_display)
+                .map(|report| report.last_exploration_error_display())
                 .unwrap_or_default(),
             last_exploration_latency: report_ref
                 .and_then(|report| report.last_exploration_latency.as_ref())
                 .map(|latency| latency.seconds),
             has_exploration_error: report_ref
-                .map(has_last_exploration_error)
+                .map(|report| report.has_last_exploration_error())
                 .unwrap_or_default(),
             bmc_mac_addrs: report_ref
                 .map(|report| {
@@ -214,23 +214,6 @@ impl From<&ExploredEndpoint> for ExploredEndpointDisplay {
     }
 }
 
-fn last_exploration_error_display(report: &EndpointExplorationReport) -> String {
-    report
-        .last_exploration_error_schema
-        .as_ref()
-        .map(|schema| serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.text.clone()))
-        .or_else(|| report.last_exploration_error.clone())
-        .unwrap_or_default()
-}
-
-fn has_last_exploration_error(report: &EndpointExplorationReport) -> bool {
-    report.last_exploration_error_schema.is_some()
-        || report
-            .last_exploration_error
-            .as_deref()
-            .is_some_and(|error| !error.is_empty())
-}
-
 /// List explored endpoints
 pub async fn show_html_all(
     AxumState(state): AxumState<Arc<Api>>,
@@ -239,7 +222,7 @@ pub async fn show_html_all(
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -297,7 +280,7 @@ pub async fn show_html_paired(
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -325,7 +308,7 @@ pub async fn show_html_unpaired(
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -363,7 +346,7 @@ pub async fn show_html_unpaired(
             .map(|pair| pair.bmc_ip)
             .collect(),
         Err(err) => {
-            tracing::error!(%err, "find_machine_ids_by_bmc_ips");
+            tracing::error!(error = %err, "find_machine_ids_by_bmc_ips");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error find_machine_ids_by_bmc_ips",
@@ -417,7 +400,7 @@ pub async fn show_all_json(AxumState(state): AxumState<Arc<Api>>) -> Response {
     let report = match fetch_explored_endpoints(&state).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -494,10 +477,10 @@ impl From<ExploredEndpointInfo> for ExploredEndpointDetail<'_> {
 
         Self {
             last_exploration_error: report_ref
-                .map(last_exploration_error_display)
+                .map(|report| report.last_exploration_error_display())
                 .unwrap_or_default(),
             has_exploration_error: report_ref
-                .map(has_last_exploration_error)
+                .map(|report| report.has_last_exploration_error())
                 .unwrap_or_default(),
             machine_setup_status: machine_setup_status_to_string(
                 report_ref.and_then(|report| report.machine_setup_status.as_ref()),
@@ -529,7 +512,7 @@ pub async fn fetch_explored_endpoint(
     let report = match fetch_explored_endpoints(api).await {
         Ok(report) => report,
         Err(err) => {
-            tracing::error!(%err, "fetch_explored_endpoints");
+            tracing::error!(error = %err, "fetch_explored_endpoints");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error loading site exploration report",
@@ -581,7 +564,7 @@ pub async fn detail(
     {
         Ok(response) => response.into_inner().in_managed_host,
         Err(err) => {
-            tracing::error!(%err, "is_bmc_in_managed_host check failed");
+            tracing::error!(error = %err, "is_bmc_in_managed_host check failed");
             // Default to true if we can't determine the status so we can't delete the endpoint
             true
         }
@@ -606,7 +589,7 @@ pub async fn detail(
                 }
             }
             Err(err) => {
-                tracing::error!(%err, "find_machine_ids_by_bmc_ips");
+                tracing::error!(error = %err, "find_machine_ids_by_bmc_ips");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Error find_machine_ids_by_bmc_ips",
@@ -644,7 +627,7 @@ pub async fn detail(
                 }
             }
             Err(err) => {
-                tracing::error!(%err, endpoint_ip = %endpoint_ip, "bmc_credential_status");
+                tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "bmc_credential_status");
                 "Not Configured".to_string()
             }
         }
@@ -678,7 +661,7 @@ pub async fn re_explore(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip, "re_explore_endpoint");
+        tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "re_explore_endpoint");
         return Redirect::to(&view_url);
     }
 
@@ -702,7 +685,7 @@ pub async fn refresh_endpoint(
             let has_error = ep
                 .report
                 .as_ref()
-                .map(has_last_exploration_error)
+                .map(|report| report.has_last_exploration_error())
                 .unwrap_or_default();
             (
                 StatusCode::OK,
@@ -716,7 +699,7 @@ pub async fn refresh_endpoint(
                 tonic::Code::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            tracing::error!(%err, endpoint_ip, "refresh_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "refresh_endpoint");
             (
                 status_code,
                 Json(serde_json::json!({ "error": err.message() })),
@@ -743,7 +726,7 @@ pub async fn pause_remediation(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip, "pause_explored_endpoint_remediation");
+        tracing::error!(error = %err, bmc_ip_address = endpoint_ip, "pause_explored_endpoint_remediation");
         return Redirect::to(&view_url);
     }
 
@@ -786,7 +769,7 @@ fn query_filter_for(
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or(false)
     {
-        Box::new(|ep: &ExploredEndpointDisplay| !ep.last_exploration_error.is_empty())
+        Box::new(|ep: &ExploredEndpointDisplay| ep.has_exploration_error)
     } else {
         Box::new(|_| true)
     };
@@ -807,7 +790,7 @@ pub async fn power_control(
     };
 
     let Some(act) = admin_power_control_request::SystemPowerControl::from_str_name(&action) else {
-        tracing::error!(endpoint_ip = %endpoint_ip, action = %action, "power_control_endpoint invalid action");
+        tracing::error!(bmc_ip_address = %endpoint_ip, action = %action, "power_control_endpoint invalid action");
         let redirect_url = ActionStatus {
             action: action_status::Type::Power,
             class: action_status::Class::Error,
@@ -857,7 +840,7 @@ pub async fn power_control(
             Redirect::to(&redirect_url).into_response()
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, action = %action, "power_control_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, action = %action, "power_control_endpoint");
             let redirect_url = ActionStatus {
                 action: action_status::Type::Power,
                 class: action_status::Class::Error,
@@ -912,7 +895,7 @@ pub async fn bmc_reset(
             Redirect::to(&redirect_url).into_response()
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, use_ipmi = %use_ipmi, "bmc_reset_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, use_ipmi = %use_ipmi, "bmc_reset_endpoint");
             let redirect_url = ActionStatus {
                 action: action_status::Type::ResetBmc,
                 class: action_status::Class::Error,
@@ -955,7 +938,7 @@ pub async fn clear_last_exploration_error(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip = %endpoint_ip, "clear_last_exploration_error_endpoint");
+        tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "clear_last_exploration_error_endpoint");
         return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
     }
 
@@ -974,7 +957,7 @@ pub async fn clear_bmc_credentials(
     let mac_address = match state.find_mac_address_by_bmc_ip(req).await {
         Ok(res) => res.into_inner().mac_address,
         Err(err) => {
-            tracing::error!(%err, "find_mac_address_by_bmc_ip");
+            tracing::error!(error = %err, "find_mac_address_by_bmc_ip");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error find_mac_address_by_bmc_ip",
@@ -992,7 +975,7 @@ pub async fn clear_bmc_credentials(
         .await
         .map(|response| response.into_inner())
     {
-        tracing::error!(%err, endpoint_ip = %endpoint_ip, "clear_bmc_credentials");
+        tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "clear_bmc_credentials");
         return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
     }
 
@@ -1020,7 +1003,7 @@ pub async fn disable_secure_boot(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "disable_secure_boot");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "disable_secure_boot");
             ActionStatus {
                 action: action_status::Type::DisableSecureBoot,
                 class: action_status::Class::Error,
@@ -1058,7 +1041,7 @@ pub async fn disable_lockdown(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "disable_lockdown");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "disable_lockdown");
             ActionStatus {
                 action: action_status::Type::DisableLockdown,
                 class: action_status::Class::Error,
@@ -1096,7 +1079,7 @@ pub async fn enable_lockdown(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "enable_lockdown");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "enable_lockdown");
             ActionStatus {
                 action: action_status::Type::EnableLockdown,
                 class: action_status::Class::Error,
@@ -1125,7 +1108,7 @@ pub async fn machine_setup(
     if let Some(ref mac) = boot_interface_mac
         && mac.parse::<mac_address::MacAddress>().is_err()
     {
-        tracing::error!(endpoint_ip = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
+        tracing::error!(bmc_ip_address = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
         let status = ActionStatus {
             action: action_status::Type::MachineSetup,
             class: action_status::Class::Error,
@@ -1153,7 +1136,7 @@ pub async fn machine_setup(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "bmc_machine_setup");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "bmc_machine_setup");
             ActionStatus {
                 action: action_status::Type::MachineSetup,
                 class: action_status::Class::Error,
@@ -1183,7 +1166,7 @@ pub async fn set_dpu_first_boot_order(
     if let Some(ref mac) = boot_interface_mac
         && mac.parse::<mac_address::MacAddress>().is_err()
     {
-        tracing::error!(endpoint_ip = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
+        tracing::error!(bmc_ip_address = %endpoint_ip, mac_address = %mac, "Invalid MAC address format");
         let redirect_url = ActionStatus {
             action: action_status::Type::SetFirstBootOrder,
             class: action_status::Class::Error,
@@ -1214,7 +1197,7 @@ pub async fn set_dpu_first_boot_order(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "set_dpu_first_boot_order");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "set_dpu_first_boot_order");
             ActionStatus {
                 action: action_status::Type::SetFirstBootOrder,
                 class: action_status::Class::Error,
@@ -1234,9 +1217,8 @@ pub async fn set_dpu_first_boot_order(
 /// interface the same way every other flow does -- the owning machine's
 /// designated interface (`primary_interface` + its captured Redfish interface
 /// id) once a machine owns this endpoint, or site-explorer's automatic default
-/// for a not-yet-managed endpoint -- and set it boot-first via the usual
-/// MAC-first / interface-id fallback. One click to put the BMC's boot order
-/// back in line with what Carbide would target.
+/// for a not-yet-managed endpoint. One click puts the BMC's boot order back in
+/// line with what Carbide would target.
 pub async fn restore_boot_interface(
     AxumState(state): AxumState<Arc<Api>>,
     AxumPath(endpoint_ip): AxumPath<String>,
@@ -1264,7 +1246,7 @@ pub async fn restore_boot_interface(
         }
         .update_redirect_url(&view_url),
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "restore_boot_interface");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "restore_boot_interface");
             ActionStatus {
                 action: action_status::Type::RestoreBootInterface,
                 class: action_status::Class::Error,
@@ -1294,13 +1276,13 @@ pub async fn delete_endpoint(
     {
         Ok(response) => {
             if response.deleted {
-                tracing::info!(endpoint_ip = %endpoint_ip, "Successfully deleted explored endpoint");
+                tracing::info!(bmc_ip_address = %endpoint_ip, "Successfully deleted explored endpoint");
             } else {
-                tracing::warn!(endpoint_ip = %endpoint_ip, message = ?response.message, "Failed to delete explored endpoint");
+                tracing::warn!(bmc_ip_address = %endpoint_ip, reason = ?response.message, "Failed to delete explored endpoint");
             }
         }
         Err(err) => {
-            tracing::error!(%err, endpoint_ip = %endpoint_ip, "delete_explored_endpoint");
+            tracing::error!(error = %err, bmc_ip_address = %endpoint_ip, "delete_explored_endpoint");
             return (StatusCode::INTERNAL_SERVER_ERROR, err.message().to_owned()).into_response();
         }
     }
@@ -1361,64 +1343,62 @@ impl<'a> super::Base for ExploredEndpointDetail<'a> {}
 
 #[cfg(test)]
 mod tests {
-    use carbide_test_support::{Check, check_values};
-    use rpc::site_explorer::{EndpointExplorationReport, OperatorErrorSchema};
+    use std::collections::HashMap;
 
-    use super::{has_last_exploration_error, last_exploration_error_display};
+    use askama::Template;
+    use rpc::site_explorer::{EndpointExplorationReport, ExploredEndpoint, OperatorErrorSchema};
 
-    fn operator_error_schema() -> OperatorErrorSchema {
-        OperatorErrorSchema {
-            error_code: "NICO-SITEEXPLORER-122".to_string(),
-            mitigation: Some("Check the HCL".to_string()),
-            text: "BMC vendor missing".to_string(),
-        }
-    }
+    use super::{ExploredEndpointDisplay, ExploredEndpointsShow, query_filter_for};
+    use crate::pagination::PageContext;
 
-    fn report(
-        schema: Option<OperatorErrorSchema>,
-        legacy: Option<&str>,
-    ) -> EndpointExplorationReport {
-        EndpointExplorationReport {
-            last_exploration_error: legacy.map(str::to_string),
-            last_exploration_error_schema: schema,
+    fn endpoint(address: &str, schema: Option<OperatorErrorSchema>) -> ExploredEndpoint {
+        ExploredEndpoint {
+            address: address.to_string(),
+            report: Some(EndpointExplorationReport {
+                last_exploration_error_schema: schema,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
 
     #[test]
-    fn last_exploration_error_display_and_presence_are_schema_aware() {
-        let schema_display =
-            serde_json::to_string_pretty(&operator_error_schema()).expect("schema serializes");
-
-        check_values(
-            [
-                Check {
-                    scenario: "schema takes precedence over legacy error",
-                    input: report(Some(operator_error_schema()), Some("legacy error")),
-                    expect: (schema_display.clone(), true),
-                },
-                Check {
-                    scenario: "legacy error remains a fallback",
-                    input: report(None, Some("legacy error")),
-                    expect: ("legacy error".to_string(), true),
-                },
-                Check {
-                    scenario: "schema-only report is an error",
-                    input: report(Some(operator_error_schema()), None),
-                    expect: (schema_display, true),
-                },
-                Check {
-                    scenario: "report without either field has no error",
-                    input: report(None, None),
-                    expect: (String::new(), false),
-                },
-            ],
-            |report| {
-                (
-                    last_exploration_error_display(&report),
-                    has_last_exploration_error(&report),
-                )
-            },
+    fn endpoint_error_html_and_filter_render_structured_and_clear_reports() {
+        let error = endpoint(
+            "192.0.2.20",
+            Some(OperatorErrorSchema {
+                error_code: "NICO-SITEEXPLORER-122".to_string(),
+                mitigation: Some("Check the HCL".to_string()),
+                text: "BMC vendor missing".to_string(),
+            }),
         );
+        let clear = endpoint("192.0.2.21", None);
+        let error = ExploredEndpointDisplay::from(&error);
+        let clear = ExploredEndpointDisplay::from(&clear);
+
+        let errors_only = query_filter_for(HashMap::from([(
+            "errors-only".to_string(),
+            "true".to_string(),
+        )]));
+        assert!(errors_only(&error));
+        assert!(!errors_only(&clear));
+
+        let rendered = ExploredEndpointsShow {
+            last_run: None,
+            vendors: Vec::new(),
+            endpoints: vec![error, clear],
+            filter_name: "All",
+            active_vendor_filter: "all".to_string(),
+            is_errors_only: false,
+            page: PageContext::all(2, "/admin/explored-endpoint"),
+            missing_default_credentials: Vec::new(),
+        }
+        .render()
+        .expect("template renders");
+
+        assert!(rendered.contains("NICO-SITEEXPLORER-122"));
+        assert!(rendered.contains("192.0.2.20"));
+        assert!(rendered.contains("192.0.2.21"));
+        assert_eq!(rendered.matches("clearlasterror_action").count(), 1);
     }
 }
