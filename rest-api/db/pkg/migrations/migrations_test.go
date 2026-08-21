@@ -66,6 +66,92 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
+func TestVpcSlaacEnabledMigration(t *testing.T) {
+	ctx := context.Background()
+	dbSession := util.GetTestDBSession(t, true)
+	defer dbSession.Close()
+	model.TestSetupSchema(t, dbSession)
+
+	ipOrg := "test-provider-org"
+	ipUser := model.TestBuildUser(t, dbSession, uuid.NewString(), ipOrg, []string{authz.ProviderAdminRole})
+	ip := model.TestBuildInfrastructureProvider(t, dbSession, "test-provider", ipOrg, ipUser)
+	tenantOrg := "test-tenant-org"
+	tenantUser := model.TestBuildUser(t, dbSession, uuid.NewString(), tenantOrg, []string{authz.TenantAdminRole})
+	tenant := model.TestBuildTenant(t, dbSession, "test-tenant", tenantOrg, tenantUser)
+	site := model.TestBuildSite(t, dbSession, ip, "test-site", ipUser)
+	vpc := model.TestBuildVPC(t, dbSession, "test-vpc", ip, tenant, site, cutil.GetPtr(model.VpcEthernetVirtualizer), nil, nil, model.VpcStatusReady, tenantUser, nil)
+
+	// Fresh installs create `slaac_enabled` before this migration runs.
+	require.NoError(t, vpcSlaacEnabledUpMigration(ctx, dbSession.DB))
+	var isNullable, columnDefault string
+	err := dbSession.DB.QueryRowContext(ctx, `
+		SELECT is_nullable, column_default
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'vpc' AND column_name = 'slaac_enabled'
+	`).Scan(&isNullable, &columnDefault)
+	require.NoError(t, err)
+	require.Equal(t, "NO", isNullable)
+	require.Equal(t, "false", columnDefault)
+
+	// Recreate the immediate predecessor schema while retaining a realistic old row.
+	_, err = dbSession.DB.ExecContext(ctx, `ALTER TABLE vpc DROP COLUMN slaac_enabled`)
+	require.NoError(t, err)
+
+	var targetMigration migrate.Migration
+	for _, migration := range Migrations.Sorted() {
+		if migration.Name == "20260817184424" {
+			targetMigration = migration
+			break
+		}
+	}
+	require.Equal(t, "vpc_slaac_enabled", targetMigration.Comment)
+
+	targetMigrations := migrate.NewMigrations()
+	targetMigrations.Add(targetMigration)
+	migrator := migrate.NewMigrator(
+		dbSession.DB,
+		targetMigrations,
+		migrate.WithTableName("vpc_slaac_enabled_migrations_test"),
+		migrate.WithLocksTableName("vpc_slaac_enabled_migration_locks_test"),
+		migrate.WithMarkAppliedOnSuccess(true),
+	)
+	require.NoError(t, migrator.Init(ctx))
+
+	group, err := migrator.Migrate(ctx)
+	require.NoError(t, err)
+	require.Len(t, group.Migrations, 1)
+
+	persisted, err := model.NewVpcDAO(dbSession).GetByID(ctx, nil, vpc.ID, nil)
+	require.NoError(t, err)
+	require.False(t, persisted.SlaacEnabled)
+
+	persisted, err = model.NewVpcDAO(dbSession).Update(ctx, nil, model.VpcUpdateInput{
+		VpcID:        vpc.ID,
+		SlaacEnabled: cutil.GetPtr(true),
+	})
+	require.NoError(t, err)
+	require.True(t, persisted.SlaacEnabled)
+
+	_, err = migrator.Rollback(ctx)
+	require.ErrorIs(t, err, errVpcSlaacEnabledRollback)
+
+	statuses, err := migrator.MigrationsWithStatus(ctx)
+	require.NoError(t, err)
+	require.Len(t, statuses, 1)
+	require.True(t, statuses[0].IsApplied())
+
+	persisted, err = model.NewVpcDAO(dbSession).GetByID(ctx, nil, vpc.ID, nil)
+	require.NoError(t, err)
+	require.True(t, persisted.SlaacEnabled)
+
+	// Fresh installs already contain `slaac_enabled` before this migration runs.
+	// Reapplying the up callback must preserve its data.
+	require.NoError(t, vpcSlaacEnabledUpMigration(ctx, dbSession.DB))
+	persisted, err = model.NewVpcDAO(dbSession).GetByID(ctx, nil, vpc.ID, nil)
+	require.NoError(t, err)
+	require.True(t, persisted.SlaacEnabled)
+}
+
 func Test_vpcProviderIDUpMigration(t *testing.T) {
 	ctx := context.Background()
 
@@ -877,8 +963,9 @@ func Test_tenantConfigUpMigration(t *testing.T) {
 	err := dbSession.DB.ResetModel(context.Background(), (*model.Tenant)(nil))
 	assert.Nil(t, err)
 
-	// Drop foreign key constraints
-	_, err = dbSession.DB.Exec("ALTER TABLE tenant ALTER COLUMN config DROP NOT NULL")
+	// Tenant.Config is scan-only, so ResetModel does not create its column.
+	// Recreate the historical schema before exercising the migration.
+	_, err = dbSession.DB.Exec("ALTER TABLE tenant ADD COLUMN config jsonb")
 	assert.NoError(t, err)
 
 	// Create initial data
@@ -891,27 +978,75 @@ func Test_tenantConfigUpMigration(t *testing.T) {
 	tnOrg3 := "test-tenant-org-3"
 
 	tenant1 := model.TestBuildTenant(t, dbSession, "test-tenant-1", tnOrg1, ipu)
+	tenant2 := model.TestBuildTenant(t, dbSession, "test-tenant-2", tnOrg2, ipu)
+	tenant3 := model.TestBuildTenant(t, dbSession, "test-tenant-3", tnOrg3, ipu)
 
-	_, err = dbSession.DB.Exec("UPDATE tenant SET config = NULL where id = ?", tenant1.ID)
+	// Simulate legacy rows with NULL configs prior to the migration.
+	_, err = dbSession.DB.Exec("UPDATE tenant SET config = NULL WHERE id IN (?)", bun.In([]uuid.UUID{tenant1.ID, tenant2.ID}))
 	assert.NoError(t, err)
 
-	tenant2 := model.TestBuildTenant(t, dbSession, "test-tenant-2", tnOrg2, ipu)
-	assert.NotNil(t, tenant2.Config)
+	// Seed one tenant with a pre-existing non-NULL config that must survive the migration.
+	existingConfig := map[string]interface{}{
+		"targetedInstanceCreation": true,
+		"enableSshAccess":          false,
+	}
+	_, err = dbSession.DB.NewUpdate().
+		Table("tenant").
+		Set("config = ?", existingConfig).
+		Where("id = ?", tenant3.ID).
+		Exec(ctx)
+	assert.NoError(t, err)
 
 	// Call up migration function
 	err = tenantConfigUpMigration(ctx, dbSession.DB)
 	assert.NoError(t, err)
 
-	// GetAll operating systems and verify
-	tnDAO := model.NewTenantDAO(dbSession)
-	tns, _, err := tnDAO.GetAll(ctx, nil, model.TenantFilterInput{Orgs: []string{tenant1.Org}}, paginator.PageInput{Limit: cutil.GetPtr(paginator.TotalLimit)}, nil)
-	assert.Nil(t, err)
-	assert.Equal(t, 1, len(tns))
-	assert.Equal(t, tenant1.ID, tns[0].ID)
+	// The migration backfills NULL configs with an empty JSON object and leaves
+	// pre-existing non-NULL values untouched.
+	type tenantConfigRow struct {
+		ID     uuid.UUID              `bun:"id"`
+		Config map[string]interface{} `bun:"config,type:jsonb"`
+	}
 
-	// Check that config is not null
-	assert.NotNil(t, tns[0].Config)
+	var rows []tenantConfigRow
+	err = dbSession.DB.NewSelect().
+		Table("tenant").
+		Column("id", "config").
+		Where("id IN (?)", bun.In([]uuid.UUID{tenant1.ID, tenant2.ID, tenant3.ID})).
+		Scan(ctx, &rows)
+	assert.NoError(t, err)
+	require.Len(t, rows, 3)
 
-	tenant3 := model.TestBuildTenant(t, dbSession, "test-tenant-3", tnOrg3, ipu)
-	assert.NotNil(t, tenant3.Config)
+	configByID := make(map[uuid.UUID]map[string]interface{}, len(rows))
+	for _, row := range rows {
+		configByID[row.ID] = row.Config
+	}
+
+	assert.Equal(t, map[string]interface{}{}, configByID[tenant1.ID])
+	assert.Equal(t, map[string]interface{}{}, configByID[tenant2.ID])
+	assert.Equal(t, existingConfig, configByID[tenant3.ID])
+
+	// The migration also establishes the column's schema contract: it sets the
+	// '{}'::jsonb default and a NOT NULL constraint. Exercise both behaviors so a
+	// regression that drops either is caught.
+
+	// A new row that omits config must receive the '{}'::jsonb default.
+	defaultTenant := model.TestBuildTenant(t, dbSession, "test-tenant-default", "test-tenant-org-default", ipu)
+
+	var defaultRow tenantConfigRow
+	err = dbSession.DB.NewSelect().
+		Table("tenant").
+		Column("id", "config").
+		Where("id = ?", defaultTenant.ID).
+		Scan(ctx, &defaultRow)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]interface{}{}, defaultRow.Config)
+
+	// Explicitly writing NULL must violate the NOT NULL constraint.
+	_, err = dbSession.DB.NewUpdate().
+		Table("tenant").
+		Set("config = NULL").
+		Where("id = ?", defaultTenant.ID).
+		Exec(ctx)
+	assert.Error(t, err)
 }

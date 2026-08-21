@@ -27,7 +27,7 @@ type SshKeyCreateRequest struct {
 	// Name cannot match that name an existing SSH Key
 	Name string `json:"name"`
 	// Must be an SSH key of type: RSA, ECDSA or ED25519
-	PublicKey string `json:"publicKey" validate:"regexp=^ssh-(rsa|ecdsa|ed25519) AAAA[0-9A-Za-z+\\/]+[=]{0,3}(\\\\s+.+)?$"`
+	PublicKey string `json:"publicKey" validate:"regexp=^ssh-(rsa|ecdsa|ed25519) AAAA[0-9A-Za-z+/]+[=]{0\\,3}(\\s+.+)?$"`
 	// ID of the SSH Key Group this key should be attached to
 	SshKeyGroupId NullableString `json:"sshKeyGroupId,omitempty"`
 }
@@ -188,7 +188,6 @@ func (o *SshKeyCreateRequest) UnmarshalJSON(data []byte) (err error) {
 	varSshKeyCreateRequest := _SshKeyCreateRequest{}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	err = decoder.Decode(&varSshKeyCreateRequest)
 
 	if err != nil {

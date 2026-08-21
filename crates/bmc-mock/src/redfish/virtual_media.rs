@@ -47,12 +47,12 @@ struct DeviceState {
     media: Mutex<Media>,
 }
 
-pub struct VirtualMediaState {
+pub(crate) struct VirtualMediaState {
     devices: Vec<DeviceState>,
 }
 
 impl VirtualMediaState {
-    pub fn new(devices: Vec<DeviceConfig>) -> Self {
+    pub(super) fn new(devices: Vec<DeviceConfig>) -> Self {
         Self {
             devices: devices
                 .into_iter()
@@ -78,7 +78,7 @@ impl VirtualMediaState {
     }
 }
 
-pub fn collection(system_id: &str) -> redfish::Collection<'static> {
+pub(super) fn collection(system_id: &str) -> redfish::Collection<'static> {
     redfish::Collection {
         odata_id: Cow::Owned(format!(
             "{}/VirtualMedia",
@@ -89,7 +89,7 @@ pub fn collection(system_id: &str) -> redfish::Collection<'static> {
     }
 }
 
-pub fn resource<'a>(system_id: &str, device_id: &'a str) -> redfish::Resource<'a> {
+fn resource<'a>(system_id: &str, device_id: &'a str) -> redfish::Resource<'a> {
     redfish::Resource {
         odata_id: Cow::Owned(format!("{}/{device_id}", collection(system_id).odata_id)),
         odata_type: Cow::Borrowed("#VirtualMedia.v1_3_2.VirtualMedia"),
@@ -112,7 +112,7 @@ fn eject_media_target(system_id: &str, device_id: &str) -> String {
     )
 }
 
-pub fn add_routes(router: Router<BmcState>) -> Router<BmcState> {
+pub(crate) fn add_routes(router: Router<BmcState>) -> Router<BmcState> {
     const SYSTEM_ID: &str = "{system_id}";
     const DEVICE_ID: &str = "{device_id}";
     router
@@ -258,7 +258,7 @@ mod tests {
     use super::*;
     use crate::test_support::host_info;
     use crate::{
-        Callbacks, HostHardwareType, MachineRouterOptions, MockPowerState, SetSystemPowerError,
+        Callbacks, HardwareType, MachineRouterOptions, MockPowerState, SetSystemPowerError,
         SystemPowerControl, machine_router,
     };
 
@@ -285,10 +285,10 @@ mod tests {
     }
 
     fn test_router() -> (Router, Arc<RecordingCallbacks>) {
-        test_router_for(HostHardwareType::DellPowerEdgeR750)
+        test_router_for(HardwareType::DellPowerEdgeR750)
     }
 
-    fn test_router_for(hardware_type: HostHardwareType) -> (Router, Arc<RecordingCallbacks>) {
+    fn test_router_for(hardware_type: HardwareType) -> (Router, Arc<RecordingCallbacks>) {
         let callbacks = Arc::new(RecordingCallbacks::default());
         let router = machine_router(
             &host_info(hardware_type),
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn attaches_virtual_media_to_the_controlled_system_not_the_first_member() {
-        let (router, _) = test_router_for(HostHardwareType::NvidiaDgxGb300);
+        let (router, _) = test_router_for(HardwareType::NvidiaDgxGb300);
         let hgx = "/redfish/v1/Systems/HGX_Baseboard_0";
         let host = "/redfish/v1/Systems/System_0";
 

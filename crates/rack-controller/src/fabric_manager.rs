@@ -23,11 +23,13 @@ use carbide_rack_controller::config::RmsConfig;
 use carbide_utils::none_if_empty::NoneIfEmpty;
 use carbide_uuid::rack::RackId;
 use carbide_uuid::switch::SwitchId;
+use component_manager::nv_switch_manager::{
+    ScaleUpFabricResponseStatus, ScaleUpFabricServiceStatuses, ScaleUpFabricStatus,
+};
+use component_manager::rms::scale_up_fabric_service_statuses_from_rms;
 use db::switch as db_switch;
 use librms::protos::rack_manager as rms;
 use model::rack::FirmwareUpgradeDeviceInfo;
-use model::switch::{FabricManagerState, FabricManagerStatus};
-use serde::Deserialize;
 use sqlx::PgConnection;
 
 use crate as carbide_rack_controller;
@@ -75,7 +77,7 @@ pub(super) async fn batch_get_scale_up_fabric_service_status(
     rack_id: &RackId,
     switches: &[FirmwareUpgradeDeviceInfo],
     node_identity: &RmsNodeIdentity,
-) -> Result<rms::BatchGetScaleUpFabricServiceStatusResponse, String> {
+) -> Result<ScaleUpFabricServiceStatuses, String> {
     let Some(url) = rms_config.api_url.as_deref().none_if_empty() else {
         return Err("RMS client not configured".to_string());
     };
@@ -86,94 +88,41 @@ pub(super) async fn batch_get_scale_up_fabric_service_status(
         rms_config.client_key.clone(),
         rms_config.enforce_tls,
     );
+
     let rms_api_config = librms::client::RmsApiConfig::new(url, &rms_client_config);
     let rms_client = librms::RackManagerApi::new(&rms_api_config);
 
-    rms_client
-        .client
-        .batch_get_scale_up_fabric_service_status(build_scale_up_fabric_services_status_request(
-            rack_id,
-            switches,
-            node_identity,
-        ))
-        .await
-        .map_err(|error| format!("RMS BatchGetScaleUpFabricServiceStatus failed: {}", error))
-}
+    let response =
+        rms_client
+            .client
+            .batch_get_scale_up_fabric_service_status(
+                build_scale_up_fabric_services_status_request(rack_id, switches, node_identity),
+            )
+            .await
+            .map_err(|error| format!("RMS BatchGetScaleUpFabricServiceStatus failed: {}", error))?;
 
-#[derive(Debug, Deserialize)]
-struct RmsFabricManagerStatusPayload {
-    status: Option<String>,
-    #[serde(rename = "addition-info")]
-    addition_info: Option<String>,
-    reason: Option<String>,
-}
-
-fn fabric_manager_status_from_entry(
-    node_id: &str,
-    entry: &rms::ScaleUpFabricServiceStatusEntry,
-) -> FabricManagerStatus {
-    if !entry.error_message.trim().is_empty() {
-        return FabricManagerStatus {
-            fabric_manager_state: FabricManagerState::Unknown,
-            addition_info: None,
-            reason: None,
-            error_message: Some(entry.error_message.clone()),
-        };
-    }
-
-    if entry.status_json.trim().is_empty() {
-        return FabricManagerStatus {
-            fabric_manager_state: FabricManagerState::Unknown,
-            addition_info: None,
-            reason: None,
-            error_message: None,
-        };
-    }
-
-    let status_json =
-        match serde_json::from_str::<RmsFabricManagerStatusPayload>(&entry.status_json) {
-            Ok(status_json) => status_json,
-            Err(error) => {
-                tracing::warn!(
-                    switch_id = %node_id,
-                    %error,
-                    status_json = %entry.status_json,
-                    "Failed to parse RMS fabric-manager status JSON"
-                );
-                return FabricManagerStatus {
-                    fabric_manager_state: FabricManagerState::Unknown,
-                    addition_info: None,
-                    reason: None,
-                    error_message: None,
-                };
-            }
-        };
-
-    let fabric_manager_state = match status_json.status.as_deref().unwrap_or_default() {
-        "ok" => FabricManagerState::Ok,
-        "not ok" => FabricManagerState::NotOk,
-        _ => FabricManagerState::Unknown,
-    };
-
-    FabricManagerStatus {
-        fabric_manager_state,
-        addition_info: status_json.addition_info,
-        reason: status_json.reason,
-        error_message: None,
-    }
+    Ok(scale_up_fabric_service_statuses_from_rms(response))
 }
 
 pub(super) async fn persist_fabric_manager_statuses(
     txn: &mut PgConnection,
     rack_id: &RackId,
     switches: &[FirmwareUpgradeDeviceInfo],
-    response: &rms::BatchGetScaleUpFabricServiceStatusResponse,
+    response: &ScaleUpFabricServiceStatuses,
 ) -> Result<(), String> {
-    if response.status != rms::ReturnCode::Success as i32 {
-        return Err(
-            "RMS BatchGetScaleUpFabricServiceStatus returned failure for ConfigureNmxCluster"
-                .to_string(),
-        );
+    match response.status {
+        ScaleUpFabricResponseStatus::Success => {}
+        ScaleUpFabricResponseStatus::Failure => {
+            return Err(
+                "RMS BatchGetScaleUpFabricServiceStatus returned failure for ConfigureNmxCluster"
+                    .to_string(),
+            );
+        }
+        ScaleUpFabricResponseStatus::Unknown(code) => {
+            return Err(format!(
+                "RMS BatchGetScaleUpFabricServiceStatus returned unknown status code {code} for ConfigureNmxCluster"
+            ));
+        }
     }
 
     for switch in switches {
@@ -189,9 +138,8 @@ pub(super) async fn persist_fabric_manager_statuses(
                 switch.node_id, error
             )
         })?;
-        let fabric_manager_status = fabric_manager_status_from_entry(&switch.node_id, entry);
 
-        db_switch::update_fabric_manager_status(txn, switch_id, Some(&fabric_manager_status))
+        db_switch::update_fabric_manager_status(txn, switch_id, Some(entry))
             .await
             .map_err(|error| {
                 format!(
@@ -203,9 +151,9 @@ pub(super) async fn persist_fabric_manager_statuses(
         tracing::info!(
             rack_id = %rack_id,
             switch_id = %switch.node_id,
-            fabric_manager_status = %fabric_manager_status.display_status(),
-            raw_fabric_manager_state = ?fabric_manager_status.fabric_manager_state,
-            error_message = %fabric_manager_status.error_message.as_deref().unwrap_or_default(),
+            fabric_manager_status = %entry.display_status(),
+            raw_fabric_manager_state = ?entry.fabric_manager_state,
+            error_message = %entry.error_message.as_deref().unwrap_or_default(),
             "Persisted FabricManager status for switch"
         );
     }
@@ -303,6 +251,81 @@ pub(super) fn select_primary_switch(
     Ok(primary)
 }
 
+/// Returns the primary switch observed in an RMS ScaleUpFabric status response.
+///
+/// A valid response must succeed and mark exactly one submitted rack switch as
+/// enabled.
+///
+/// # Errors
+///
+/// Returns an error when RMS does not report one valid primary.
+pub(super) fn observed_primary_switch(
+    switches: &[FirmwareUpgradeDeviceInfo],
+    response: &ScaleUpFabricStatus,
+) -> Result<SwitchId, String> {
+    match response.status {
+        ScaleUpFabricResponseStatus::Success => {}
+        ScaleUpFabricResponseStatus::Failure => {
+            let details = if response.error_message.trim().is_empty() {
+                "no error details provided"
+            } else {
+                response.error_message.as_str()
+            };
+
+            return Err(format!("RMS GetScaleUpFabricStatus failed: {details}"));
+        }
+        ScaleUpFabricResponseStatus::Unknown(status) => {
+            return Err(format!(
+                "RMS GetScaleUpFabricStatus returned invalid status {}",
+                status
+            ));
+        }
+    }
+
+    let Some(switch_statuses) = response.switches.as_ref() else {
+        return Err("RMS GetScaleUpFabricStatus returned no fabric status".to_string());
+    };
+
+    let mut enabled_switches = switch_statuses.iter().filter(|switch| switch.enabled);
+
+    let Some(enabled_switch) = enabled_switches.next() else {
+        return Err("RMS GetScaleUpFabricStatus reported no primary switch".to_string());
+    };
+
+    if enabled_switches.next().is_some() {
+        return Err("RMS GetScaleUpFabricStatus reported multiple primary switches".to_string());
+    }
+
+    let observed_primary = enabled_switch
+        .node_id
+        .parse::<SwitchId>()
+        .map_err(|error| {
+            format!(
+                "RMS returned invalid primary switch ID '{}': {error}",
+                enabled_switch.node_id
+            )
+        })?;
+
+    if !switches
+        .iter()
+        .any(|switch| switch.node_id == enabled_switch.node_id)
+    {
+        return Err(format!(
+            "RMS returned primary switch {} outside the submitted rack",
+            enabled_switch.node_id
+        ));
+    }
+
+    if !enabled_switch.error_message.trim().is_empty() {
+        return Err(format!(
+            "RMS failed to inspect primary switch {}: {}",
+            enabled_switch.node_id, enabled_switch.error_message
+        ));
+    }
+
+    Ok(observed_primary)
+}
+
 pub(super) async fn persist_primary_switch(
     txn: &mut PgConnection,
     rack_id: &RackId,
@@ -333,6 +356,8 @@ pub(super) async fn persist_primary_switch(
 mod tests {
     use carbide_rack::rms_node_type::switch_node_identity_for_profile;
     use carbide_test_support::{Check, check_values};
+    use carbide_uuid::switch::{SwitchIdSource, SwitchType};
+    use component_manager::nv_switch_manager::ScaleUpFabricSwitchStatus;
     use model::rack_type::{RackProductFamily, RackProfile};
 
     use super::*;
@@ -443,108 +468,89 @@ mod tests {
         Ok(())
     }
 
-    fn entry(status_json: &str, error_message: &str) -> rms::ScaleUpFabricServiceStatusEntry {
-        rms::ScaleUpFabricServiceStatusEntry {
-            status_json: status_json.to_string(),
-            error_message: error_message.to_string(),
-        }
-    }
-
-    /// The full derived status plus its product-facing display string, so a
-    /// table row asserts both the parsed fields and the "running"/"not_running"
-    /// outcome the caller acts on.
-    #[derive(Debug, PartialEq)]
-    struct Observed {
-        status: FabricManagerStatus,
-        display: &'static str,
-    }
-
-    fn observe(entry: rms::ScaleUpFabricServiceStatusEntry) -> Observed {
-        let status = fabric_manager_status_from_entry("sw-1", &entry);
-        let display = status.display_status();
-        Observed { status, display }
-    }
-
     #[test]
-    fn test_fabric_manager_status_from_entry() {
+    fn observed_primary_switch_requires_one_submitted_rack_switch() {
+        let first_id = SwitchId::new(SwitchIdSource::Tpm, [1; 32], SwitchType::NvLink).to_string();
+        let second_id = SwitchId::new(SwitchIdSource::Tpm, [2; 32], SwitchType::NvLink).to_string();
+        let expected_switches = vec![switch(&first_id), switch(&second_id)];
+
+        let switch_status = |node_id: &str, enabled| ScaleUpFabricSwitchStatus {
+            node_id: node_id.to_string(),
+            enabled,
+            error_message: String::new(),
+        };
+
+        let response = |status, switches| ScaleUpFabricStatus {
+            status,
+            switches,
+            error_message: String::new(),
+        };
+
         check_values(
             [
                 Check {
-                    scenario: "ok with control-plane configured -> running",
-                    input: entry(
-                        r#"{"addition-info":"CONTROL_PLANE_STATE_CONFIGURED","reason":"","status":"ok"}"#,
-                        "",
+                    scenario: "one enabled submitted switch",
+                    input: response(
+                        ScaleUpFabricResponseStatus::Success,
+                        Some(vec![
+                            switch_status(&first_id, false),
+                            switch_status(&second_id, true),
+                        ]),
                     ),
-                    expect: Observed {
-                        status: FabricManagerStatus {
-                            fabric_manager_state: FabricManagerState::Ok,
-                            addition_info: Some("CONTROL_PLANE_STATE_CONFIGURED".to_string()),
-                            reason: Some(String::new()),
-                            error_message: None,
-                        },
-                        display: "running",
-                    },
+                    expect: Some(second_id.clone()),
                 },
                 Check {
-                    scenario: "not ok -> not_running",
-                    input: entry(
-                        r#"{"addition-info":"","reason":"stopped by user","status":"not ok"}"#,
-                        "",
+                    scenario: "RMS failure",
+                    input: response(ScaleUpFabricResponseStatus::Failure, Some(Vec::new())),
+                    expect: None,
+                },
+                Check {
+                    scenario: "unknown response status",
+                    input: response(ScaleUpFabricResponseStatus::Unknown(17), Some(Vec::new())),
+                    expect: None,
+                },
+                Check {
+                    scenario: "missing fabric status",
+                    input: response(ScaleUpFabricResponseStatus::Success, None),
+                    expect: None,
+                },
+                Check {
+                    scenario: "no enabled switch",
+                    input: response(
+                        ScaleUpFabricResponseStatus::Success,
+                        Some(vec![switch_status(&first_id, false)]),
                     ),
-                    expect: Observed {
-                        status: FabricManagerStatus {
-                            fabric_manager_state: FabricManagerState::NotOk,
-                            addition_info: Some(String::new()),
-                            reason: Some("stopped by user".to_string()),
-                            error_message: None,
-                        },
-                        display: "not_running",
-                    },
+                    expect: None,
                 },
                 Check {
-                    scenario: "empty status json -> unknown, not_running",
-                    input: entry("", ""),
-                    expect: Observed {
-                        status: FabricManagerStatus {
-                            fabric_manager_state: FabricManagerState::Unknown,
-                            addition_info: None,
-                            reason: None,
-                            error_message: None,
-                        },
-                        display: "not_running",
-                    },
-                },
-                Check {
-                    scenario: "error message surfaces -> unknown, not_running",
-                    input: entry(
-                        r#"{"addition-info":"CONTROL_PLANE_STATE_CONFIGURED","status":"ok"}"#,
-                        "nmx-controller not started",
+                    scenario: "multiple enabled switches",
+                    input: response(
+                        ScaleUpFabricResponseStatus::Success,
+                        Some(vec![
+                            switch_status(&first_id, true),
+                            switch_status(&second_id, true),
+                        ]),
                     ),
-                    expect: Observed {
-                        status: FabricManagerStatus {
-                            fabric_manager_state: FabricManagerState::Unknown,
-                            addition_info: None,
-                            reason: None,
-                            error_message: Some("nmx-controller not started".to_string()),
-                        },
-                        display: "not_running",
-                    },
+                    expect: None,
                 },
                 Check {
-                    scenario: "malformed json -> unknown, not_running",
-                    input: entry("{not-json", ""),
-                    expect: Observed {
-                        status: FabricManagerStatus {
-                            fabric_manager_state: FabricManagerState::Unknown,
-                            addition_info: None,
-                            reason: None,
-                            error_message: None,
-                        },
-                        display: "not_running",
-                    },
+                    scenario: "enabled switch outside submitted rack",
+                    input: response(
+                        ScaleUpFabricResponseStatus::Success,
+                        Some(vec![switch_status(
+                            &SwitchId::new(SwitchIdSource::Tpm, [3; 32], SwitchType::NvLink)
+                                .to_string(),
+                            true,
+                        )]),
+                    ),
+                    expect: None,
                 },
             ],
-            observe,
+            |response| {
+                observed_primary_switch(&expected_switches, &response)
+                    .ok()
+                    .map(|primary| primary.to_string())
+            },
         );
     }
 }

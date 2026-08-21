@@ -67,7 +67,7 @@ discovery-retry-secs = 1
 discovery-retries-max = 1000
 "#;
 
-pub fn setup_agent_run_env(
+pub(super) fn setup_agent_run_env(
     addr: &SocketAddr,
     td: &TempDir,
     acf: &NamedTempFile,
@@ -81,6 +81,10 @@ pub fn setup_agent_run_env(
     };
     let root_dir = PathBuf::from(repo_root);
 
+    // SAFETY: Initial lint enablement: these test settings are installed before the
+    // in-process agent starts, but the parallel test harness and Tokio runtimes may
+    // already have other threads. Unix process-wide exclusion from environment readers
+    // is not proven; this needs owner review.
     unsafe {
         env::set_var("DISABLE_TLS_ENFORCEMENT", "true");
         env::set_var("IGNORE_MGMT_VRF", "true");
@@ -129,7 +133,7 @@ pub fn setup_agent_run_env(
     Ok(Some(opts))
 }
 
-pub async fn run_grpc_server(
+pub(super) async fn run_grpc_server(
     app: axum::Router<()>,
 ) -> eyre::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?; // 0 let OS choose available port
@@ -254,7 +258,7 @@ impl HttpBody for GrpcBody {
 }
 
 /// Takes an rpc object (built from rpc/proto/forge.proto) and turns into into a gRPC axum response
-pub fn respond(out: impl prost::Message) -> impl IntoResponse {
+pub(super) fn respond(out: impl prost::Message) -> impl IntoResponse {
     let msg_len = out.encoded_len() as u32;
     let mut body = Vec::with_capacity(1 + 4 + msg_len as usize);
     // first byte is compression: 0 means none

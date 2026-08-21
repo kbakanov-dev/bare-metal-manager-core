@@ -23,11 +23,7 @@ import (
 )
 
 func logAPIError(logger zerolog.Logger, apiErr *cutil.APIError, msg string) {
-	if apiErr.Data != nil {
-		logger.Error().Err(apiErr.Data).Msg(msg)
-		return
-	}
-	logger.Error().Err(apiErr).Msg(msg)
+	logger.Error().Err(apiErr.Diagnosis()).Msg(msg)
 }
 
 type MachinePowerControlHandler struct {
@@ -93,7 +89,9 @@ func (h MachinePowerControlHandler) Handle(c echo.Context) error {
 		return cutil.NewAPIErrorResponse(c, http.StatusBadRequest, err.Error(), nil)
 	}
 
-	provider, _, apiError := common.IsProviderOrTenant(ctx, logger, h.dbSession, org, dbUser, true, true)
+	// Machine power control is restricted to Provider Admins: disable viewer
+	// access and pass a nil scope so no Tenant capability is resolved.
+	provider, _, apiError := common.IsProviderOrTenant(ctx, logger, h.dbSession, org, dbUser, false, nil)
 	if apiError != nil {
 		return cutil.NewAPIErrorResponse(c, apiError.Code, apiError.Message, apiError.Data)
 	}

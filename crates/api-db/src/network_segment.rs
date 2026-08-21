@@ -125,8 +125,9 @@ pub async fn persist(
                 vni_id,
                 network_segment_type,
                 can_stretch,
-                allocation_strategy)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                allocation_strategy,
+                infer_slaac_eui64_addresses)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id";
     let segment_id: NetworkSegmentId = sqlx::query_as(query)
         .bind(value.id)
@@ -142,6 +143,7 @@ pub async fn persist(
         .bind(value.segment_type)
         .bind(value.can_stretch)
         .bind(value.allocation_strategy)
+        .bind(value.infer_slaac_eui64_addresses)
         .fetch_one(&mut *txn)
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
@@ -496,9 +498,9 @@ pub async fn segment_exists(txn: &mut PgConnection, name: &str) -> Result<bool, 
 
 /// Reconcile declared network definitions against what was previously seeded.
 ///
-///   1. **New** (no snapshot, no segment): no-op. The caller's
-///      segment-creation path is responsible for both creating the segment
-///      and writing the snapshot.
+///   1. **New** (no snapshot, no segment): returned to the caller for creation.
+///      The caller is responsible for creating the segment and writing the
+///      snapshot in the same transaction.
 ///   2. **Backfill** (no snapshot, segment present): record the snapshot,
 ///      linking it to the existing segment's id.
 ///   3. **In sync** (snapshot matches declaration): no-op.
@@ -508,18 +510,25 @@ pub async fn segment_exists(txn: &mut PgConnection, name: &str) -> Result<bool, 
 /// Networks that appear in the snapshot table but are no longer declared
 /// ("dropped" from `InitialObjectsConfig.networks`) are warned about, but
 /// not removed.
+///
+/// # Returns
+///
+/// Config-declared networks that have neither a segment row nor a snapshot,
+/// in unspecified order. The caller must create the segment and write the
+/// snapshot in the same transaction.
 pub async fn reconcile_network_defs(
     txn: &mut PgConnection,
     declared: &HashMap<String, NetworkDefinition>,
-) -> Result<(), DatabaseError> {
+) -> Result<Vec<(String, NetworkDefinition)>, DatabaseError> {
     let stored = all_stored_defs(&mut *txn).await?;
+    let mut to_create: Vec<(String, NetworkDefinition)> = Vec::new();
 
     for (name, def) in declared {
         let exists = segment_exists(&mut *txn, name).await?;
         match (stored.get(name), exists) {
-            // Already seeded with the current declaration
+            // Already seeded with the current declaration — nothing to do.
             (Some(stored_def), true) if stored_def == def => {}
-            // Declaration has drifted since seed. Warn don't reapply
+            // Declaration has drifted since seed; warn and leave both in place.
             (Some(stored_def), true) => {
                 tracing::warn!(
                     network_name = name,
@@ -561,10 +570,10 @@ pub async fn reconcile_network_defs(
                     );
                 }
             }
-            // New networks are seeded by the caller (`create_initial_networks`),
-            // which both expands the definition into a `NewNetworkSegment` and
-            // writes the snapshot in the same transaction.
-            (None, false) => {}
+            // No segment and no snapshot: return to the caller for creation.
+            (None, false) => {
+                to_create.push((name.clone(), def.clone()));
+            }
             (Some(_), false) => {
                 unreachable!("network_def.segment_id is FK; snapshot cannot outlive its segment")
             }
@@ -580,7 +589,7 @@ pub async fn reconcile_network_defs(
         }
     }
 
-    Ok(())
+    Ok(to_create)
 }
 pub async fn find_ids(
     txn: impl DbReader<'_>,
@@ -890,6 +899,13 @@ pub async fn mark_as_deleted(
             "Network Segment can't be deleted while addresses on the segment are allocated to instances".to_string(),
         ));
     }
+    let num_referencing_instances =
+        crate::instance::count_network_segment_references(txn, &value.id).await?;
+    if num_referencing_instances > 0 {
+        return DatabaseResult::Err(DatabaseError::NetworkSegmentDelete(format!(
+            "network segment can't be deleted while referenced by network configurations; referencing instance count: {num_referencing_instances}"
+        )));
+    }
 
     let query = "UPDATE network_segments SET updated=NOW(), deleted=NOW() WHERE id=$1 RETURNING id";
     let id = sqlx::query_as(query)
@@ -901,16 +917,31 @@ pub async fn mark_as_deleted(
     Ok(id)
 }
 
+/// Physically deletes a segment after rechecking that no allocations reference it.
+///
+/// The caller's transaction retains the recheck's table lock through physical
+/// deletion, serializing with the allocator's exclusive lock on
+/// `instance_addresses`.
 pub async fn final_delete(
     segment_id: NetworkSegmentId,
-    txn: &mut PgConnection,
+    txn: &mut PgTransaction<'_>,
 ) -> Result<NetworkSegmentId, DatabaseError> {
-    crate::network_prefix::delete_for_segment(segment_id, txn).await?;
+    // Recheck inside the delete transaction. The table lock serializes this
+    // read against the allocator's exclusive lock on `instance_addresses`,
+    // closing the gap between the controller's drain decision and physical
+    // deletion.
+    if crate::instance_address::segment_has_allocations(txn.as_mut(), &segment_id).await? {
+        return Err(DatabaseError::NetworkSegmentDelete(
+            "network segment can't be deleted while allocations still reference it".to_string(),
+        ));
+    }
+
+    crate::network_prefix::delete_for_segment(segment_id, txn.as_mut()).await?;
 
     let query = "DELETE FROM network_segments WHERE id=$1::uuid RETURNING id";
     let segment: NetworkSegmentId = sqlx::query_as(query)
         .bind(segment_id)
-        .fetch_one(txn)
+        .fetch_one(txn.as_mut())
         .await
         .map_err(|e| DatabaseError::query(query, e))?;
 
@@ -1011,6 +1042,20 @@ pub async fn allocate_svi_ip(
 ) -> Result<IpAddr, DatabaseError> {
     let mut first_svi_ip = None;
 
+    // A tenant prefix with fewer than three reserved addresses falls back to
+    // the instance address allocator. Take its table lock before touching any
+    // prefix row so this path uses the same lock order as segment deletion,
+    // including dual-stack segments whose prefixes reserve different numbers
+    // of addresses.
+    if value.config.segment_type.is_tenant()
+        && value
+            .prefixes
+            .iter()
+            .any(|prefix| prefix.svi_ip.is_none() && prefix.num_reserved < 3)
+    {
+        crate::instance_address::lock_table_for_allocation(txn.as_mut()).await?;
+    }
+
     for prefix in &value.prefixes {
         if prefix.svi_ip.is_some() {
             if first_svi_ip.is_none() {
@@ -1102,6 +1147,7 @@ mod tests {
             segment_type: NetworkSegmentType::Admin,
             can_stretch: None,
             allocation_strategy: Default::default(),
+            infer_slaac_eui64_addresses: false,
         };
         let segment_id = segment.id;
 
@@ -1144,6 +1190,7 @@ mod tests {
                 segment_type: NetworkSegmentType::Admin,
                 can_stretch: None,
                 allocation_strategy: Default::default(),
+                infer_slaac_eui64_addresses: false,
             },
             &mut txn,
             NetworkSegmentControllerState::Ready,
@@ -1253,11 +1300,10 @@ mod tests {
     }
 
     // A brand-new network is declared but no segment exists yet and no
-    // snapshot has been recorded.
-    // (`create_initial_networks`) is responsible for inserting both the
-    // segment and the snapshot in the same transaction.
+    // snapshot has been recorded. reconcile_network_defs must return it in
+    // the to-create list and leave all writes to the caller.
     #[crate::sqlx_test]
-    async fn test_reconcile_network_defs_brand_new_is_noop(
+    async fn test_reconcile_network_defs_brand_new_is_returned(
         pool: sqlx::PgPool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let def = NetworkDefinition {
@@ -1269,6 +1315,7 @@ mod tests {
             mtu: 1500,
             reserve_first: 5,
             allocation_strategy: Default::default(),
+            infer_slaac_eui64_addresses: false,
             vpc_name: None,
         };
 
@@ -1277,20 +1324,27 @@ mod tests {
             .into_iter()
             .collect();
 
-        reconcile_network_defs(&mut txn, &declared).await?;
+        let to_create = reconcile_network_defs(&mut txn, &declared).await?;
 
-        // Reconcile must not have written a snapshot for the brand-new entry.
+        // reconcile must not have written a snapshot for a brand-new network.
         let stored = stored_def(txn.as_mut(), "brand-new").await?;
         assert!(
             stored.is_none(),
-            "reconcile must leave brand-new networks alone; \
-             snapshot insertion is the caller's responsibility"
+            "reconcile must not write a snapshot for a brand-new network; \
+             that is the caller's responsibility"
         );
 
-        // And must not have created a network_segments row either.
+        // reconcile must not have created a network_segments row.
         assert!(
             !segment_exists(&mut txn, "brand-new").await?,
             "reconcile must not create a network_segments row for a brand-new network"
+        );
+
+        // reconcile must return the brand-new network so the caller can create it.
+        assert_eq!(
+            to_create,
+            vec![("brand-new".to_string(), def)],
+            "brand-new network must appear in the returned to-create list"
         );
 
         txn.rollback().await?;
@@ -1308,6 +1362,7 @@ mod tests {
             mtu: 1500,
             reserve_first: 3,
             allocation_strategy: Default::default(),
+            infer_slaac_eui64_addresses: false,
             vpc_name: None,
         }
     }
@@ -1328,7 +1383,12 @@ mod tests {
         let mut txn = pool.begin().await?;
         let def = def("192.168.1.0/24", "192.168.1.1");
 
-        reconcile_network_defs(&mut txn, &declared_one("pre-existing", def.clone())).await?;
+        let to_create =
+            reconcile_network_defs(&mut txn, &declared_one("pre-existing", def.clone())).await?;
+        assert!(
+            to_create.is_empty(),
+            "this arm must not add networks to the to-create list"
+        );
 
         let stored = stored_def(txn.as_mut(), "pre-existing").await?;
         assert_eq!(stored.as_ref(), Some(&def), "snapshot must be backfilled");
@@ -1347,7 +1407,12 @@ mod tests {
         let def = def("192.168.1.0/24", "192.168.1.1");
         insert_network_def(&mut txn, "stable", segment_id, &def).await?;
 
-        reconcile_network_defs(&mut txn, &declared_one("stable", def.clone())).await?;
+        let to_create =
+            reconcile_network_defs(&mut txn, &declared_one("stable", def.clone())).await?;
+        assert!(
+            to_create.is_empty(),
+            "this arm must not add networks to the to-create list"
+        );
 
         let stored = stored_def(txn.as_mut(), "stable").await?;
         assert_eq!(
@@ -1373,7 +1438,12 @@ mod tests {
         let drifted = def("10.0.0.0/24", "10.0.0.1");
         insert_network_def(&mut txn, "drifty", segment_id, &original).await?;
 
-        reconcile_network_defs(&mut txn, &declared_one("drifty", drifted.clone())).await?;
+        let to_create =
+            reconcile_network_defs(&mut txn, &declared_one("drifty", drifted.clone())).await?;
+        assert!(
+            to_create.is_empty(),
+            "this arm must not add networks to the to-create list"
+        );
 
         let stored = stored_def(txn.as_mut(), "drifty").await?;
         assert_eq!(
@@ -1399,7 +1469,11 @@ mod tests {
         insert_network_def(&mut txn, "abandoned", segment_id, &def).await?;
 
         let empty: HashMap<String, NetworkDefinition> = HashMap::new();
-        reconcile_network_defs(&mut txn, &empty).await?;
+        let to_create = reconcile_network_defs(&mut txn, &empty).await?;
+        assert!(
+            to_create.is_empty(),
+            "this arm must not add networks to the to-create list"
+        );
 
         let stored = stored_def(txn.as_mut(), "abandoned").await?;
         assert_eq!(
@@ -1446,6 +1520,165 @@ mod tests {
         Ok(())
     }
 
+    /// `final_delete` must recheck the allocation predicate in its own
+    /// transaction so a network configuration that retains only a prefix
+    /// cannot disappear between the controller drain check and physical
+    /// deletion.
+    #[crate::sqlx_test]
+    async fn final_delete_rejects_instance_network_config_reference(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let segment_id = minimum_segment_data(&pool, "still-referenced").await?;
+        let machine_id = uuid::Uuid::new_v4();
+        let mut txn = pool.begin().await?;
+        sqlx::query("INSERT INTO machines (id, dpf) VALUES ($1, '{}'::jsonb)")
+            .bind(machine_id)
+            .execute(txn.as_mut())
+            .await?;
+        sqlx::query(
+            "INSERT INTO instances (machine_id, network_config) \
+             VALUES ($1, jsonb_build_object( \
+                 'interfaces', jsonb_build_array( \
+                     jsonb_build_object('network_segment_id', $2::text))))",
+        )
+        .bind(machine_id)
+        .bind(segment_id)
+        .execute(txn.as_mut())
+        .await?;
+
+        let error = final_delete(segment_id, &mut txn)
+            .await
+            .expect_err("referenced segment must remain present");
+        assert!(matches!(
+            error,
+            DatabaseError::NetworkSegmentDelete(message)
+                if message.contains("allocations still reference it")
+        ));
+        assert!(
+            segment_exists(txn.as_mut(), "still-referenced").await?,
+            "failed final deletion must retain the segment",
+        );
+        txn.rollback().await?;
+        Ok(())
+    }
+
+    /// SVI allocation must lock the `instance_addresses` table before it
+    /// updates any prefix row. Otherwise, a tenant segment whose prefixes
+    /// reserve different numbers of addresses can deadlock with final deletion:
+    /// allocation holds the first prefix row and waits for the table lock while
+    /// deletion holds the table lock and waits for that prefix row.
+    #[crate::sqlx_test]
+    async fn tenant_svi_allocation_locks_before_mixed_prefix_updates(
+        pool: sqlx::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut setup_txn = pool.begin().await?;
+        let mut segment = persist(
+            NewNetworkSegment {
+                id: NetworkSegmentId::new(),
+                name: "mixed-svi-lock-order".to_string(),
+                subdomain_id: None,
+                vpc_id: None,
+                mtu: 1500,
+                prefixes: vec![
+                    NewNetworkPrefix {
+                        prefix: "198.51.100.0/29".parse()?,
+                        gateway: None,
+                        dhcpv6_link_address: None,
+                        num_reserved: 3,
+                    },
+                    NewNetworkPrefix {
+                        prefix: "2001:db8:2403::/64".parse()?,
+                        gateway: None,
+                        dhcpv6_link_address: None,
+                        num_reserved: 0,
+                    },
+                ],
+                vlan_id: None,
+                vni: None,
+                segment_type: NetworkSegmentType::Tenant,
+                can_stretch: Some(true),
+                allocation_strategy: Default::default(),
+                infer_slaac_eui64_addresses: false,
+            },
+            setup_txn.as_mut(),
+            NetworkSegmentControllerState::Ready,
+        )
+        .await?;
+        setup_txn.commit().await?;
+
+        // `json_agg` does not promise prefix order. Force the dangerous order:
+        // update the third address directly, then fall back to the allocator.
+        segment
+            .prefixes
+            .sort_by_key(|prefix| std::cmp::Reverse(prefix.num_reserved));
+        assert_eq!(segment.prefixes[0].num_reserved, 3);
+        assert_eq!(segment.prefixes[1].num_reserved, 0);
+
+        let mut deletion_txn = pool.begin().await?;
+        let deletion_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(deletion_txn.as_mut())
+            .await?;
+        sqlx::query("LOCK TABLE instance_addresses IN ACCESS SHARE MODE")
+            .execute(deletion_txn.as_mut())
+            .await?;
+
+        let allocation_pool = pool.clone();
+        let segment_id = segment.id;
+        let allocation_task = tokio::spawn(async move {
+            let mut txn = allocation_pool.begin().await.unwrap();
+            let result = allocate_svi_ip(&segment, &mut txn).await;
+            if result.is_ok() {
+                txn.commit().await.unwrap();
+            } else {
+                txn.rollback().await.unwrap();
+            }
+            result
+        });
+
+        // Wait until allocation reaches the table boundary held above. With
+        // the correct order it has not touched either prefix row yet.
+        let mut allocation_is_blocked = false;
+        for _ in 0..300 {
+            allocation_is_blocked = sqlx::query_scalar(
+                r#"SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_stat_activity AS activity
+                    WHERE activity.datname = current_database()
+                      AND activity.wait_event_type = 'Lock'
+                      AND $1 = ANY(pg_blocking_pids(activity.pid))
+                      AND activity.query ILIKE
+                          '%LOCK TABLE instance_addresses IN ACCESS EXCLUSIVE MODE%'
+                )"#,
+            )
+            .bind(deletion_pid)
+            .fetch_one(&pool)
+            .await?;
+            if allocation_is_blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            allocation_is_blocked,
+            "SVI allocation never reached the lock on instance_addresses",
+        );
+
+        // Acquiring the table lock before the prefix lock lets this delete
+        // finish. Roll it back so the waiting allocator can resume against the
+        // restored rows.
+        assert_eq!(
+            final_delete(segment_id, &mut deletion_txn).await?,
+            segment_id,
+        );
+        deletion_txn.rollback().await?;
+
+        allocation_task
+            .await
+            .expect("SVI allocation task must complete")
+            .expect("SVI allocation must resume after deletion rollback");
+        Ok(())
+    }
+
     // `network_segments.name` is not UNIQUE at the DB layer, so two rows
     // can share a name Reconcile's backfill
     // path can't tell which one to attach a snapshot to, so it must
@@ -1461,7 +1694,12 @@ mod tests {
         let mut txn = pool.begin().await?;
         let def = def("192.168.1.0/24", "192.168.1.1");
 
-        reconcile_network_defs(&mut txn, &declared_one("ambiguous", def.clone())).await?;
+        let to_create =
+            reconcile_network_defs(&mut txn, &declared_one("ambiguous", def.clone())).await?;
+        assert!(
+            to_create.is_empty(),
+            "this arm must not add networks to the to-create list"
+        );
 
         assert!(
             stored_def(txn.as_mut(), "ambiguous").await?.is_none(),

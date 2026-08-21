@@ -142,6 +142,13 @@ make generate-sdk
 make publish-openapi
 ```
 
+`generate-sdk` uses a pinned openapi-generator, downloaded to `.tools/` and
+checksum-verified on first use, because the generated SDK is byte-for-byte
+dependent on the generator version. Do not install the generator separately to
+bypass the pin. Raising `OPENAPI_GENERATOR_VERSION` belongs in its own change
+alongside the regenerated `sdk/standard/`, since a new generator rewrites files
+no spec edit touched.
+
 ### Protobuf Code Generation
 
 ```bash
@@ -174,13 +181,28 @@ verification expectations.
 - Linting uses `golangci-lint` (v2 config in `.golangci.yml`) with most
   linters enabled, plus `revive` (config in `.revive.toml`).
 - Use `testify` (assert/require) for test assertions.
+- When a test verifies a generated CLI command path, assert that the leaf
+  command has a non-nil `Action`; path presence alone does not prove the
+  command is runnable.
+- For a tenant-owned TUI resource picker, resolve the current tenant explicitly,
+  send its ID in the list request, and require each returned row to match that
+  exact tenant ID. Test a dual-role caller whose response also contains
+  provider-owned and other-tenant resources.
 - Tests that need a database use a PostgreSQL container (testcontainers-go
   or the Makefile-managed container).
+- Organize tests by the production function or method under test, not by individual
+  scenarios. Use one top-level test function named `Test<Receiver>_<Method>` or
+  `Test<Function>`—for example `TestIsStrInSlice` for `IsStrInSlice` and `TestGetAllSkuHandler_Handle` for `GetAllSkuHandler.Handle`. Define individual test
+  cases in a table and execute each case as a named `t.Run` subtest. Do not create
+  separate top-level test functions for each test case.
 - Tests run with `-p 1` (serial) and often with `-race`.
 - API handlers live in `api/pkg/api/handler/`, request/response models in
   `api/pkg/api/model/`, and DB models in `db/pkg/db/model/`.
 - OpenAPI schema in `openapi/spec.yaml` must be updated whenever routes in the
   published API surface are added or modified.
+- Give every newly introduced OpenAPI object a realistic example backed by an
+  existing contract, configuration, or test fixture. Keep example IDs, enum
+  values, nullability, and timing semantics valid under OpenAPI lint.
 - When adding a request/response field to a resource that has both single-item
   and batch endpoints, update the full surface together: single create/update
   DTOs, batch create/update DTOs, handlers, DAO input structs, persistence,
@@ -215,6 +237,8 @@ verification expectations.
   implementation details.
 - API-layer enum-like request constants exposed through JSON use CapitalCase
   values, for example `SiteWideRoot` and `BMCRoot`.
+- When prose names exact API enum values, format the literals as code, for
+  example `Set`, `Clear`, and `Restart`, so they are distinct from verbs.
 - For disruptive machine operations, decide and encode the attached-Instance
   behavior explicitly. If an operation can power-cycle or otherwise disrupt a
   tenant workload, check `Machine.IsAssigned` (or the equivalent association)
@@ -231,6 +255,13 @@ verification expectations.
 When building or converting a REST endpoint that calls on-site NICo Core through
 the generic gRPC proxy, follow
 [`skills/rest-core-grpc-proxy/SKILL.md`](skills/rest-core-grpc-proxy/SKILL.md).
+
+### REST endpoints through the Flow gRPC proxy
+
+When building or converting a REST endpoint that calls on-site Flow through the
+generic gRPC proxy, follow
+[`skills/rest-flow-grpc-proxy/SKILL.md`](skills/rest-flow-grpc-proxy/SKILL.md).
+Callers supply the Temporal workflow ID and conflict policy (unlike CoreProxy).
 
 ### REST endpoint implementation patterns
 
@@ -250,6 +281,11 @@ main patterns:
 - Flow-backed inventory and task APIs use Flow request/response protobufs in the
   API model layer and keep target-shape helpers next to the model or handler
   that owns the REST shape. Use Rack, Tray, Task, and Task Rule as references.
+  Every Flow-backed endpoint dispatches through the generic proxy, so use
+  `handler/util/common.ProxyFlowGRPC` (or `ExecuteFlowGRPC` where the caller
+  must return a plain `error`) rather than adding a bespoke Temporal workflow
+  per method. Retiring the bespoke workflows spans releases; see the skill for
+  the required order.
 - Curated REST endpoints that call NICo Core `forge.Forge` unary methods should
   use `handler/util/common.ExecuteCoreGRPC` with a typed protobuf request. Do
   not create a bespoke Temporal workflow for a simple unary Core call. BMC
@@ -770,6 +806,8 @@ When writing git commit messages, follow the conventions below:
   otherwise expect to be present.
 - Add TODO comments for features or nuances not important to implement
   right away.
+- In Go, split variable assignment and the condition into separate lines.
+  Do not use initializer clauses such as if err := operation(); err != nil
 
 ## Commit Guidelines
 
@@ -788,6 +826,21 @@ All commits **must** meet the following signing requirement:
 - Keep PRs focused on a single change.
 - Do not land unused code unless the PR is too large to review otherwise.
 - Ensure all CI checks pass before requesting review.
+- Before requesting review for a Go change, run `make lint-go` and inspect its
+  complete analyzer output. Its `golangci-lint` command uses
+  `--issues-exit-code 0`, so a successful command does not mean the output is
+  clean. Run `go tool golangci-lint run <changed-packages>` without that
+  override and fix every finding in the changed package.
+- When CLI flags override configuration, copy the complete configured object
+  first and overlay only explicitly set flags. Test no override, one override,
+  and unset configured fields so unrelated options cannot be discarded.
+- Before using an authentication or protocol convenience API, read its current
+  documentation for protocol-specific encoding rules. Exercise delimiters,
+  percent signs, plus signs, and other reserved characters through the real
+  encode and decode boundary.
+- Before requesting review, group every changed Go function's scenarios under
+  one table-driven top-level test. Treat scenario-specific top-level tests as a
+  review failure even when the test suite passes.
 
 ## CI / CD
 

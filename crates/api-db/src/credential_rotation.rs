@@ -73,8 +73,11 @@ use crate::DatabaseError;
 use crate::db_read::DbReader;
 
 /// Backoff floor: the first failed rotation attempt quarantines the device for
-/// this long before the engine will retry it.
-const BACKOFF_BASE_SECS: i64 = 60;
+/// this long before the engine will retry it. Set to 15 minutes so retries are
+/// spaced far enough apart -- from the very first failure -- that repeated failed
+/// BMC logins cannot cluster tightly enough to trip a device's account-lockout
+/// policy (whose failure counters reset on the order of minutes).
+const BACKOFF_BASE_SECS: i64 = 900;
 /// Backoff ceiling: the quarantine window never grows past this (~1 hour), so a
 /// permanently failing device is still retried periodically.
 const BACKOFF_CAP_SECS: i64 = 3600;
@@ -1126,10 +1129,7 @@ mod tests {
         insert_switch_with_nvos_credentials(conn, id, bmc_mac, deleted, false).await;
     }
 
-    // current_version for a (mac, type) row, or None if no row exists. Takes the
-    // same connection the writers use (rather than the pool) so the whole test
-    // runs on a single connection -- otherwise holding that connection across a
-    // second `pool` acquisition trips the txn_held_across_await lint.
+    // current_version for a (mac, type) row, or None if no row exists.
     async fn version_of(conn: &mut PgConnection, mac: &str, credential_type: &str) -> Option<i32> {
         let row: Option<Option<i32>> = sqlx::query_scalar(
             "SELECT current_version FROM device_credential_rotation \
@@ -1297,11 +1297,11 @@ mod tests {
     fn backoff_is_exponential_and_capped() {
         let now = Utc::now();
 
-        // prior_attempts = 0 is the first failure: the base floor (1 minute).
-        assert_eq!(backoff_until(0, now), now + Duration::seconds(60));
-        // Each subsequent failure doubles the window.
-        assert_eq!(backoff_until(1, now), now + Duration::seconds(120));
-        assert_eq!(backoff_until(2, now), now + Duration::seconds(240));
+        // prior_attempts = 0 is the first failure: the base floor (15 minutes).
+        assert_eq!(backoff_until(0, now), now + Duration::minutes(15));
+        // Each subsequent failure doubles the window until it reaches the cap.
+        assert_eq!(backoff_until(1, now), now + Duration::minutes(30));
+        assert_eq!(backoff_until(2, now), now + Duration::minutes(60));
         // A large attempt count saturates at the cap rather than overflowing.
         assert_eq!(
             backoff_until(1_000, now),
@@ -1313,7 +1313,7 @@ mod tests {
             now + Duration::seconds(BACKOFF_CAP_SECS)
         );
         // A negative count (never produced in practice) floors at the base.
-        assert_eq!(backoff_until(-5, now), now + Duration::seconds(60));
+        assert_eq!(backoff_until(-5, now), now + Duration::minutes(15));
     }
 
     #[crate::sqlx_test]

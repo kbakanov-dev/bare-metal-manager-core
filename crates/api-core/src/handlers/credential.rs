@@ -46,7 +46,10 @@ const DEFAULT_FORGE_ADMIN_BMC_USERNAME: &str = "root";
 /// on the DPU.  This was directly verified by checking the maximum accepted
 /// by FRR on the DPU.  NVUE will silently accept seemingly any length,
 /// but FRR reloads fail above this length.
-pub const MAX_BGP_PASSWORD_LENGTH: usize = 80;
+const MAX_BGP_PASSWORD_LENGTH: usize = 80;
+
+#[cfg(test)]
+pub(crate) const TEST_MAX_BGP_PASSWORD_LENGTH: usize = MAX_BGP_PASSWORD_LENGTH;
 
 pub(crate) async fn create_credential(
     api: &Api,
@@ -122,7 +125,14 @@ pub(crate) async fn create_credential(
                     credential_type: CredentialType::SiteDefault,
                 })
                 .await)
-                .is_ok_and(|result| result.is_some())
+                .is_ok_and(|result| {
+                    result.is_some_and(|creds| {
+                        // An empty password is seeded by nico-prereqs at deploy time —
+                        // treat it as absent so the operator can set the real password.
+                        let Credentials::UsernamePassword { ref password, .. } = creds;
+                        !password.is_empty()
+                    })
+                })
             {
                 // TODO: support reset credential
                 return Err(tonic::Status::already_exists(
@@ -151,7 +161,14 @@ pub(crate) async fn create_credential(
                     credential_type: CredentialType::SiteDefault,
                 })
                 .await
-                .is_ok_and(|result| result.is_some())
+                .is_ok_and(|result| {
+                    result.is_some_and(|creds| {
+                        // An empty password is seeded by nico-prereqs at deploy time —
+                        // treat it as absent so the operator can set the real password.
+                        let Credentials::UsernamePassword { ref password, .. } = creds;
+                        !password.is_empty()
+                    })
+                })
             {
                 // TODO: support reset credential
                 return Err(tonic::Status::already_exists(
@@ -626,7 +643,7 @@ async fn set_sitewide_nic_lockdown_ikm(api: &Api, password: String) -> Result<()
         })
 }
 
-pub(crate) async fn delete_bmc_root_credentials_by_mac(
+pub(super) async fn delete_bmc_root_credentials_by_mac(
     api: &Api,
     bmc_mac_address: MacAddress,
 ) -> Result<(), CarbideError> {
@@ -697,7 +714,7 @@ async fn set_bmc_credentials(
         .map_err(|e| CarbideError::internal(format!("error setting credential for BMC: {e:?} ")))
 }
 
-pub async fn write_ufm_certs(api: &Api, fabric: String) -> Result<(), CarbideError> {
+async fn write_ufm_certs(api: &Api, fabric: String) -> Result<(), CarbideError> {
     const CERT_PATH: &str = "/var/run/secrets";
 
     // ttl can be limited by vault, so final value can be different
@@ -780,7 +797,7 @@ pub(crate) async fn renew_machine_certificate(
     Err(CarbideError::ClientCertificateError("no client certificate presented?".to_string()).into())
 }
 
-pub async fn get_container_registry_credential(
+pub(crate) async fn get_container_registry_credential(
     api: &Api,
     request: Request<rpc::GetContainerRegistryCredentialRequest>,
 ) -> Result<Response<rpc::GetContainerRegistryCredentialResponse>, Status> {

@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use bmc_mock::test_support::TestBmc;
 use bmc_mock::test_support::axum_http_client::Error as TestBmcError;
-use bmc_mock::{DpuMachineInfo, DpuSettings, HostHardwareType, HostMachineInfo, MachineInfo};
+use bmc_mock::{DpuMachineInfo, DpuSettings, HardwareType, HostMachineInfo, MachineInfo};
 use model::site_explorer::EndpointExplorationReport;
+use nv_redfish::core::ODataId;
 use nv_redfish::{Bmc, Resource, ServiceRoot};
 
 use crate::chassis::ExploredChassisCollection;
@@ -87,6 +88,20 @@ pub async fn detect_hw_type<B: Bmc>(
     Ok(hw_type(&root, &explored_system, &explored_chassis))
 }
 
+/// Fetches supplemental adapter Port data for selected chassis without running
+/// the platform-specific report pipeline.
+pub async fn explore_network_adapter_ports<B: Bmc>(
+    root: &ServiceRoot<B>,
+    linked_chassis_ids: &[ODataId],
+) -> Result<Vec<model::site_explorer::Chassis>, Error<B>> {
+    let config = build_chassis_explore_config(root);
+    let mut explored_chassis = ExploredChassisCollection::explore(root, &config).await?;
+    explored_chassis
+        .fetch_network_adapter_ports(linked_chassis_ids)
+        .await;
+    Ok(explored_chassis.to_model())
+}
+
 pub type MockExplorerError = Error<TestBmc>;
 
 #[derive(Clone, Debug)]
@@ -109,7 +124,7 @@ pub async fn generate_report_for_machine(
 }
 
 pub async fn generate_managed_host_reports(
-    hw_type: HostHardwareType,
+    hw_type: HardwareType,
 ) -> Result<GeneratedManagedHostReports, MockExplorerError> {
     generate_managed_host_reports_from_info(host_info_for_hw_type(hw_type)).await
 }
@@ -137,7 +152,7 @@ pub async fn generate_managed_host_reports_from_info(
     })
 }
 
-fn host_info_for_hw_type(hw_type: HostHardwareType) -> HostMachineInfo {
+fn host_info_for_hw_type(hw_type: HardwareType) -> HostMachineInfo {
     let dpu_count = hw_type.fixed_number_of_dpu().unwrap_or(0);
     let mut pool = bmc_mock::test_support::TEST_MAC_POOL.lock().unwrap();
     let hw_mac_addr_pool = pool.allocate_range_config().unwrap();

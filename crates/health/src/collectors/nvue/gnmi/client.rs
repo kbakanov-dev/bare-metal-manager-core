@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use tokio_stream::StreamExt;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Extensions, Request};
@@ -30,7 +31,7 @@ use super::proto::{
 use crate::HealthError;
 use crate::config::{MtlsProfileConfig, NvueGnmiPaths};
 
-pub fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
+pub(super) fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
     let mut paths = Vec::with_capacity(4);
     if paths_config.components_enabled {
         paths.push(Path {
@@ -62,9 +63,10 @@ pub fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
             ..Default::default()
         });
     }
+
     if paths_config.platform_general_enabled {
-        // `/platform-general/state` carries the memory and disk
-        // utilization leaves
+        // `/platform-general/state` carries memory, disk, and ambient
+        // temperature leaves.
         paths.push(Path {
             elem: vec![
                 PathElem {
@@ -98,7 +100,7 @@ pub fn nvue_subscribe_paths(paths_config: &NvueGnmiPaths) -> Vec<Path> {
 }
 
 #[derive(Clone)]
-pub struct GnmiClient {
+pub(super) struct GnmiClient {
     switch_id: String,
     host: String,
     port: u16,
@@ -232,7 +234,7 @@ impl GnmiClient {
     }
 
     /// open a gNMI SAMPLE streaming subscription
-    pub async fn subscribe_sample(
+    pub(super) async fn subscribe_sample(
         &self,
         paths: &[Path],
         sample_interval_nanos: u64,
@@ -242,7 +244,9 @@ impl GnmiClient {
         let subscribe_request = build_sample_subscribe_request(paths, sample_interval_nanos);
 
         let auth = build_auth_metadata(&self.username, &self.password)?;
-        let stream = tokio_stream::once(subscribe_request);
+
+        let stream = tokio_stream::once(subscribe_request).chain(tokio_stream::pending());
+
         let request = Request::from_parts(auth, Extensions::default(), stream);
 
         let response = client
@@ -260,7 +264,7 @@ impl GnmiClient {
     }
 
     /// open a gNMI ON_CHANGE streaming subscription
-    pub async fn subscribe_on_change(
+    pub(super) async fn subscribe_on_change(
         &self,
         prefix: &Path,
         paths: &[Path],
@@ -270,7 +274,9 @@ impl GnmiClient {
         let subscribe_request = build_on_change_subscribe_request(prefix, paths);
 
         let auth = build_auth_metadata(&self.username, &self.password)?;
-        let stream = tokio_stream::once(subscribe_request);
+
+        let stream = tokio_stream::once(subscribe_request).chain(tokio_stream::pending());
+
         let request = Request::from_parts(auth, Extensions::default(), stream);
 
         let response = client
@@ -380,7 +386,7 @@ fn build_auth_metadata(
 /// Extract a string from a `TypedValue`, handling JSON-encoded bytes as well
 /// as native string values.
 #[allow(deprecated)]
-pub fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
+pub(super) fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
     use proto::typed_value::Value;
     match &val.value {
         Some(Value::StringVal(s)) => Some(s.clone()),
@@ -402,7 +408,7 @@ pub fn typed_value_to_string(val: &proto::TypedValue) -> Option<String> {
 /// Extract a float from a `TypedValue`, handling JSON-encoded bytes, native
 /// numeric values, and string representations.
 #[allow(deprecated)]
-pub fn typed_value_to_f64(val: &proto::TypedValue) -> Option<f64> {
+pub(super) fn typed_value_to_f64(val: &proto::TypedValue) -> Option<f64> {
     use proto::typed_value::Value;
     match &val.value {
         Some(Value::DoubleVal(v)) => Some(*v),

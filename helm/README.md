@@ -74,12 +74,67 @@ Top-level `global:` values are automatically passed to all subcharts.
 | `global.spiffe.trustDomain` | SPIFFE trust domain for mTLS | `nico.local` |
 | `global.labels` | Common labels applied to all resources | See `values.yaml` |
 
+### NVSwitch mTLS Certificates
+
+`nico-api.nvSwitchTls` can ask cert-manager to issue NICo's dedicated NMX-C
+client identity and, optionally, the NVSwitch server identity. Both leaves
+use the existing `nvSwitchTls.issuerRef`, which defaults to
+`vault-nico-issuer`. NMX-C/NVUE must trust the CA behind that issuer when NICo
+connects, and NICo uses the CA returned in its client Secret to verify the
+server certificate presented by the switch.
+
+The profiles are deliberately fixed to the capabilities each peer needs:
+
+- `nicoClient` uses `digital signature` and `client auth`. Its Secret is
+  mounted read-only in the nico-api container as `tls.crt`, `tls.key`, and
+  `ca.crt`.
+- `switchServer` uses `digital signature`, `server auth`, and `client auth`.
+  Its Secret is created in the NICo namespace but is never mounted into
+  nico-api. A switch installer or operator must copy the certificate, private
+  key, and CA to NMX-C/NVUE and bind them there.
+
+Both profiles are off by default. Enable `switchServer` only when this Helm
+release should own the server artifact. Configure `dnsNames` or `ipAddresses`,
+as appropriate, with a SAN that exactly matches `nmx_c_tls_authority` in the
+NICo site configuration.
+
+```yaml
+nico-api:
+  nvSwitchTls:
+    issuerRef:
+      kind: ClusterIssuer
+      name: vault-nico-issuer
+      group: cert-manager.io
+    nicoClient:
+      enabled: true
+      uris:
+        - spiffe://switch.local/nico-system/sa/nico-nmxc
+    switchServer:
+      enabled: true
+      dnsNames:
+        - nmxc.example.internal
+
+  siteConfig:
+    enabled: true
+    nicoApiSiteConfig: |
+      [nvlink_config]
+      enabled = true
+      nmx_c_tls_ca_cert_path = "/var/run/secrets/nvswitch-client/ca.crt"
+      nmx_c_tls_client_cert_path = "/var/run/secrets/nvswitch-client/tls.crt"
+      nmx_c_tls_client_key_path = "/var/run/secrets/nvswitch-client/tls.key"
+      nmx_c_tls_authority = "nmxc.example.internal"
+```
+
+The configured issuer and any cert-manager approver policy must allow both
+requested URI/DNS identities, durations, key profile, and usages. Creating the
+Kubernetes Secret does not install or bind the server identity on a switch.
+
 ### Grafana Dashboards
 
 The chart packages three dashboards built from NICo's exported Prometheus
 metrics: a site overview, object lifecycle diagnostics, and API performance.
 They are disabled by default because this chart does not install Grafana.
-The source JSON files live in [`dashboards/`](./dashboards/) and can also be
+The source JSON files live in [`observability/dashboards/`](./observability/dashboards/) and can also be
 imported into Grafana directly.
 
 To expose the dashboards to a Grafana dashboard sidecar in the release
@@ -298,6 +353,114 @@ helm diff upgrade nico ./helm \
   --namespace forge-system \
   -f values-production.yaml
 ```
+
+### Upgrading from pre-2.0.0 (carbide/forge naming)
+
+Starting with v2.0.0 the chart defaults changed from the legacy `carbide`/`forge` naming
+to `nico`. A **fresh install** works out of the box with no overrides — all default service
+names, SPIFFE identities, and trust domains are already `nico`-prefixed.
+
+> **Cutting over to nico naming on an existing site:** if you want to fully migrate an
+> existing site from `carbide`/`forge` naming to `nico` naming rather than preserving the
+> old names in-place, the safe procedure is:
+>
+> 1. Back up the PostgreSQL database (`pg_dump`).
+> 2. Uninstall the current release (`helm uninstall nico -n forge-system`).
+> 3. Re-install from scratch with the new defaults and your target namespace
+>    (`helm upgrade --install nico ./helm -n nico-system --create-namespace -f values-production.yaml`).
+> 4. Restore the database into the new cluster (`pg_restore`).
+>
+> This is necessary because Kubernetes Services, Certificates, and SPIFFE identities cannot
+> be renamed in-place without a coordinated restart of every component and re-issuance of
+> every DPU agent certificate. A backup/restore avoids that coordination.
+
+A site **upgrading from a pre-2.0.0 release** that wants to keep the old names running
+without a full cut-over needs to preserve the old names so that
+running DPU agents (which have certificates issued under `forge.local` and dial
+`carbide-api.forge-system`) keep working without a coordinated cut-over. Add the following
+block to your site values file (in addition to your normal site-specific overrides):
+
+```yaml
+# Preserves pre-2.0.0 carbide/forge naming across the upgrade.
+# Safe to remove once every DPU agent on the site has been re-issued a certificate
+# under nico.local and updated to the new binary that dials nico-api.
+global:
+  spiffe:
+    trustDomain: forge.local   # existing certs were issued under forge.local
+
+nico-api:
+  nameOverride: carbide-api
+  certificate:
+    identityNamespace: forge-system
+  auth:
+    namespace: forge-system    # accept /forge-system/sa/ and /forge-system/machine/ SPIFFE paths
+    principals:
+      dhcp: carbide-dhcp
+      dns: carbide-dns
+
+nico-bmc-proxy:
+  nameOverride: carbide-bmc-proxy
+  certificate:
+    identityNamespace: forge-system
+  auth:
+    namespace: forge-system
+    apiPrincipal: carbide-api
+
+nico-dhcp:
+  nameOverride: carbide-dhcp
+  apiServiceName: carbide-api
+  certificate:
+    identityNamespace: forge-system
+
+nico-dns:
+  nameOverride: carbide-dns
+  apiServiceName: carbide-api
+  certificate:
+    identityNamespace: forge-system
+
+nico-dsx-exchange-consumer:
+  nameOverride: carbide-dsx-exchange-consumer
+  certificate:
+    identityNamespace: forge-system
+
+nico-hardware-health:
+  nameOverride: carbide-hardware-health
+  certificate:
+    identityNamespace: forge-system
+
+nico-pxe:
+  nameOverride: carbide-pxe
+  apiServiceName: carbide-api
+  certificate:
+    identityNamespace: forge-system
+
+nico-ssh-console-rs:
+  nameOverride: carbide-ssh-console-rs
+  apiServiceName: carbide-api
+  certificate:
+    identityNamespace: forge-system
+```
+
+This is also available as a ready-to-use overlay at
+[`examples/carbide-legacy.yaml`](./examples/carbide-legacy.yaml).
+
+**Why each block matters:**
+
+- `global.spiffe.trustDomain: forge.local` — all existing DPU agent and service certificates
+  were issued under this trust domain. Changing it before reissuing every cert breaks mTLS
+  cluster-wide.
+- `nameOverride: carbide-*` — keeps each Kubernetes Service name stable so existing clients
+  find the service. Without this, `helm upgrade` deletes `carbide-api` and creates `nico-api`,
+  causing an outage window and breaking any client that cached the old DNS name.
+- `certificate.identityNamespace: forge-system` — keeps the SPIFFE URI of each service
+  consistent with what Vault and peer services expect (e.g.
+  `spiffe://forge.local/forge-system/sa/carbide-api`).
+- `auth.namespace: forge-system` — tells `nico-api` to accept SPIFFE IDs whose path contains
+  `/forge-system/`, which is what pre-2.0.0 client certificates present.
+- `apiServiceName: carbide-api` — tells `nico-pxe`, `nico-dhcp`, `nico-dns`, and
+  `nico-ssh-console-rs` to dial `carbide-api` (the name the Service has after `nameOverride`),
+  rather than the new default `nico-api`. Without this, those services build a URL pointing at
+  a Service that does not exist.
 
 ## Uninstalling
 

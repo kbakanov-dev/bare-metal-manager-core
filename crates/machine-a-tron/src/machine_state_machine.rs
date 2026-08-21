@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
@@ -24,12 +24,13 @@ use std::time::Duration;
 use bmc_mock::injection::InjectionStore;
 use bmc_mock::ipmi_sim::IpmiEndpoint;
 use bmc_mock::{
-    BmcCommand, BmcState, BootOptionKind, Callbacks, HostHardwareType, HostnameQuerying,
-    MachineInfo, MockPowerState, POWER_CYCLE_DELAY, SetSystemPowerError, SetSystemPowerResult,
+    BmcCommand, BmcEvent, BmcState, BootOptionKind, Callbacks, HostnameQuerying, MachineInfo,
+    MockPowerState, POWER_CYCLE_DELAY, SetSystemPowerError, SetSystemPowerResult,
     SystemPowerControl,
 };
 use carbide_network::virtualization::build_dual_stack_list;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{MachineId, MachineInterfaceId};
+use rand::RngExt;
 use rpc::forge::{MachineArchitecture, MachineDiscoveryResult, ManagedHostNetworkConfigResponse};
 use rpc::forge_agent_control_response::Action;
 use serde::{Deserialize, Serialize};
@@ -47,21 +48,121 @@ use crate::dhcp_wrapper::{
 use crate::machine_fsm::{Action as FsmAction, DhcpType, Event, MachineFsm, Timer};
 use crate::machine_state_machine::MachineStateError::MissingMachineId;
 use crate::machine_utils::{
-    PxeError, PxeResponse, forge_agent_control, get_validation_id, send_pxe_boot_request,
+    PxeBootTarget, PxeError, PxeResponse, forge_agent_control, get_validation_id,
+    send_pxe_boot_request,
 };
-use crate::{PersistedDpuMachine, PersistedHostMachine};
+use crate::{Guid, InfinibandPortState, PersistedDevice, PersistedDpuMachine};
 
-pub type DpuDhcpRelayHandle = oneshot::Sender<()>;
+type DpuDhcpRelayHandle = oneshot::Sender<()>;
+
+// RFC 2131 section 4.1's Ethernet example starts at four seconds, doubles to a
+// 64-second base, and adds uniform jitter from -1 through +1 second.
+const DHCP_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(4);
+const DHCP_RETRY_MAX_DELAY: Duration = Duration::from_secs(64);
+const DHCP_RETRY_JITTER_MILLIS: i64 = 1_000;
+
+fn dhcp_retry_delay(retry_attempt: u32, jitter_millis: i64) -> Duration {
+    assert!((-DHCP_RETRY_JITTER_MILLIS..=DHCP_RETRY_JITTER_MILLIS).contains(&jitter_millis));
+
+    let multiplier = 1_u32 << retry_attempt.min(4);
+    let base_delay = DHCP_RETRY_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(DHCP_RETRY_MAX_DELAY);
+    let delay_millis = i64::try_from(base_delay.as_millis()).expect("DHCP retry delay fits in i64")
+        + jitter_millis;
+    Duration::from_millis(u64::try_from(delay_millis).expect("DHCP retry delay is positive"))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DhcpRetryState {
+    attempt: u32,
+    deadline: Option<Instant>,
+}
+
+impl DhcpRetryState {
+    fn reset(&mut self) {
+        self.attempt = 0;
+        self.deadline = None;
+    }
+
+    // Determine how long a DHCP action needs to be parked in the queue
+    // without being re-attempted. Actions behind Dhcp(_) are also effectively
+    // blocked till the backoff expires.
+    fn remaining_backoff(&self, now: Instant) -> Option<Duration> {
+        let remaining = self.deadline?.saturating_duration_since(now);
+        (!remaining.is_zero()).then_some(remaining)
+    }
+
+    fn schedule_next(&mut self, now: Instant, jitter_millis: i64) -> Duration {
+        let retry_attempt = self.attempt;
+        self.attempt = self.attempt.saturating_add(1);
+        let retry_delay = dhcp_retry_delay(retry_attempt, jitter_millis);
+        self.deadline = Some(now + retry_delay);
+        retry_delay
+    }
+}
+
+/// Abandon queued work for the current boot when the machine powers off or
+/// cycles. A retrying in-band action would otherwise block the power-change
+/// cleanup and timer queued behind it.
+///
+/// BMC initialization remains valid because the BMC stays powered independently
+/// of the machine. Preserve an existing power-off cleanup in case another power
+/// change arrives before that action runs.
+fn abandon_machine_actions_on_power_change(
+    actions: &mut VecDeque<FsmAction>,
+    dhcp_retry: &mut DhcpRetryState,
+) {
+    let abandoned_machine_dhcp = actions
+        .iter()
+        .any(|action| matches!(action, FsmAction::Dhcp(DhcpType::Machine)));
+
+    actions.retain(|action| match action {
+        FsmAction::SetupBmc | FsmAction::Dhcp(DhcpType::Bmc) | FsmAction::CleanupOnPowerOff => true,
+        FsmAction::SetTimer(
+            Timer::PowerCycle
+            | Timer::MachineOn
+            | Timer::ScoutAgentControlPoll
+            | Timer::DpuAgentControlPoll,
+        )
+        | FsmAction::Dhcp(DhcpType::Machine)
+        | FsmAction::PxeBootRequest
+        | FsmAction::InitialDiscoveryRequest(_)
+        | FsmAction::AgentControlRequest(_)
+        | FsmAction::DpuAgentNetworkObservation
+        | FsmAction::BmcEvent(BmcEvent::PowerOn | BmcEvent::BootCompleted) => false,
+    });
+
+    if abandoned_machine_dhcp {
+        dhcp_retry.reset();
+    }
+}
 
 fn direct_dhcp_relay_address(
     is_host: bool,
-    admin_relay_address: Ipv4Addr,
+    underlay_relay_address: Ipv4Addr,
     host_inband_relay_address: Option<Ipv4Addr>,
 ) -> Ipv4Addr {
     if is_host {
-        host_inband_relay_address.unwrap_or(admin_relay_address)
+        host_inband_relay_address.unwrap_or(underlay_relay_address)
     } else {
-        admin_relay_address
+        underlay_relay_address
+    }
+}
+
+fn resolve_pxe_boot(
+    pxe_response: PxeResponse,
+    installed_os: OsImage,
+) -> Result<(OsImage, Option<MachineInterfaceId>), MachineStateError> {
+    let os_image = match pxe_response.boot_target {
+        PxeBootTarget::Exit => installed_os,
+        PxeBootTarget::Scout => OsImage::Scout,
+        PxeBootTarget::DpuAgent => OsImage::DpuAgent,
+    };
+
+    match pxe_response.machine_interface_id {
+        None if os_image != OsImage::None => Err(MachineStateError::MissingInterfaceId),
+        machine_interface_id => Ok((os_image, machine_interface_id)),
     }
 }
 
@@ -69,10 +170,10 @@ fn direct_dhcp_relay_address(
 ///
 /// This code is in common between DPUs and Hosts.(ie. anything that has a BMC, boots via DHCP, can
 /// receive PXE instructions, etc.)
-pub struct MachineStateMachine {
-    pub live_state: Arc<RwLock<LiveState>>,
-    pub mat_host_id: Uuid,
-    pub installed_os: OsImage,
+pub(super) struct MachineStateMachine {
+    pub(super) live_state: Arc<RwLock<LiveState>>,
+    pub(super) mat_host_id: Uuid,
+    pub(super) installed_os: OsImage,
 
     fsm: MachineFsm,
     bmc_mock: Option<Arc<BmcMockWrapperHandle>>,
@@ -83,6 +184,8 @@ pub struct MachineStateMachine {
     agent_polling_deadline: Option<(Instant, Timer)>,
     bmc_dhcp_info: Option<DhcpResponseInfo>,
     machine_dhcp_info: Option<DhcpResponseInfo>,
+    machine_interface_id: Option<MachineInterfaceId>,
+    dhcp_retry: DhcpRetryState,
     machine_discovery_result: Option<MachineDiscoveryResult>,
 
     actions: VecDeque<FsmAction>,
@@ -95,13 +198,13 @@ pub struct MachineStateMachine {
 }
 
 #[derive(Debug, Clone)]
-pub struct LiveStateCallbacks {
+struct LiveStateCallbacks {
     state: Arc<RwLock<LiveState>>,
     command_channel: mpsc::UnboundedSender<BmcCommand>,
 }
 
 impl LiveStateCallbacks {
-    pub fn new(
+    fn new(
         state: Arc<RwLock<LiveState>>,
         command_channel: mpsc::UnboundedSender<BmcCommand>,
     ) -> Self {
@@ -137,7 +240,7 @@ impl Callbacks for LiveStateCallbacks {
 }
 
 #[derive(Debug, Clone)]
-pub struct LiveStateHostnameQuery(pub Arc<RwLock<LiveState>>);
+struct LiveStateHostnameQuery(Arc<RwLock<LiveState>>);
 
 impl HostnameQuerying for LiveStateHostnameQuery {
     fn get_hostname(&'_ self) -> Cow<'_, str> {
@@ -154,24 +257,29 @@ impl HostnameQuerying for LiveStateHostnameQuery {
 /// Represents state which changes over time with this machine. This is kept in an `Arc<RwLock>` so
 /// that callers can query it at any time. It is updated after every state transition.
 #[derive(Debug)]
-pub struct LiveState {
-    pub is_up: bool,
-    pub power_state: MockPowerState, // reflects the "desired" power state of the machine. Affects whether next_state will boot the machine or not.
-    pub observed_machine_id: Option<MachineId>,
-    pub machine_ip: Option<Ipv4Addr>,
-    pub bmc_ip: Option<Ipv4Addr>,
-    pub ipmi_endpoint: Option<IpmiEndpoint>,
-    pub booted_os: MaybeOsImage,
-    pub next_boot_kind: Option<BootOptionKind>,
-    pub installed_os: OsImage,
-    pub state_string: Option<&'static str>,
-    pub api_state: String,
-    pub tpm_ek_certificate: Option<Vec<u8>>,
-    pub ssh_host_key: Option<String>,
+pub(super) struct LiveState {
+    pub(super) is_up: bool,
+    pub(super) power_state: MockPowerState, // reflects the "desired" power state of the machine. Affects whether next_state will boot the machine or not.
+    pub(super) observed_machine_id: Option<MachineId>,
+    pub(super) machine_ip: Option<Ipv4Addr>,
+    pub(super) bmc_ip: Option<Ipv4Addr>,
+    pub(super) ipmi_endpoint: Option<IpmiEndpoint>,
+    pub(super) booted_os: MaybeOsImage,
+    pub(super) next_boot_kind: Option<BootOptionKind>,
+    pub(super) installed_os: OsImage,
+    pub(super) state_string: Option<&'static str>,
+    pub(super) api_state: String,
+    pub(super) tpm_ek_certificate: Option<Vec<u8>>,
+    pub(super) ssh_host_key: Option<String>,
+    pub(super) infiniband_port_states: HashMap<Guid, InfinibandPortState>,
     /// For a DPU machine, whether its BlueField has flipped to NIC mode. Lets the
     /// owning host observe the flip through the DPU handle and converge (detach
     /// its DPU DHCP relay). Always false for a host machine.
-    pub dpu_flipped_to_nic_mode: bool,
+    pub(super) dpu_flipped_to_nic_mode: bool,
+    /// Current host firmware inventory, updated on each power-on after staged
+    /// firmware is applied.  Used by `persisted()` so restarts resume from the
+    /// last observed versions rather than the operator-configured starting point.
+    pub(super) active_host_firmware: Option<bmc_mock::HostFirmwareVersions>,
 }
 
 impl Default for LiveState {
@@ -191,13 +299,39 @@ impl Default for LiveState {
             api_state: "Unknown".to_string(),
             tpm_ek_certificate: None,
             ssh_host_key: None,
+            infiniband_port_states: HashMap::new(),
             dpu_flipped_to_nic_mode: false,
+            active_host_firmware: None,
         }
     }
 }
 
 impl LiveState {
-    pub fn ui_next_boot_kind(&self) -> &'static str {
+    fn for_machine(
+        machine_info: &MachineInfo,
+        power_state: MockPowerState,
+        tpm_ek_certificate: Option<Vec<u8>>,
+    ) -> Self {
+        let infiniband_port_states = match machine_info {
+            MachineInfo::Host(host) => host
+                .infiniband_port_guids()
+                .into_iter()
+                .map(|guid| {
+                    let bytes: [u8; 8] = guid.into();
+                    (Guid::from(bytes), InfinibandPortState::Active)
+                })
+                .collect(),
+            MachineInfo::Dpu(_) => HashMap::new(),
+        };
+        Self {
+            power_state,
+            tpm_ek_certificate,
+            infiniband_port_states,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn ui_next_boot_kind(&self) -> &'static str {
         match self.next_boot_kind {
             Some(BootOptionKind::Disk) => "Disk",
             Some(BootOptionKind::Network) => "Network",
@@ -223,13 +357,13 @@ pub enum BmcRegistrationMode {
     None(u16),
 }
 
-pub enum PersistedMachine {
-    Host(PersistedHostMachine),
+pub(super) enum PersistedMachine {
+    Host(PersistedDevice),
     Dpu(PersistedDpuMachine),
 }
 
 impl MachineStateMachine {
-    pub fn from_persisted(
+    pub(super) fn from_persisted(
         persisted_machine: PersistedMachine,
         machine_info: MachineInfo,
         config: Arc<MachineConfig>,
@@ -254,13 +388,15 @@ impl MachineStateMachine {
             agent_polling_deadline: None,
             bmc_dhcp_info: None,
             machine_dhcp_info: None,
+            machine_interface_id: None,
+            dhcp_retry: DhcpRetryState::default(),
             machine_discovery_result: None,
             installed_os: initial_os_image,
-            live_state: Arc::new(RwLock::new(LiveState {
-                power_state: MockPowerState::On,
+            live_state: Arc::new(RwLock::new(LiveState::for_machine(
+                &machine_info,
+                MockPowerState::On,
                 tpm_ek_certificate,
-                ..Default::default()
-            })),
+            ))),
             machine_info,
             bmc_command_channel,
             config,
@@ -271,7 +407,7 @@ impl MachineStateMachine {
         }
     }
 
-    pub fn new(
+    pub(super) fn new(
         machine_info: MachineInfo,
         config: Arc<MachineConfig>,
         app_context: Arc<MachineATronContext>,
@@ -282,11 +418,11 @@ impl MachineStateMachine {
     ) -> MachineStateMachine {
         let (fsm, actions) = MachineFsm::init(false, Self::is_bmc_only(&machine_info, &config));
         MachineStateMachine {
-            live_state: Arc::new(RwLock::new(LiveState {
-                power_state: MockPowerState::Off,
+            live_state: Arc::new(RwLock::new(LiveState::for_machine(
+                &machine_info,
+                MockPowerState::Off,
                 tpm_ek_certificate,
-                ..Default::default()
-            })),
+            ))),
             fsm,
             actions: actions.into_iter().collect(),
             bmc_dhcp_info: None,
@@ -294,6 +430,8 @@ impl MachineStateMachine {
             bmc_state: None,
             bmc_injection: Arc::new(InjectionStore::new()),
             machine_dhcp_info: None,
+            machine_interface_id: None,
+            dhcp_retry: DhcpRetryState::default(),
             machine_discovery_result: None,
             machine_on_deadline: None,
             agent_polling_deadline: None,
@@ -309,7 +447,7 @@ impl MachineStateMachine {
         }
     }
 
-    pub async fn advance(&mut self) -> Duration {
+    pub(super) async fn advance(&mut self) -> Duration {
         if let Some(duration) = self.process_actions().await {
             duration
         } else {
@@ -350,9 +488,14 @@ impl MachineStateMachine {
         }
     }
 
-    pub async fn process_actions(&mut self) -> Option<Duration> {
+    async fn process_actions(&mut self) -> Option<Duration> {
         while let Some(action) = self.actions.front() {
             self.update_live_state();
+            if matches!(action, FsmAction::Dhcp(_))
+                && let Some(remaining) = self.dhcp_retry.remaining_backoff(Instant::now())
+            {
+                return Some(remaining);
+            }
             match action {
                 FsmAction::SetupBmc => match self.setup_bmc().await {
                     Ok((bmc_mock, bmc_state)) => {
@@ -391,21 +534,25 @@ impl MachineStateMachine {
                 FsmAction::Dhcp(DhcpType::Bmc) => match self.bmc_dhcp_discovery().await {
                     Ok(bmc_dhcp_info) => {
                         self.bmc_dhcp_info = Some(bmc_dhcp_info);
+                        self.dhcp_retry.reset();
                         self.actions.pop_front();
                         self.fsm_event(Event::DhcpComplete(DhcpType::Bmc))
                     }
-                    Err(_) => return Some(self.config.run_interval_working),
+                    Err(_) => return Some(self.next_dhcp_retry_delay(DhcpType::Bmc)),
                 },
                 FsmAction::Dhcp(DhcpType::Machine) => match self.machine_dhcp_discovery().await {
                     Ok(machine_dhcp_info) => {
+                        self.machine_interface_id = None;
                         self.machine_dhcp_info = Some(machine_dhcp_info);
+                        self.dhcp_retry.reset();
                         self.actions.pop_front();
                         self.fsm_event(Event::DhcpComplete(DhcpType::Machine))
                     }
-                    Err(_) => return Some(self.config.run_interval_working),
+                    Err(_) => return Some(self.next_dhcp_retry_delay(DhcpType::Machine)),
                 },
                 FsmAction::PxeBootRequest => match self.pxe_boot_request().await {
-                    Ok(os_image) => {
+                    Ok((os_image, machine_interface_id)) => {
+                        self.machine_interface_id = machine_interface_id;
                         // A netbooted DPU-agent image is this simulation's stand-in
                         // for the DPF BFB install writing the OS to the DPU's disk,
                         // so record it as installed at boot. NICo's PXE serves a DPU
@@ -454,6 +601,7 @@ impl MachineStateMachine {
                         self.machine_on_deadline = None;
                         self.power_cycle_deadline = None;
                         self.agent_polling_deadline = None;
+                        self.dhcp_retry.reset();
                         // Let the FSM own the transition: it is returned by `event()`,
                         // not assigned here.
                         self.fsm_event(Event::DpuFlippedToNicMode);
@@ -471,7 +619,7 @@ impl MachineStateMachine {
                             self.actions.pop_front();
                             self.fsm_event(Event::InitialDiscoveryCompleted)
                         }
-                        Err(_) => return Some(self.config.run_interval_working),
+                        Err(_) => return Some(self.config.discovery_retry_interval),
                     }
                 }
                 FsmAction::AgentControlRequest(os_image) => {
@@ -507,6 +655,7 @@ impl MachineStateMachine {
                 }
                 FsmAction::CleanupOnPowerOff => {
                     self.actions.pop_front();
+                    self.machine_interface_id = None;
                     self.machine_discovery_result = None;
                     self.dpu_dhcp_relay_handle = None;
                 }
@@ -516,7 +665,29 @@ impl MachineStateMachine {
         None
     }
 
+    fn next_dhcp_retry_delay(&mut self, dhcp_type: DhcpType) -> Duration {
+        let retry_attempt = self.dhcp_retry.attempt;
+        let jitter_millis =
+            rand::rng().random_range(-DHCP_RETRY_JITTER_MILLIS..=DHCP_RETRY_JITTER_MILLIS);
+        let retry_delay = self.dhcp_retry.schedule_next(Instant::now(), jitter_millis);
+        tracing::debug!(
+            ?dhcp_type,
+            retry_attempt,
+            retry_delay_milliseconds = retry_delay.as_millis(),
+            "scheduled DHCP retry"
+        );
+        retry_delay
+    }
+
     fn fsm_event(&mut self, event: Event) {
+        if matches!(event, Event::PowerCycle | Event::PowerOff) {
+            abandon_machine_actions_on_power_change(&mut self.actions, &mut self.dhcp_retry);
+
+            self.machine_on_deadline = None;
+            self.power_cycle_deadline = None;
+            self.agent_polling_deadline = None;
+        }
+
         let old_state = self.fsm;
         let (new_state, actions) = self.fsm.event(event);
         tracing::info!(previous_state = ?old_state, ?event, next_state = ?new_state, ?actions, "machine FSM step");
@@ -541,7 +712,7 @@ impl MachineStateMachine {
             .dhcp_client
             .request_ip(DhcpRequestInfo {
                 mac_address: self.machine_info.bmc_mac_address(),
-                relay_address: self.config.oob_dhcp_relay_address,
+                relay_address: self.config.bmc_dhcp_relay_address,
                 vendor_class: vendor_class(&self.machine_info, DhcpRequester::Bmc),
             })
             .await
@@ -606,7 +777,7 @@ impl MachineStateMachine {
         } else {
             let direct_relay_address = direct_dhcp_relay_address(
                 matches!(&self.machine_info, MachineInfo::Host(_)),
-                self.config.admin_dhcp_relay_address,
+                self.config.underlay_dhcp_relay_address,
                 self.config.host_inband_dhcp_relay_address,
             );
             tracing::debug!(
@@ -642,9 +813,11 @@ impl MachineStateMachine {
             })
     }
 
-    async fn pxe_boot_request(&self) -> Result<OsImage, MachineStateError> {
+    async fn pxe_boot_request(
+        &self,
+    ) -> Result<(OsImage, Option<MachineInterfaceId>), MachineStateError> {
         let Some(dhcp_info) = self.machine_dhcp_info.as_ref() else {
-            return Err(MachineStateError::MissingInterfaceId);
+            return Err(MachineStateError::NoMachineDhcpInfo);
         };
 
         let (architecture, product) = match self.machine_info {
@@ -666,36 +839,19 @@ impl MachineStateMachine {
         )
         .await?;
 
-        let os = match pxe_response {
-            PxeResponse::Exit => self.installed_os,
-            PxeResponse::Scout => OsImage::Scout,
-            PxeResponse::DpuAgent => OsImage::DpuAgent,
-        };
-        match os {
-            OsImage::None => Ok(os),
-            OsImage::DpuAgent => {
-                if matches!(self.machine_info, MachineInfo::Host(_)) {
-                    Err(MachineStateError::WrongOsForMachine(
-                        "ERROR: Running DpuAgent OS on a host machine, this should not happen."
-                            .to_string(),
-                    ))
-                } else {
-                    Ok(os)
-                }
+        let (os, machine_interface_id) = resolve_pxe_boot(pxe_response, self.installed_os)?;
+
+        match (&self.machine_info, os) {
+            (MachineInfo::Host(_), OsImage::DpuAgent) => Err(MachineStateError::WrongOsForMachine(
+                "ERROR: Running DpuAgent OS on a host machine, this should not happen.".to_string(),
+            )),
+            (MachineInfo::Dpu(_), OsImage::Scout) => {
+                tracing::warn!("ERROR: Running Scout OS on a DPU machine, this should not happen.");
+                Err(MachineStateError::WrongOsForMachine(
+                    "ERROR: Running Scout OS on a DPU machine, this should not happen.".to_string(),
+                ))
             }
-            OsImage::Scout => {
-                if matches!(self.machine_info, MachineInfo::Dpu(_)) {
-                    tracing::warn!(
-                        "ERROR: Running Scout OS on a DPU machine, this should not happen."
-                    );
-                    Err(MachineStateError::WrongOsForMachine(
-                        "ERROR: Running Scout OS on a DPU machine, this should not happen."
-                            .to_string(),
-                    ))
-                } else {
-                    Ok(os)
-                }
-            }
+            _ => Ok((os, machine_interface_id)),
         }
     }
 
@@ -703,12 +859,12 @@ impl MachineStateMachine {
         &self,
         os_image: OsImage,
     ) -> Result<Option<MachineDiscoveryResult>, MachineStateError> {
-        let Some(machine_dhcp_info) = self.machine_dhcp_info.as_ref() else {
+        if self.machine_dhcp_info.is_none() {
             return Err(MachineStateError::NoMachineDhcpInfo);
-        };
+        }
         // No machine_discovery_result means we just booted. Run discovery now.
         tracing::trace!("Running initial discovery after boot");
-        match self.run_machine_discovery(machine_dhcp_info).await {
+        match self.run_machine_discovery().await {
             Ok(result) => {
                 if os_image == OsImage::Scout {
                     let machine_id = result.machine_id.as_ref().ok_or(MissingMachineId)?;
@@ -799,7 +955,7 @@ impl MachineStateMachine {
         }
         Ok(())
     }
-    pub async fn dpu_agent_network_observation(
+    async fn dpu_agent_network_observation(
         &self,
     ) -> Result<Option<DpuDhcpRelayHandle>, MachineStateError> {
         let machine_id = self
@@ -841,7 +997,7 @@ impl MachineStateMachine {
         }
     }
 
-    pub fn update_live_state(&self) {
+    pub(super) fn update_live_state(&self) {
         let mut live_state = self.live_state.write().unwrap();
         live_state.is_up = self.fsm.is_up();
         live_state.machine_ip = self.machine_ip();
@@ -869,20 +1025,54 @@ impl MachineStateMachine {
                 .as_ref()
                 .and_then(|state| state.bluefield_nic_mode())
                 .unwrap_or(false);
+        live_state.active_host_firmware = self.current_host_firmware();
     }
 
     /// Whether this machine still relays its data-plane DHCP through a managed
     /// DPU. False once the relay is detached (see `detach_dpu_dhcp_relay`) or for
     /// a host that never had a managed DPU.
-    pub fn has_dpu_dhcp_relay(&self) -> bool {
+    pub(super) fn has_dpu_dhcp_relay(&self) -> bool {
         self.dpu_dhcp_relay.is_some()
+    }
+
+    /// Return the active host firmware versions from the live BMC mock inventory.
+    /// Returns `None` when the BMC mock has not started yet, or when this
+    /// platform has no host firmware simulation (inventory IDs are `None`).
+    pub(super) fn current_host_firmware(&self) -> Option<bmc_mock::HostFirmwareVersions> {
+        let bmc_state = self.bmc_state.as_ref()?;
+        // host_bmc_inventory_id is None for platforms without host firmware simulation
+        // (switches, power shelves, Dell R760+BF4, etc.).  Return None early so
+        // live_state.active_host_firmware stays None for those machines.
+        let bmc_id = bmc_state
+            .update_service_state
+            .host_bmc_inventory_id
+            .as_deref()?;
+        let uefi_id = bmc_state
+            .update_service_state
+            .host_uefi_inventory_id
+            .as_deref();
+        let bmc = bmc_state
+            .update_service_state
+            .find_firmware_inventory(bmc_id)
+            .and_then(|v| v["Version"].as_str().map(str::to_owned));
+        let uefi = uefi_id.and_then(|id| {
+            bmc_state
+                .update_service_state
+                .find_firmware_inventory(id)
+                .and_then(|v| v["Version"].as_str().map(str::to_owned))
+        });
+        if bmc.is_some() || uefi.is_some() {
+            Some(bmc_mock::HostFirmwareVersions { bmc, uefi })
+        } else {
+            None
+        }
     }
 
     /// Stop relaying data-plane DHCP through the DPU. Once a DPU flips to NIC
     /// mode it is a plain NIC, so the host DHCPs directly on its own (former-DPU
     /// host) MAC -- the same MAC, so a retained boot interface still matches on
     /// re-ingestion. Idempotent.
-    pub fn detach_dpu_dhcp_relay(&mut self) {
+    pub(super) fn detach_dpu_dhcp_relay(&mut self) {
         self.dpu_dhcp_relay = None;
         self.dpu_dhcp_relay_handle = None;
     }
@@ -894,7 +1084,7 @@ impl MachineStateMachine {
     /// host-facing MAC becomes the host's own plain-NIC MAC, so the host keeps
     /// DHCPing on the same MAC and a retained boot interface still matches.
     /// No-op for a non-host machine or a host that already has no DPUs.
-    pub fn drop_managed_dpus(&mut self) {
+    pub(super) fn drop_managed_dpus(&mut self) {
         if let MachineInfo::Host(host) = &mut self.machine_info {
             if host.dpus.is_empty() {
                 return;
@@ -916,11 +1106,8 @@ impl MachineStateMachine {
         }
     }
 
-    async fn run_machine_discovery(
-        &self,
-        machine_dhcp_info: &DhcpResponseInfo,
-    ) -> Result<MachineDiscoveryResult, MachineStateError> {
-        let Some(machine_interface_id) = machine_dhcp_info.interface_id else {
+    async fn run_machine_discovery(&self) -> Result<MachineDiscoveryResult, MachineStateError> {
+        let Some(machine_interface_id) = self.machine_interface_id else {
             return Err(MachineStateError::MissingInterfaceId);
         };
 
@@ -945,6 +1132,8 @@ impl MachineStateMachine {
         Ok(machine_discovery_result)
     }
 
+    // Machine-a-tron receives the compatibility fields from the agent-facing response.
+    #[allow(deprecated)]
     async fn send_network_status_observation(
         &self,
         machine_id: MachineId,
@@ -976,7 +1165,7 @@ impl MachineStateMachine {
                 mac_address: self.machine_info.host_mac_address().map(|a| a.to_string()),
                 addresses,
                 prefixes,
-                gateways: vec![iface.gateway.clone()],
+                gateways: build_dual_stack_list(iface.gateway.clone(), None),
                 network_security_group: None,
                 internal_uuid: None,
             }]
@@ -984,17 +1173,18 @@ impl MachineStateMachine {
             instance_network_config_version =
                 Some(network_config.instance_network_config_version.clone());
 
+            // Tenant status consumers pair addresses and prefixes positionally. A SLAAC
+            // interface has no concrete IPv6 address yet, so omit that family from both.
             for iface in network_config.tenant_interfaces.iter() {
-                let addresses = build_dual_stack_list(
-                    iface.ip.clone(),
-                    iface.ipv6_interface_config.as_ref().map(|v6| v6.ip.clone()),
-                );
+                let observed_ipv6 = iface
+                    .ipv6_interface_config
+                    .as_ref()
+                    .filter(|ipv6| !ipv6.ip.is_empty());
+                let addresses =
+                    build_dual_stack_list(iface.ip.clone(), observed_ipv6.map(|v6| v6.ip.clone()));
                 let prefixes = build_dual_stack_list(
                     iface.interface_prefix.clone(),
-                    iface
-                        .ipv6_interface_config
-                        .as_ref()
-                        .map(|v6| v6.interface_prefix.clone()),
+                    observed_ipv6.map(|v6| v6.interface_prefix.clone()),
                 );
                 interfaces.push(rpc::forge::InstanceInterfaceStatusObservation {
                     function_type: iface.function_type,
@@ -1002,7 +1192,7 @@ impl MachineStateMachine {
                     mac_address: self.machine_info.host_mac_address().map(|a| a.to_string()),
                     addresses,
                     prefixes,
-                    gateways: vec![iface.gateway.clone()],
+                    gateways: build_dual_stack_list(iface.gateway.clone(), None),
                     network_security_group: iface.network_security_group.as_ref().map(|s| {
                         rpc::forge::NetworkSecurityGroupStatus {
                             source: s.source,
@@ -1030,7 +1220,7 @@ impl MachineStateMachine {
         Ok(())
     }
 
-    pub fn set_system_power(&mut self, request: SystemPowerControl) -> SetSystemPowerResult {
+    pub(super) fn set_system_power(&mut self, request: SystemPowerControl) -> SetSystemPowerResult {
         use SystemPowerControl::*;
         match request {
             On | ForceOn => self.fsm_event(Event::PowerOn),
@@ -1046,17 +1236,17 @@ impl MachineStateMachine {
         Ok(())
     }
 
-    pub fn machine_id(&self) -> Option<MachineId> {
+    fn machine_id(&self) -> Option<MachineId> {
         self.machine_discovery_result
             .as_ref()
             .and_then(|result| result.machine_id)
     }
 
-    pub fn machine_ip(&self) -> Option<Ipv4Addr> {
+    fn machine_ip(&self) -> Option<Ipv4Addr> {
         self.machine_dhcp_info.as_ref().map(|v| v.ip_address)
     }
 
-    pub fn bmc_ip(&self) -> Option<Ipv4Addr> {
+    fn bmc_ip(&self) -> Option<Ipv4Addr> {
         self.bmc_dhcp_info.as_ref().map(|v| v.ip_address)
     }
 
@@ -1064,7 +1254,7 @@ impl MachineStateMachine {
         self.bmc_injection.clone()
     }
 
-    pub fn booted_os(&self) -> MaybeOsImage {
+    pub(super) fn booted_os(&self) -> MaybeOsImage {
         MaybeOsImage(self.fsm.booted_os())
     }
 
@@ -1085,7 +1275,6 @@ impl MachineStateMachine {
         );
 
         let pw_override = match &self.machine_info {
-            MachineInfo::Host(host) if host.hw_type == HostHardwareType::LiteOnPowerShelf => None,
             MachineInfo::Host(_) => self.app_context.app_config.host_bmc_password.as_deref(),
             MachineInfo::Dpu(_) => self.app_context.app_config.dpu_bmc_password.as_deref(),
         };
@@ -1138,11 +1327,7 @@ impl MachineStateMachine {
     fn is_bmc_only(info: &MachineInfo, config: &MachineConfig) -> bool {
         match info {
             MachineInfo::Dpu(_) => config.dpus_in_nic_mode,
-            MachineInfo::Host(host) => matches!(
-                host.hw_type,
-                bmc_mock::HostHardwareType::LiteOnPowerShelf
-                    | bmc_mock::HostHardwareType::NvidiaSwitchNd5200Ld
-            ),
+            MachineInfo::Host(_) => false,
         }
     }
 }
@@ -1177,7 +1362,7 @@ impl Display for OsImage {
 }
 
 #[derive(Debug, Default)]
-pub struct MaybeOsImage(pub Option<OsImage>);
+pub(super) struct MaybeOsImage(pub(super) Option<OsImage>);
 
 impl Display for MaybeOsImage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1189,7 +1374,7 @@ impl Display for MaybeOsImage {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum MachineStateError {
+pub(super) enum MachineStateError {
     #[error(
         "invalid machine state: missing interface_id for this machine in machine discovery results"
     )]
@@ -1233,7 +1418,7 @@ impl From<tonic::Status> for MachineStateError {
     }
 }
 #[derive(thiserror::Error, Debug)]
-pub enum AddressConfigError {
+pub(super) enum AddressConfigError {
     #[error("error running ip command: {0}")]
     Io(#[from] std::io::Error),
     #[error("error running ip command: {0:?}, output: {1:?}")]
@@ -1242,13 +1427,94 @@ pub enum AddressConfigError {
 
 #[cfg(test)]
 mod tests {
-    use carbide_test_support::{Check, check_values};
+    use carbide_test_support::Outcome::*;
+    use carbide_test_support::{Case, Check, check_cases, check_values};
 
     use super::*;
 
     #[test]
+    fn resolves_pxe_boot_identity_requirements() {
+        let machine_interface_id: MachineInterfaceId =
+            "0fd6e9a3-06fc-4a22-ad29-aca299677b00".parse().unwrap();
+
+        check_cases(
+            [
+                Case {
+                    scenario: "Scout netboot",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::Scout,
+                            machine_interface_id: Some(machine_interface_id),
+                        },
+                        OsImage::None,
+                    ),
+                    expect: Yields((OsImage::Scout, Some(machine_interface_id))),
+                },
+                Case {
+                    scenario: "DPU agent netboot",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::DpuAgent,
+                            machine_interface_id: Some(machine_interface_id),
+                        },
+                        OsImage::None,
+                    ),
+                    expect: Yields((OsImage::DpuAgent, Some(machine_interface_id))),
+                },
+                Case {
+                    scenario: "exit to installed Scout",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::Exit,
+                            machine_interface_id: Some(machine_interface_id),
+                        },
+                        OsImage::Scout,
+                    ),
+                    expect: Yields((OsImage::Scout, Some(machine_interface_id))),
+                },
+                Case {
+                    scenario: "unknown machine exits without an installed OS",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::Exit,
+                            machine_interface_id: None,
+                        },
+                        OsImage::None,
+                    ),
+                    expect: Yields((OsImage::None, None)),
+                },
+                Case {
+                    scenario: "Scout netboot without an interface ID",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::Scout,
+                            machine_interface_id: None,
+                        },
+                        OsImage::None,
+                    ),
+                    expect: Fails,
+                },
+                Case {
+                    scenario: "exit to installed Scout without an interface ID",
+                    input: (
+                        PxeResponse {
+                            boot_target: PxeBootTarget::Exit,
+                            machine_interface_id: None,
+                        },
+                        OsImage::Scout,
+                    ),
+                    expect: Fails,
+                },
+            ],
+            |(pxe_response, installed_os)| {
+                resolve_pxe_boot(pxe_response, installed_os).map_err(drop)
+            },
+        );
+    }
+
+    #[test]
     fn direct_dhcp_relay_selection() {
-        let admin = Ipv4Addr::new(172, 21, 0, 1);
+        let underlay = Ipv4Addr::new(172, 21, 0, 1);
         let host_inband = Ipv4Addr::new(172, 22, 0, 1);
 
         check_values(
@@ -1261,15 +1527,260 @@ mod tests {
                 Check {
                     scenario: "legacy host without HostInband configuration",
                     input: (true, None),
-                    expect: admin,
+                    expect: underlay,
                 },
                 Check {
                     scenario: "DPU ignores HostInband configuration",
                     input: (false, Some(host_inband)),
-                    expect: admin,
+                    expect: underlay,
                 },
             ],
-            |(is_host, host_inband)| direct_dhcp_relay_address(is_host, admin, host_inband),
+            |(is_host, host_inband)| direct_dhcp_relay_address(is_host, underlay, host_inband),
+        );
+    }
+
+    #[test]
+    fn dhcp_retry_delay_uses_rfc_2131_backoff() {
+        check_values(
+            [
+                Check {
+                    scenario: "first retry with minimum jitter",
+                    input: (0, -1_000),
+                    expect: Duration::from_secs(3),
+                },
+                Check {
+                    scenario: "first retry without jitter",
+                    input: (0, 0),
+                    expect: Duration::from_secs(4),
+                },
+                Check {
+                    scenario: "first retry with maximum jitter",
+                    input: (0, 1_000),
+                    expect: Duration::from_secs(5),
+                },
+                Check {
+                    scenario: "second retry doubles the base",
+                    input: (1, 0),
+                    expect: Duration::from_secs(8),
+                },
+                Check {
+                    scenario: "third retry doubles the base",
+                    input: (2, 0),
+                    expect: Duration::from_secs(16),
+                },
+                Check {
+                    scenario: "fourth retry doubles the base",
+                    input: (3, 0),
+                    expect: Duration::from_secs(32),
+                },
+                Check {
+                    scenario: "fifth retry reaches the cap",
+                    input: (4, 0),
+                    expect: Duration::from_secs(64),
+                },
+                Check {
+                    scenario: "later retry remains capped with minimum jitter",
+                    input: (u32::MAX, -1_000),
+                    expect: Duration::from_secs(63),
+                },
+                Check {
+                    scenario: "later retry remains capped with maximum jitter",
+                    input: (u32::MAX, 1_000),
+                    expect: Duration::from_secs(65),
+                },
+            ],
+            |(retry_attempt, jitter_millis)| dhcp_retry_delay(retry_attempt, jitter_millis),
+        );
+    }
+
+    #[test]
+    fn dhcp_retry_state_increments_and_resets() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Fail,
+            Reset,
+        }
+
+        check_values(
+            [
+                Check {
+                    scenario: "first failure uses attempt 0",
+                    input: &[Step::Fail][..],
+                    expect: (Duration::from_secs(4), 1),
+                },
+                Check {
+                    scenario: "consecutive failures advance the ladder",
+                    input: &[Step::Fail, Step::Fail, Step::Fail][..],
+                    expect: (Duration::from_secs(16), 3),
+                },
+                Check {
+                    scenario: "reset after failures restarts the ladder",
+                    input: &[Step::Fail, Step::Fail, Step::Reset, Step::Fail][..],
+                    expect: (Duration::from_secs(4), 1),
+                },
+                Check {
+                    scenario: "reset after a failure returns attempt to zero",
+                    input: &[Step::Fail, Step::Reset][..],
+                    expect: (Duration::ZERO, 0),
+                },
+            ],
+            |steps| {
+                let now = Instant::now();
+                let mut retry = DhcpRetryState::default();
+                let mut last_delay = Duration::ZERO;
+                for step in steps {
+                    match step {
+                        Step::Fail => last_delay = retry.schedule_next(now, 0),
+                        Step::Reset => {
+                            retry.reset();
+                            last_delay = Duration::ZERO;
+                        }
+                    }
+                }
+                (last_delay, retry.attempt)
+            },
+        );
+    }
+
+    #[test]
+    fn dhcp_retry_backoff_is_held_until_its_deadline() {
+        let scheduled_at = Instant::now();
+
+        check_values(
+            [
+                Check {
+                    scenario: "no retry scheduled yet",
+                    input: (0, Duration::ZERO),
+                    expect: None,
+                },
+                Check {
+                    scenario: "early wake-up while the backoff is pending",
+                    input: (1, Duration::from_secs(1)),
+                    expect: Some(Duration::from_secs(3)),
+                },
+                Check {
+                    scenario: "early wake-up on a later, longer rung",
+                    input: (3, Duration::from_secs(1)),
+                    expect: Some(Duration::from_secs(15)),
+                },
+                Check {
+                    scenario: "wake-up exactly at the deadline",
+                    input: (1, Duration::from_secs(4)),
+                    expect: None,
+                },
+                Check {
+                    scenario: "wake-up after the deadline",
+                    input: (1, Duration::from_secs(9)),
+                    expect: None,
+                },
+            ],
+            |(failures, elapsed)| {
+                let mut retry = DhcpRetryState::default();
+                for _ in 0..failures {
+                    retry.schedule_next(scheduled_at, 0);
+                }
+                retry.remaining_backoff(scheduled_at + elapsed)
+            },
+        );
+    }
+
+    /// What a power change leaves behind: the remaining action queue (rendered
+    /// through `Debug`, since `FsmAction` is not `PartialEq`), the retry ladder
+    /// position, and whether a retry deadline is still parked.
+    #[derive(Debug, Eq, PartialEq)]
+    struct PowerChangeOutcome {
+        remaining_actions: Vec<String>,
+        attempt: u32,
+        backoff_pending: bool,
+    }
+
+    fn outcome(actions: &VecDeque<FsmAction>, retry: &DhcpRetryState) -> PowerChangeOutcome {
+        PowerChangeOutcome {
+            remaining_actions: actions.iter().map(|action| format!("{action:?}")).collect(),
+            attempt: retry.attempt,
+            backoff_pending: retry.deadline.is_some(),
+        }
+    }
+
+    #[test]
+    fn power_change_abandons_queued_machine_actions() {
+        let queued = |actions: &[FsmAction]| VecDeque::from(actions.to_vec());
+
+        check_values(
+            [
+                Check {
+                    scenario: "failing machine DHCP no longer blocks power-off cleanup",
+                    input: (queued(&[FsmAction::Dhcp(DhcpType::Machine)]), 3),
+                    expect: PowerChangeOutcome {
+                        remaining_actions: vec![],
+                        attempt: 0,
+                        backoff_pending: false,
+                    },
+                },
+                Check {
+                    scenario: "in-band work from the previous boot is abandoned",
+                    input: (
+                        queued(&[
+                            FsmAction::SetupBmc,
+                            FsmAction::Dhcp(DhcpType::Machine),
+                            FsmAction::SetTimer(Timer::PowerCycle),
+                            FsmAction::SetTimer(Timer::MachineOn),
+                            FsmAction::SetTimer(Timer::ScoutAgentControlPoll),
+                            FsmAction::SetTimer(Timer::DpuAgentControlPoll),
+                            FsmAction::PxeBootRequest,
+                            FsmAction::InitialDiscoveryRequest(OsImage::Scout),
+                            FsmAction::AgentControlRequest(OsImage::Scout),
+                            FsmAction::DpuAgentNetworkObservation,
+                            FsmAction::BmcEvent(BmcEvent::PowerOn),
+                            FsmAction::BmcEvent(BmcEvent::BootCompleted),
+                            FsmAction::CleanupOnPowerOff,
+                        ]),
+                        1,
+                    ),
+                    expect: PowerChangeOutcome {
+                        remaining_actions: vec![
+                            format!("{:?}", FsmAction::SetupBmc),
+                            format!("{:?}", FsmAction::CleanupOnPowerOff),
+                        ],
+                        attempt: 0,
+                        backoff_pending: false,
+                    },
+                },
+                Check {
+                    scenario: "out-of-band BMC DHCP keeps its backoff across a power change",
+                    input: (queued(&[FsmAction::Dhcp(DhcpType::Bmc)]), 2),
+                    expect: PowerChangeOutcome {
+                        remaining_actions: vec![format!("{:?}", FsmAction::Dhcp(DhcpType::Bmc))],
+                        attempt: 2,
+                        backoff_pending: true,
+                    },
+                },
+                Check {
+                    scenario: "power change without queued in-band work changes nothing",
+                    input: (
+                        queued(&[FsmAction::SetupBmc, FsmAction::CleanupOnPowerOff]),
+                        0,
+                    ),
+                    expect: PowerChangeOutcome {
+                        remaining_actions: vec![
+                            format!("{:?}", FsmAction::SetupBmc),
+                            format!("{:?}", FsmAction::CleanupOnPowerOff),
+                        ],
+                        attempt: 0,
+                        backoff_pending: false,
+                    },
+                },
+            ],
+            |(mut actions, failures)| {
+                let now = Instant::now();
+                let mut retry = DhcpRetryState::default();
+                for _ in 0..failures {
+                    retry.schedule_next(now, 0);
+                }
+
+                abandon_machine_actions_on_power_change(&mut actions, &mut retry);
+                outcome(&actions, &retry)
+            },
         );
     }
 }

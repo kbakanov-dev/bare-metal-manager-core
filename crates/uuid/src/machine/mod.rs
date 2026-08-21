@@ -150,9 +150,9 @@ mod legacy_rpc {
     /// manually every time, while still interacting with peers that expect a `.common.MachineId`
     /// to be serialized.
     #[derive(prost::Message)]
-    pub struct MachineId {
+    pub(super) struct MachineId {
         #[prost(string, tag = "1")]
-        pub id: String,
+        pub(super) id: String,
     }
 
     impl From<super::MachineId> for MachineId {
@@ -286,6 +286,10 @@ impl MachineId {
             [0; 32],
             MachineType::Host,
         )
+    }
+
+    pub(crate) fn is_matching_prefix(s: &str) -> bool {
+        s.starts_with(MACHINE_ID_PREFIX)
     }
 }
 
@@ -431,8 +435,9 @@ impl std::fmt::Display for MachineId {
         f.write_char(self.ty.id_char())?;
         // The next character determines how the MachineId is derived (`MachineIdSource`)
         f.write_char(self.source.id_char())?;
-        // Then follows the actual source data. self.hardware_id is guaranteed to have been written
-        // from a valid string, so we can use from_utf8_unchecked.
+        // Then follows the source data.
+        // SAFETY: `hardware_id` is private and populated only from `BASE32_DNSSEC::encode`, whose
+        // output is ASCII and therefore valid UTF-8.
         unsafe { f.write_str(std::str::from_utf8_unchecked(self.hardware_id.as_slice())) }
     }
 }

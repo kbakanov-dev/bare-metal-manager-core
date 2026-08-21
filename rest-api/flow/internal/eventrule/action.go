@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"slices"
 
-	taskcommon "github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/common"
+	"github.com/NVIDIA/infra-controller/rest-api/flow/internal/task/operations"
 	flowtypes "github.com/NVIDIA/infra-controller/rest-api/flow/pkg/types"
 )
 
@@ -16,6 +16,14 @@ import (
 type ActionCondition struct {
 	Severities     []Severity
 	ComponentTypes []flowtypes.ComponentType
+}
+
+// Clone returns an independent copy of the condition.
+func (c ActionCondition) Clone() ActionCondition {
+	cloned := c
+	cloned.Severities = slices.Clone(c.Severities)
+	cloned.ComponentTypes = slices.Clone(c.ComponentTypes)
+	return cloned
 }
 
 func (c ActionCondition) validate() error {
@@ -46,16 +54,21 @@ func (c ActionCondition) validate() error {
 	return nil
 }
 
-// AppliesTo reports whether the condition accepts the envelope.
-func (c ActionCondition) AppliesTo(envelope Envelope) bool {
+// AppliesTo reports whether the condition accepts the envelope and its
+// canonically resolved resource.
+func (c ActionCondition) AppliesTo(envelope Envelope, resource ResolvedResource) bool {
 	if c.Severities != nil &&
 		!slices.Contains(c.Severities, envelope.Severity) {
 		return false
 	}
 
-	if c.ComponentTypes != nil &&
-		!slices.Contains(c.ComponentTypes, envelope.Resource.ComponentType) {
-		return false
+	if c.ComponentTypes != nil {
+		if resource.Kind != ResourceKindComponent {
+			return false
+		}
+		if !slices.Contains(c.ComponentTypes, resource.ComponentType) {
+			return false
+		}
 	}
 
 	return true
@@ -69,6 +82,16 @@ const (
 	ActionTypeSendAlert  ActionType = "send_alert"
 	ActionTypeNoop       ActionType = "noop"
 )
+
+// Validate checks that the action type is supported by the domain.
+func (t ActionType) Validate() error {
+	switch t {
+	case ActionTypeSubmitTask, ActionTypeSendAlert, ActionTypeNoop:
+		return nil
+	default:
+		return fmt.Errorf("unknown action type %q", t)
+	}
+}
 
 // ConflictStrategy describes task-conflict behavior.
 type ConflictStrategy string
@@ -89,27 +112,37 @@ func (s ConflictStrategy) validate() error {
 
 // ActionSpec is the closed set of typed responses supported by an action.
 // The unexported validation method prevents implementations outside this
-// package while allowing processors to identify a specification with Type.
+// package while exposing its type and target-resolution behavior.
 type ActionSpec interface {
 	Type() ActionType
+	TargetResolutionStrategy() TargetStrategy
+	clone() ActionSpec
 	validate() error
 }
 
-// Action describes one independently selected and deduplicated response.
+// Action describes one independently selected and deduplicated response. Name
+// is its stable identity within the owning rule (it is not a database key).
 type Action struct {
-	ID        string
+	Name      string
 	Condition ActionCondition
 	Spec      ActionSpec
 }
 
-// NewAction returns an action containing the supplied typed specification.
-func NewAction(id string, condition ActionCondition, spec ActionSpec) Action {
-	return Action{ID: id, Condition: condition, Spec: spec}
+// Clone returns an independent copy of the action's mutable data.
+func (a Action) Clone() Action {
+	cloned := Action{
+		Name:      a.Name,
+		Condition: a.Condition.Clone(),
+	}
+	if a.Spec != nil {
+		cloned.Spec = a.Spec.clone()
+	}
+	return cloned
 }
 
-// Validate checks action identity, condition, and typed specification.
+// Validate checks the action name, condition, and typed specification.
 func (a Action) Validate() error {
-	if err := validateIdentifier("action id", a.ID); err != nil {
+	if err := validateIdentifier("action name", a.Name); err != nil {
 		return err
 	}
 
@@ -124,57 +157,122 @@ func (a Action) Validate() error {
 	return a.Spec.validate()
 }
 
-// TargetStrategy identifies how a target-bearing action resolves concrete
+// ValidateActions checks an action collection and its name constraints.
+func ValidateActions(actions []Action) error {
+	actionNames := make(map[string]struct{}, len(actions))
+	for i, action := range actions {
+		if err := action.Validate(); err != nil {
+			return fmt.Errorf("actions[%d]: %w", i, err)
+		}
+
+		if _, ok := actionNames[action.Name]; ok {
+			return fmt.Errorf("actions[%d]: duplicate action name %q", i, action.Name)
+		}
+
+		actionNames[action.Name] = struct{}{}
+	}
+
+	return nil
+}
+
+// CloneActions returns an independent copy of an action collection.
+func CloneActions(actions []Action) []Action {
+	if actions == nil {
+		return nil
+	}
+
+	cloned := make([]Action, len(actions))
+	for i := range actions {
+		cloned[i] = actions[i].Clone()
+	}
+	return cloned
+}
+
+// TargetStrategy identifies whether and how an action resolves concrete
 // operation targets.
 type TargetStrategy string
 
 const (
+	TargetStrategyNone               TargetStrategy = "none"
 	TargetStrategyComponent          TargetStrategy = "component"
 	TargetStrategyRack               TargetStrategy = "rack"
 	TargetStrategyAffectedComponents TargetStrategy = "affected_components"
 )
 
-// Validate checks that the target strategy is supported by the schema.
+// Validate checks that the target strategy is supported by the domain.
 func (s TargetStrategy) Validate() error {
 	switch s {
-	case TargetStrategyComponent, TargetStrategyRack, TargetStrategyAffectedComponents:
+	case TargetStrategyNone,
+		TargetStrategyComponent,
+		TargetStrategyRack,
+		TargetStrategyAffectedComponents:
 		return nil
 	default:
 		return fmt.Errorf("unknown target strategy %q", s)
 	}
 }
 
+// RequiresResolution reports whether concrete targets must be resolved for
+// the strategy.
+func (s TargetStrategy) RequiresResolution() bool {
+	return s != TargetStrategyNone
+}
+
 // SubmitTask describes a task submission requested by an event rule.
 type SubmitTask struct {
-	OperationType    taskcommon.TaskType
-	OperationCode    taskcommon.OperationCode
+	Operation        operations.Operation
 	TargetStrategy   TargetStrategy
 	ConflictStrategy ConflictStrategy
 	Description      string
 }
 
 // Type returns the submit_task action discriminator.
-func (s SubmitTask) Type() ActionType {
+func (*SubmitTask) Type() ActionType {
 	return ActionTypeSubmitTask
 }
 
-func (s SubmitTask) validate() error {
-	if !s.OperationType.IsValid() {
-		return fmt.Errorf("operation_type %q is invalid", s.OperationType)
+// TargetResolutionStrategy returns the task's target strategy.
+func (s *SubmitTask) TargetResolutionStrategy() TargetStrategy {
+	if s == nil {
+		return TargetStrategyNone
 	}
+	return s.TargetStrategy
+}
 
-	if err := s.OperationCode.ValidateFor(s.OperationType); err != nil {
-		return err
+func (s *SubmitTask) clone() ActionSpec {
+	if s == nil {
+		return nil
 	}
+	cloned := &SubmitTask{
+		TargetStrategy:   s.TargetStrategy,
+		ConflictStrategy: s.ConflictStrategy,
+		Description:      s.Description,
+	}
+	if s.Operation != nil {
+		cloned.Operation = s.Operation.Clone()
+	}
+	return cloned
+}
 
+func (s *SubmitTask) validate() error {
+	if s == nil {
+		return fmt.Errorf("action spec is required")
+	}
+	if s.Operation == nil {
+		return fmt.Errorf("operation is required")
+	}
+	if err := s.Operation.Validate(); err != nil {
+		return fmt.Errorf("operation: %w", err)
+	}
 	if err := s.TargetStrategy.Validate(); err != nil {
 		return err
 	}
-
+	if !s.TargetStrategy.RequiresResolution() {
+		return fmt.Errorf("submit task target strategy must require resolution")
+	}
 	if err := s.ConflictStrategy.validate(); err != nil {
 		return err
 	}
-
 	return validateOptionalString("description", s.Description)
 }
 
@@ -185,13 +283,33 @@ type SendAlert struct {
 }
 
 // Type returns the send_alert action discriminator.
-func (s SendAlert) Type() ActionType {
+func (*SendAlert) Type() ActionType {
 	return ActionTypeSendAlert
 }
 
-func (s SendAlert) validate() error {
+// TargetResolutionStrategy reports that alerts do not resolve targets.
+func (*SendAlert) TargetResolutionStrategy() TargetStrategy {
+	return TargetStrategyNone
+}
+
+func (s *SendAlert) clone() ActionSpec {
+	if s == nil {
+		return nil
+	}
+	cloned := *s
+	return &cloned
+}
+
+func (s *SendAlert) validate() error {
+	if s == nil {
+		return fmt.Errorf("action spec is required")
+	}
+
 	if err := s.Severity.Validate(); err != nil {
 		return err
+	}
+	if s.Severity.IsUnspecified() {
+		return fmt.Errorf("alert severity cannot be unspecified")
 	}
 
 	return validateOptionalString("alert message", s.Message)
@@ -203,10 +321,33 @@ type Noop struct {
 }
 
 // Type returns the noop action discriminator.
-func (Noop) Type() ActionType {
+func (*Noop) Type() ActionType {
 	return ActionTypeNoop
 }
 
-func (n Noop) validate() error {
+// TargetResolutionStrategy reports that no-op actions do not resolve targets.
+func (*Noop) TargetResolutionStrategy() TargetStrategy {
+	return TargetStrategyNone
+}
+
+func (n *Noop) clone() ActionSpec {
+	if n == nil {
+		return nil
+	}
+	cloned := *n
+	return &cloned
+}
+
+func (n *Noop) validate() error {
+	if n == nil {
+		return fmt.Errorf("action spec is required")
+	}
+
 	return validateOptionalString("noop reason", n.Reason)
 }
+
+var (
+	_ ActionSpec = (*SubmitTask)(nil)
+	_ ActionSpec = (*SendAlert)(nil)
+	_ ActionSpec = (*Noop)(nil)
+)

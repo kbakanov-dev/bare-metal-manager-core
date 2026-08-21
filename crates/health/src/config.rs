@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,7 +26,12 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use rustls_pki_types::DnsName;
 use serde::{Deserialize, Deserializer, Serialize};
+use tokio::sync::Semaphore;
 use url::Url;
+
+use crate::metrics::BmcLatencyAttribute;
+
+const DEFAULT_BMC_REQUEST_CONCURRENCY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,6 +59,12 @@ pub struct Config {
     /// Maximum cache size per BMC, uses etags
     pub cache_size: usize,
 
+    /// Maximum concurrent Redfish operations per BMC, including collector
+    /// fan-out. Changes take effect when the service restarts and rebuilds BMC
+    /// clients. The value must not exceed [`Semaphore::MAX_PERMITS`], which
+    /// bounds SSE event-record buffering.
+    pub bmc_request_concurrency: NonZeroUsize,
+
     /// Interval between BMC endpoint discovery iterations.
     #[serde(with = "humantime_serde")]
     pub endpoint_discovery_interval: Duration,
@@ -74,6 +86,7 @@ impl Default for Config {
             shard: 0,
             shards_count: 1,
             cache_size: 100,
+            bmc_request_concurrency: DEFAULT_BMC_REQUEST_CONCURRENCY,
             endpoint_discovery_interval: Duration::from_secs(300),
             bmc_proxy_url: None,
         }
@@ -255,6 +268,11 @@ pub struct StaticSwitchEndpoint {
     pub slot_number: Option<i32>,
     #[serde(alias = "compute_tray_index")]
     pub tray_index: Option<i32>,
+
+    /// Optional non-nil NVLink domain UUID associated with this switch.
+    /// Invalid or nil values are omitted from telemetry.
+    pub nvlink_domain_uuid: Option<String>,
+
     #[serde(default = "default_static_switch_endpoint_role")]
     pub endpoint_role: StaticSwitchEndpointRole,
     #[serde(default)]
@@ -366,7 +384,10 @@ impl StaticBmcEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SinksConfig {
-    /// Tracing sink: logs all collector events through `tracing`.
+    /// Tracing sink: logs collector events through `tracing`.
+    ///
+    /// Reachability metrics are excluded because the collector emits explicit
+    /// structured records according to its `log_mode`.
     pub tracing: Configurable<TracingSinkConfig>,
 
     /// Prometheus sink: stores metric events in Prometheus exporter format.
@@ -520,6 +541,15 @@ pub struct OtlpTargetConfig {
     #[serde(default = "OtlpTargetConfig::default_batch_size")]
     pub batch_size: usize,
 
+    /// Maximum number of entries waiting in each signal queue for this target.
+    ///
+    /// Logs and metrics have independent queues of this size. When a queue is
+    /// full, inserting a new identity drops its oldest entry. The active export
+    /// batch is bounded separately by `batch_size`. Defaults to 32,768 and must
+    /// be greater than zero.
+    #[serde(default = "OtlpTargetConfig::default_queue_capacity")]
+    pub queue_capacity: usize,
+
     /// Maximum time to wait before flushing a non-empty batch for either
     /// signal. Defaults to two seconds.
     #[serde(
@@ -528,20 +558,34 @@ pub struct OtlpTargetConfig {
     )]
     pub flush_interval: std::time::Duration,
 
-    /// Export Redfish diagnostic payload fields to this target.
+    /// Export collector diagnostic payload fields to this target.
     ///
     /// Disabled by default because payload bodies are opaque and may be large or
     /// sensitive. If no diagnostic-capable sink enables diagnostics, collectors
     /// do not attach diagnostic fields. OTLP exports parent logs normally and
-    /// keeps diagnostics as latest-wins per endpoint while the drain is backed
-    /// up.
+    /// uses the parent event identity for queue replacement while backed up.
+    /// This setting does not control descriptor-decoded NMX-C payloads.
     #[serde(default)]
     pub include_diagnostics: bool,
+
+    /// Emit per-alert detail on health report log records sent to this target.
+    ///
+    /// Disabled by default because alert messages are free-form and a fully
+    /// degraded endpoint can produce many of them. When enabled, health report
+    /// records carry a `health_report.alerts` attribute holding a JSON array.
+    #[serde(default)]
+    pub include_alert_details: bool,
 }
 
 impl OtlpTargetConfig {
+    pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 32_768;
+
     fn default_batch_size() -> usize {
         512
+    }
+
+    fn default_queue_capacity() -> usize {
+        Self::DEFAULT_QUEUE_CAPACITY
     }
 
     fn default_flush_interval() -> std::time::Duration {
@@ -553,6 +597,10 @@ impl OtlpTargetConfig {
 
         if self.batch_size == 0 {
             return Err(format!("{path}.batch_size must be greater than 0"));
+        }
+
+        if self.queue_capacity == 0 {
+            return Err(format!("{path}.queue_capacity must be greater than 0"));
         }
 
         if self.flush_interval.is_zero() {
@@ -688,7 +736,7 @@ impl Default for CarbideApiConnectionConfig {
             root_ca: "/var/run/secrets/spiffe.io/ca.crt".to_string(),
             client_cert: "/var/run/secrets/spiffe.io/tls.crt".to_string(),
             client_key: "/var/run/secrets/spiffe.io/tls.key".to_string(),
-            api_url: Url::parse("https://carbide-api.forge-system.svc.cluster.local:1079").unwrap(),
+            api_url: Url::parse("https://nico-api.nico-system.svc.cluster.local:1079").unwrap(),
         }
     }
 }
@@ -822,6 +870,10 @@ pub struct CollectorsConfig {
     /// Entity metrics collector configuration (if present, metrics collector is enabled)
     pub metrics: Configurable<MetricsCollectorConfig>,
 
+    /// Redfish telemetry service collector configuration (if present, telemetry
+    /// collector is enabled)
+    pub telemetry: Configurable<TelemetryCollectorConfig>,
+
     /// Firmware collector configuration (if present, firmware collector is enabled)
     pub firmware: Configurable<FirmwareCollectorConfig>,
 
@@ -842,6 +894,12 @@ pub struct CollectorsConfig {
 
     /// GPU inventory collector: compares OOB GPU count vs the assigned SKU.
     pub gpu_inventory: Configurable<GpuInventoryConfig>,
+
+    /// Direct TCP probes for ports used by enabled collectors.
+    ///
+    /// The probes report transport reachability only. They do not check TLS,
+    /// authentication, or collector protocol readiness.
+    pub reachability: Configurable<ReachabilityCollectorConfig>,
 }
 
 impl Default for CollectorsConfig {
@@ -850,6 +908,7 @@ impl Default for CollectorsConfig {
             discovery: DiscoveryConfig::default(),
             sensors: Configurable::Enabled(SensorCollectorConfig::default()),
             metrics: Configurable::Disabled,
+            telemetry: Configurable::Disabled,
             firmware: Configurable::Disabled,
             leak_detector: Configurable::Enabled(LeakDetectorCollectorConfig::default()),
             logs: Configurable::Disabled,
@@ -857,7 +916,79 @@ impl Default for CollectorsConfig {
             nmxc: Configurable::Disabled,
             nvue: Configurable::Disabled,
             gpu_inventory: Configurable::Disabled,
+            reachability: Configurable::Disabled,
         }
+    }
+}
+
+/// Controls structured log emission for TCP reachability probes.
+///
+/// Metrics are emitted for every completed probe regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachabilityLogMode {
+    /// Emit a structured log for every successful and failed probe.
+    All,
+
+    /// Emit a structured log for every failed probe and suppress successful probes.
+    #[default]
+    Unreachable,
+}
+
+/// Global configuration for periodic TCP reachability probes.
+///
+/// The collector probes the BMC Redfish port when an enabled collector is
+/// eligible to use it, plus ports used by enabled eligible switch collectors.
+/// One global cadence applies to all targets; each collector's own configuration
+/// remains the source of truth for whether its target and port exist. Each
+/// completed probe is sent to configured metric sinks; configured log sinks
+/// receive policy-selected records.
+/// Results never create health reports. It is disabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReachabilityCollectorConfig {
+    /// Interval between probe cycles for each endpoint.
+    ///
+    /// Every selected target is probed once per cycle and emits a state metric.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+
+    /// Timeout for one TCP connection attempt.
+    ///
+    /// This bounds the TCP handshake only; it does not cover TLS or any
+    /// collector-specific protocol exchange.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+
+    /// Selects which completed probes emit structured log records.
+    ///
+    /// This policy is stateless: `unreachable` emits every failed probe, including
+    /// repeated failures after service restart. Metrics remain continuous in all modes.
+    pub log_mode: ReachabilityLogMode,
+}
+
+impl Default for ReachabilityCollectorConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(3),
+            log_mode: ReachabilityLogMode::Unreachable,
+        }
+    }
+}
+
+impl ReachabilityCollectorConfig {
+    /// Validates the probe cadence and timeout.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.interval.is_zero() {
+            return Err("[collectors.reachability].interval must be greater than 0".to_string());
+        }
+
+        if self.timeout.is_zero() {
+            return Err("[collectors.reachability].timeout must be greater than 0".to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -945,6 +1076,7 @@ pub struct DiscoveryConfig {
     #[serde(with = "humantime_serde")]
     pub refresh_interval: Duration,
 
+    /// Maximum endpoints whose system identities are resolved concurrently.
     pub discovery_concurrency: usize,
 }
 
@@ -962,15 +1094,32 @@ impl Default for DiscoveryConfig {
 pub struct MetricsCollectorConfig {
     #[serde(with = "humantime_serde")]
     pub fetch_interval: Duration,
-
-    pub fetch_concurrency: usize,
 }
 
 impl Default for MetricsCollectorConfig {
     fn default() -> Self {
         Self {
             fetch_interval: Duration::from_secs(120),
-            fetch_concurrency: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryCollectorConfig {
+    /// Interval between metric report fetches.
+    ///
+    /// A report is one GET covering many readings, so this can run
+    /// tighter than the per-resource collectors without adding load
+    /// proportional to entity count.
+    #[serde(with = "humantime_serde")]
+    pub fetch_interval: Duration,
+}
+
+impl Default for TelemetryCollectorConfig {
+    fn default() -> Self {
+        Self {
+            fetch_interval: Duration::from_secs(60),
         }
     }
 }
@@ -1051,9 +1200,6 @@ pub struct SensorCollectorConfig {
     #[serde(with = "humantime_serde")]
     pub sensor_fetch_interval: Duration,
 
-    /// Number of concurrent sensor fetches.
-    pub sensor_fetch_concurrency: usize,
-
     /// Include sensor thresholds in the metrics attributes.
     pub include_sensor_thresholds: bool,
 }
@@ -1062,7 +1208,6 @@ impl Default for SensorCollectorConfig {
     fn default() -> Self {
         Self {
             sensor_fetch_interval: Duration::from_secs(60),
-            sensor_fetch_concurrency: 4,
             include_sensor_thresholds: true,
         }
     }
@@ -1366,6 +1511,64 @@ impl Default for NmxtCollectorConfig {
 
 const DEFAULT_NMX_C_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NMX_C_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_NMX_C_MAX_FRAME_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NMX_C_FRAME_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+fn default_nmxc_hello_rpc_path() -> String {
+    "/nmx_c.NMX_Controller/Hello".to_string()
+}
+
+fn default_nmxc_subscribe_rpc_path() -> String {
+    "/nmx_c.NMX_Controller/Subscribe".to_string()
+}
+
+/// Descriptor-driven replacement configuration for the generated NMX-C collector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NmxcSchemaOverrideConfig {
+    /// Required path to a complete binary protobuf `FileDescriptorSet`.
+    ///
+    /// The set must contain the configured methods and all imported descriptors.
+    /// Relative paths are resolved from the service process working directory.
+    /// This field has no default.
+    pub descriptor_set_path: PathBuf,
+
+    /// Optional fully qualified gRPC path for the NMX-C Hello method.
+    ///
+    /// The path must use `/package.Service/Method` form and identify a unary
+    /// method in the descriptor. Defaults to `/nmx_c.NMX_Controller/Hello`.
+    #[serde(default = "default_nmxc_hello_rpc_path")]
+    pub hello_rpc_path: String,
+
+    /// Optional fully qualified gRPC path for the NMX-C Subscribe method.
+    ///
+    /// The path must use `/package.Service/Method` form and identify a method
+    /// that accepts one request and streams responses. Defaults to
+    /// `/nmx_c.NMX_Controller/Subscribe`.
+    #[serde(default = "default_nmxc_subscribe_rpc_path")]
+    pub subscribe_rpc_path: String,
+
+    /// Optional maximum encoded size accepted for one Hello or Subscribe response.
+    ///
+    /// Defaults to 4 MiB when omitted. Valid values are 1 byte through 64 MiB.
+    #[serde(default = "default_nmxc_max_frame_size_bytes")]
+    pub max_frame_size_bytes: usize,
+
+    /// Optional additional `SubscribeRequest` fields.
+    ///
+    /// Keys and values follow the supplied descriptor's protobuf JSON mapping.
+    /// The map is empty when omitted. Values are validated when the descriptor
+    /// and request are loaded at startup.
+    ///
+    /// `gateway_id`, `notify_on_self_change`, and `heart_beat_rate` remain owned
+    /// by `[collectors.nmxc]` and must not be repeated here.
+    #[serde(default)]
+    pub subscribe_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+const fn default_nmxc_max_frame_size_bytes() -> usize {
+    DEFAULT_NMX_C_MAX_FRAME_SIZE_BYTES
+}
 
 /// Configuration for streaming NMX-C controller notifications from switch hosts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1398,6 +1601,15 @@ pub struct NmxcCollectorConfig {
     /// Maximum retry backoff after repeated streaming connection failures.
     #[serde(with = "humantime_serde")]
     pub max_backoff: Duration,
+
+    /// Optional descriptor-driven replacement for the generated NMX-C collector.
+    ///
+    /// Omission uses the generated collector. The descriptor and request are
+    /// loaded at service startup, so changes require a restart. Responses are
+    /// emitted as generic logs and are not projected through the generated
+    /// NMX-C event mapping. Every OTLP target includes canonical protobuf JSON,
+    /// independently of its diagnostic payload setting.
+    pub schema_override: Option<NmxcSchemaOverrideConfig>,
 }
 
 impl Default for NmxcCollectorConfig {
@@ -1411,6 +1623,7 @@ impl Default for NmxcCollectorConfig {
             rpc_timeout: None,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            schema_override: None,
         }
     }
 }
@@ -1464,6 +1677,28 @@ impl NmxcCollectorConfig {
                 "[collectors.nmxc].max_backoff must be greater than or equal to initial_backoff"
                     .to_string(),
             );
+        }
+
+        if let Some(schema_override) = &self.schema_override {
+            if schema_override.descriptor_set_path.as_os_str().is_empty() {
+                return Err(
+                    "[collectors.nmxc.schema_override].descriptor_set_path must not be empty"
+                        .to_string(),
+                );
+            }
+
+            if schema_override.max_frame_size_bytes == 0 {
+                return Err(
+                    "[collectors.nmxc.schema_override].max_frame_size_bytes must be greater than 0"
+                        .to_string(),
+                );
+            }
+
+            if schema_override.max_frame_size_bytes > MAX_NMX_C_FRAME_SIZE_BYTES {
+                return Err(format!(
+                    "[collectors.nmxc.schema_override].max_frame_size_bytes must not exceed {MAX_NMX_C_FRAME_SIZE_BYTES}"
+                ));
+            }
         }
 
         Ok(())
@@ -1621,6 +1856,14 @@ pub struct MetricsConfig {
     pub endpoint: String,
     /// Prefix for all metrics, defaults to carbide_hardware_health
     pub prefix: String,
+    /// Emit per-request BMC latency histograms.
+    pub enable_bmc_latency_metrics: bool,
+    /// Label attributes emitted on the BMC latency histogram.
+    #[serde(
+        default = "default_bmc_latency_attributes",
+        deserialize_with = "deserialize_bmc_latency_attributes"
+    )]
+    pub bmc_latency_attributes: Vec<BmcLatencyAttribute>,
 }
 
 impl Default for RateLimitConfig {
@@ -1638,7 +1881,82 @@ impl Default for MetricsConfig {
         Self {
             endpoint: "0.0.0.0:9009".to_string(),
             prefix: "carbide_hardware_health".to_string(),
+            enable_bmc_latency_metrics: false,
+            bmc_latency_attributes: default_bmc_latency_attributes(),
         }
+    }
+}
+
+fn default_bmc_latency_attributes() -> Vec<BmcLatencyAttribute> {
+    BmcLatencyAttribute::ATTRIBUTES.to_vec()
+}
+
+fn deserialize_bmc_latency_attributes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<BmcLatencyAttribute>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let labels = Vec::<String>::deserialize(deserializer)?;
+    let mut has_all = false;
+    let mut unknown = Vec::new();
+
+    for label in &labels {
+        if label == "all" {
+            has_all = true;
+        } else if BmcLatencyAttribute::from_label_name(label).is_none() {
+            unknown.push(label.as_str());
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(serde::de::Error::custom(format!(
+            "unknown BMC latency attribute(s): {}; allowed values are: {}",
+            unknown.join(", "),
+            bmc_latency_attribute_allowed_values().join(", ")
+        )));
+    }
+
+    if has_all {
+        return Ok(default_bmc_latency_attributes());
+    }
+
+    let requested = labels.iter().map(String::as_str).collect::<HashSet<_>>();
+    Ok(BmcLatencyAttribute::ATTRIBUTES
+        .iter()
+        .copied()
+        .filter(|attribute| requested.contains(attribute.label_name()))
+        .collect())
+}
+
+fn bmc_latency_attribute_allowed_values() -> Vec<&'static str> {
+    let mut values = vec!["all"];
+    values.extend(
+        BmcLatencyAttribute::ATTRIBUTES
+            .iter()
+            .map(|attribute| attribute.label_name()),
+    );
+    values
+}
+
+impl MetricsConfig {
+    pub fn bmc_latency_attributes(&self) -> Vec<BmcLatencyAttribute> {
+        BmcLatencyAttribute::ATTRIBUTES
+            .iter()
+            .copied()
+            .filter(|attribute| self.bmc_latency_attributes.contains(attribute))
+            .collect()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.enable_bmc_latency_metrics && self.bmc_latency_attributes().is_empty() {
+            return Err(
+                "metrics.bmc_latency_attributes must not be empty when metrics.enable_bmc_latency_metrics is true"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -1681,6 +1999,15 @@ impl Config {
         if self.endpoint_discovery_interval.is_zero() {
             return Err("endpoint_discovery_interval must be greater than 0".to_string());
         }
+
+        if self.bmc_request_concurrency.get() > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "bmc_request_concurrency must not exceed {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+
+        self.metrics.validate()?;
 
         if let Configurable::Enabled(rate_limit) = &self.rate_limit
             && rate_limit.bucket_replenish.is_zero()
@@ -1768,6 +2095,16 @@ impl Config {
 
         if let Configurable::Enabled(nmxc) = &self.collectors.nmxc {
             nmxc.validate()?;
+
+            if nmxc.schema_override.is_some() && !self.sinks.otlp.is_enabled() {
+                return Err(
+                    "collectors.nmxc.schema_override requires at least one OTLP target".to_string(),
+                );
+            }
+        }
+
+        if let Configurable::Enabled(reachability) = &self.collectors.reachability {
+            reachability.validate()?;
         }
 
         if let Configurable::Enabled(gpu_inventory) = &self.collectors.gpu_inventory {
@@ -1918,6 +2255,7 @@ mod tests {
             serial: Some("switch-serial".to_string()),
             slot_number: None,
             tray_index: None,
+            nvlink_domain_uuid: None,
             endpoint_role: StaticSwitchEndpointRole::Host,
             is_primary: false,
             nmxc_enabled: None,
@@ -1930,8 +2268,10 @@ mod tests {
             endpoint: endpoint.to_string(),
             tls: None,
             batch_size: 512,
+            queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
             flush_interval: Duration::from_secs(2),
             include_diagnostics: false,
+            include_alert_details: false,
         }
     }
 
@@ -2031,7 +2371,7 @@ mod tests {
                 carbide_api
                     .api_url
                     .as_str()
-                    .starts_with("https://carbide-api.forge-system.svc.cluster.local:1079"),
+                    .starts_with("https://nico-api.nico-system.svc.cluster.local:1079"),
             );
         } else {
             panic!("carbide api empty for sources")
@@ -2062,14 +2402,19 @@ mod tests {
         assert!(config.collectors.logs.is_enabled());
         assert!(config.collectors.nvue.is_enabled());
         assert!(!config.collectors.nmxc.is_enabled());
+        assert!(config.collectors.reachability.is_enabled());
         assert!(!config.sinks.tracing.is_enabled());
         assert!(config.sinks.prometheus.is_enabled());
 
-        if let Configurable::Enabled(ref sensors) = config.collectors.sensors {
-            assert_eq!(sensors.sensor_fetch_concurrency, 10);
-        } else {
-            panic!("sensors empty")
-        }
+        let reachability = config
+            .collectors
+            .reachability
+            .as_option()
+            .expect("example config enables reachability");
+
+        assert_eq!(reachability.interval, Duration::from_secs(30));
+        assert_eq!(reachability.timeout, Duration::from_secs(3));
+        assert_eq!(reachability.log_mode, ReachabilityLogMode::Unreachable);
 
         if let Configurable::Enabled(ref logs) = config.collectors.logs {
             assert_eq!(logs.mode, LogCollectionMode::Auto);
@@ -2115,6 +2460,7 @@ mod tests {
         assert_eq!(config.shards_count, 1);
 
         assert_eq!(config.cache_size, 100);
+        assert_eq!(config.bmc_request_concurrency.get(), 4);
         assert_eq!(config.endpoint_discovery_interval, Duration::from_secs(300));
 
         if let Configurable::Enabled(ref nvue) = config.collectors.nvue {
@@ -2142,6 +2488,7 @@ mod tests {
     fn test_static_only_config() {
         let toml_content = r#"
 endpoint_discovery_interval = "1m"
+bmc_request_concurrency = 2
 
 [[endpoint_sources.static_bmc_endpoints]]
 ip = "192.168.1.100"
@@ -2157,7 +2504,6 @@ enabled = false
 
 [collectors.sensors]
 sensor_fetch_interval = "30s"
-sensor_fetch_concurrency = 5
 include_sensor_thresholds = false
 
 [metrics]
@@ -2178,6 +2524,8 @@ cache_size = 50
         assert!(!config.sinks.health_report.is_enabled());
 
         assert_eq!(config.endpoint_sources.static_bmc_endpoints.len(), 1);
+        assert_eq!(config.bmc_request_concurrency.get(), 2);
+
         assert_eq!(
             config.endpoint_sources.static_bmc_endpoints[0].ip,
             "192.168.1.100".parse::<IpAddr>().unwrap()
@@ -2346,6 +2694,12 @@ username = "root"
                 Box::new(Config::default()) => Yields(()),
 
                 config_with(|config| {
+                    config.bmc_request_concurrency =
+                        NonZeroUsize::new(Semaphore::MAX_PERMITS)
+                            .expect("Tokio supports at least one semaphore permit");
+                }) => Yields(()),
+
+                config_with(|config| {
                     config.collectors.logs =
                         Configurable::Enabled(LogsCollectorConfig::default());
                 }) => Yields(()),
@@ -2367,6 +2721,15 @@ username = "root"
                         targets: vec![otlp_target("http://localhost:4317")],
                     });
                 }) => Yields(()),
+
+                config_with(|config| {
+                    config.metrics.enable_bmc_latency_metrics = true;
+                    config.metrics.bmc_latency_attributes = vec![
+                        BmcLatencyAttribute::HttpResponseStatusCode,
+                        BmcLatencyAttribute::ServerAddress,
+                        BmcLatencyAttribute::UrlScheme,
+                    ];
+                }) => Yields(()),
             }
 
             "top-level settings" {
@@ -2379,6 +2742,22 @@ username = "root"
                     config.endpoint_discovery_interval = Duration::ZERO;
                 }) => FailsWith(
                     "endpoint_discovery_interval must be greater than 0".to_string()
+                ),
+
+                config_with(|config| {
+                    config.bmc_request_concurrency =
+                        NonZeroUsize::new(Semaphore::MAX_PERMITS + 1)
+                            .expect("the value above Tokio's maximum remains nonzero");
+                }) => FailsWith(format!(
+                    "bmc_request_concurrency must not exceed {}",
+                    Semaphore::MAX_PERMITS
+                )),
+
+                config_with(|config| {
+                    config.metrics.enable_bmc_latency_metrics = true;
+                    config.metrics.bmc_latency_attributes = vec![];
+                }) => FailsWith(
+                    "metrics.bmc_latency_attributes must not be empty when metrics.enable_bmc_latency_metrics is true".to_string()
                 ),
 
                 config_with(|config| {
@@ -2634,8 +3013,10 @@ endpoint = "https://site.example:4317"
 [[targets]]
 endpoint = "https://central.example:4317"
 batch_size = 1024
+queue_capacity = 2048
 flush_interval = "5s"
 include_diagnostics = true
+include_alert_details = true
 
 [targets.tls]
 ca_cert_path = "/central/ca.crt"
@@ -2653,10 +3034,19 @@ reload_interval = "30s"
         assert_eq!(targets.len(), 2);
         assert!(targets[0].tls.is_none());
         assert_eq!(targets[0].batch_size, 512);
+
+        assert_eq!(
+            targets[0].queue_capacity,
+            OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY
+        );
+
         assert_eq!(targets[0].flush_interval, Duration::from_secs(2));
         assert_eq!(targets[1].batch_size, 1024);
+        assert_eq!(targets[1].queue_capacity, 2048);
         assert_eq!(targets[1].flush_interval, Duration::from_secs(5));
         assert!(targets[1].include_diagnostics);
+        assert!(!targets[0].include_alert_details);
+        assert!(targets[1].include_alert_details);
 
         let tls = targets[1]
             .tls
@@ -2716,6 +3106,16 @@ reload_interval = "30s"
                     },
                 } => FailsWith(
                     "sinks.otlp.targets[2].batch_size must be greater than 0".to_string()
+                ),
+
+                IndexedOtlpTarget {
+                    index: 2,
+                    target: OtlpTargetConfig {
+                        queue_capacity: 0,
+                        ..otlp_target("http://site.example:4317")
+                    },
+                } => FailsWith(
+                    "sinks.otlp.targets[2].queue_capacity must be greater than 0".to_string()
                 ),
 
                 IndexedOtlpTarget {
@@ -2890,8 +3290,10 @@ reload_interval = "30s"
                         targets: vec![OtlpTargetConfig {
                             endpoint: "http://localhost:4317".to_string(),
                             batch_size: 512,
+                            queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: false,
+                            include_alert_details: false,
                             tls: None,
                         }],
                     }),
@@ -2927,8 +3329,10 @@ reload_interval = "30s"
                         targets: vec![OtlpTargetConfig {
                             endpoint: "http://localhost:4317".to_string(),
                             batch_size: 512,
+                            queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: true,
+                            include_alert_details: false,
                             tls: None,
                         }],
                     }),
@@ -2944,15 +3348,19 @@ reload_interval = "30s"
                             OtlpTargetConfig {
                                 endpoint: "http://site.example:4317".to_string(),
                                 batch_size: 512,
+                                queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
                                 flush_interval: Duration::from_secs(2),
                                 include_diagnostics: false,
+                                include_alert_details: false,
                                 tls: None,
                             },
                             OtlpTargetConfig {
                                 endpoint: "http://central.example:4317".to_string(),
                                 batch_size: 512,
+                                queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
                                 flush_interval: Duration::from_secs(2),
                                 include_diagnostics: true,
+                                include_alert_details: false,
                                 tls: None,
                             },
                         ],
@@ -2996,8 +3404,10 @@ reload_interval = "30s"
                         targets: vec![OtlpTargetConfig {
                             endpoint: "http://localhost:4317".to_string(),
                             batch_size: 512,
+                            queue_capacity: OtlpTargetConfig::DEFAULT_QUEUE_CAPACITY,
                             flush_interval: Duration::from_secs(2),
                             include_diagnostics: false,
+                            include_alert_details: false,
                             tls: None,
                         }],
                     }),
@@ -3018,7 +3428,17 @@ reload_interval = "30s"
         assert_eq!(config.shard, 0);
         assert_eq!(config.shards_count, 1);
         assert_eq!(config.cache_size, 100);
+        assert_eq!(config.bmc_request_concurrency.get(), 4);
         assert_eq!(config.metrics.endpoint, "0.0.0.0:9009");
+        assert!(!config.metrics.enable_bmc_latency_metrics);
+        assert_eq!(
+            config.metrics.bmc_latency_attributes,
+            BmcLatencyAttribute::ATTRIBUTES.to_vec()
+        );
+        assert_eq!(
+            config.metrics.bmc_latency_attributes(),
+            BmcLatencyAttribute::ATTRIBUTES.to_vec()
+        );
         assert!(config.rate_limit.is_enabled());
         assert!(config.processors.leak_detection.is_enabled());
         assert!(config.collectors.leak_detector.is_enabled());
@@ -3029,6 +3449,64 @@ reload_interval = "30s"
         } else {
             panic!("health report sink should be enabled by default");
         }
+    }
+
+    #[test]
+    fn zero_bmc_request_concurrency_is_rejected() {
+        let result = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("bmc_request_concurrency = 0"))
+            .extract::<Config>();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bmc_latency_metrics_config_parsing() {
+        let toml_content = r#"
+[metrics]
+enable_bmc_latency_metrics = true
+bmc_latency_attributes = ["http_response_status_code", "server_address", "url_scheme", "entity_type", "machine_id", "rack_id"]
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml_content))
+            .extract()
+            .expect("could not parse config toml file");
+
+        assert!(config.metrics.enable_bmc_latency_metrics);
+        assert_eq!(
+            config.metrics.bmc_latency_attributes(),
+            vec![
+                BmcLatencyAttribute::HttpResponseStatusCode,
+                BmcLatencyAttribute::ServerAddress,
+                BmcLatencyAttribute::UrlScheme,
+                BmcLatencyAttribute::EntityType,
+                BmcLatencyAttribute::MachineId,
+                BmcLatencyAttribute::RackId,
+            ]
+        );
+
+        let toml_content = r#"
+[metrics]
+bmc_latency_attributes = ["http_path", "all"]
+"#;
+
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml_content))
+            .extract()
+            .expect("could not parse config toml file");
+
+        assert_eq!(
+            config.metrics.bmc_latency_attributes,
+            BmcLatencyAttribute::ATTRIBUTES.to_vec()
+        );
+        assert_eq!(
+            config.metrics.bmc_latency_attributes(),
+            BmcLatencyAttribute::ATTRIBUTES.to_vec()
+        );
     }
 
     #[test]
@@ -3083,6 +3561,7 @@ skip_empty_reports = false
         assert_eq!(defaults.rpc_timeout(), Duration::from_secs(10));
         assert_eq!(defaults.initial_backoff, Duration::from_secs(1));
         assert_eq!(defaults.max_backoff, Duration::from_secs(30));
+        assert!(defaults.schema_override.is_none());
     }
 
     #[test]
@@ -3103,6 +3582,12 @@ connect_timeout = "3s"
 rpc_timeout = "4s"
 initial_backoff = "2s"
 max_backoff = "20s"
+
+[collectors.nmxc.schema_override]
+descriptor_set_path = "/etc/carbide-health/nmx_c.desc"
+
+[collectors.nmxc.schema_override.subscribe_fields]
+testOption = true
 "#;
 
         let config: Config = Figment::new()
@@ -3122,6 +3607,36 @@ max_backoff = "20s"
             assert_eq!(nmxc.rpc_timeout(), Duration::from_secs(4));
             assert_eq!(nmxc.initial_backoff, Duration::from_secs(2));
             assert_eq!(nmxc.max_backoff, Duration::from_secs(20));
+
+            let schema_override = nmxc
+                .schema_override
+                .as_ref()
+                .expect("schema override config should parse");
+
+            assert_eq!(
+                schema_override.descriptor_set_path,
+                PathBuf::from("/etc/carbide-health/nmx_c.desc")
+            );
+
+            assert_eq!(
+                schema_override.hello_rpc_path,
+                "/nmx_c.NMX_Controller/Hello"
+            );
+
+            assert_eq!(
+                schema_override.subscribe_rpc_path,
+                "/nmx_c.NMX_Controller/Subscribe"
+            );
+
+            assert_eq!(
+                schema_override.max_frame_size_bytes,
+                DEFAULT_NMX_C_MAX_FRAME_SIZE_BYTES
+            );
+
+            assert_eq!(
+                schema_override.subscribe_fields["testOption"],
+                serde_json::Value::Bool(true)
+            );
         } else {
             panic!("nmxc config should be enabled");
         }
@@ -3132,6 +3647,17 @@ max_backoff = "20s"
         scenarios!(run = |config: NmxcCollectorConfig| config.validate();
             "valid configuration" {
                 NmxcCollectorConfig::default() => Yields(()),
+
+                NmxcCollectorConfig {
+                    schema_override: Some(NmxcSchemaOverrideConfig {
+                        descriptor_set_path: PathBuf::from("nmx_c.desc"),
+                        hello_rpc_path: default_nmxc_hello_rpc_path(),
+                        subscribe_rpc_path: default_nmxc_subscribe_rpc_path(),
+                        max_frame_size_bytes: MAX_NMX_C_FRAME_SIZE_BYTES,
+                        subscribe_fields: Default::default(),
+                    }),
+                    ..NmxcCollectorConfig::default()
+                } => Yields(()),
             }
 
             "connection settings" {
@@ -3193,7 +3719,79 @@ max_backoff = "20s"
                         .to_string()
                 ),
             }
+
+            "schema override settings" {
+                NmxcCollectorConfig {
+                    schema_override: Some(NmxcSchemaOverrideConfig {
+                        descriptor_set_path: PathBuf::new(),
+                        hello_rpc_path: default_nmxc_hello_rpc_path(),
+                        subscribe_rpc_path: default_nmxc_subscribe_rpc_path(),
+                        max_frame_size_bytes: DEFAULT_NMX_C_MAX_FRAME_SIZE_BYTES,
+                        subscribe_fields: Default::default(),
+                    }),
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.nmxc.schema_override].descriptor_set_path must not be empty"
+                        .to_string()
+                ),
+
+                NmxcCollectorConfig {
+                    schema_override: Some(NmxcSchemaOverrideConfig {
+                        descriptor_set_path: PathBuf::from("nmx_c.desc"),
+                        hello_rpc_path: default_nmxc_hello_rpc_path(),
+                        subscribe_rpc_path: default_nmxc_subscribe_rpc_path(),
+                        max_frame_size_bytes: 0,
+                        subscribe_fields: Default::default(),
+                    }),
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith(
+                    "[collectors.nmxc.schema_override].max_frame_size_bytes must be greater than 0"
+                        .to_string()
+                ),
+
+                NmxcCollectorConfig {
+                    schema_override: Some(NmxcSchemaOverrideConfig {
+                        descriptor_set_path: PathBuf::from("nmx_c.desc"),
+                        hello_rpc_path: default_nmxc_hello_rpc_path(),
+                        subscribe_rpc_path: default_nmxc_subscribe_rpc_path(),
+                        max_frame_size_bytes: MAX_NMX_C_FRAME_SIZE_BYTES + 1,
+                        subscribe_fields: Default::default(),
+                    }),
+                    ..NmxcCollectorConfig::default()
+                } => FailsWith(
+                    format!(
+                        "[collectors.nmxc.schema_override].max_frame_size_bytes must not exceed {MAX_NMX_C_FRAME_SIZE_BYTES}"
+                    )
+                ),
+            }
         );
+    }
+
+    #[test]
+    fn nmxc_schema_override_accepts_otlp_target_without_diagnostics() {
+        let mut config = Config::default();
+
+        config.collectors.nmxc = Configurable::Enabled(NmxcCollectorConfig {
+            schema_override: Some(NmxcSchemaOverrideConfig {
+                descriptor_set_path: PathBuf::from("nmx_c.desc"),
+                hello_rpc_path: default_nmxc_hello_rpc_path(),
+                subscribe_rpc_path: default_nmxc_subscribe_rpc_path(),
+                max_frame_size_bytes: DEFAULT_NMX_C_MAX_FRAME_SIZE_BYTES,
+                subscribe_fields: Default::default(),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            config.validate(),
+            Err("collectors.nmxc.schema_override requires at least one OTLP target".to_string())
+        );
+
+        config.sinks.otlp = Configurable::Enabled(OtlpSinkConfig {
+            targets: vec![otlp_target("http://localhost:4317")],
+        });
+
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]
@@ -3866,7 +4464,7 @@ ip = "10.0.1.2"
 mac = "11:22:33:44:55:77"
 username = "admin"
 password = "pass"
-switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SW-002", endpoint_role = "host", is_primary = false, nmxc_enabled = true, nmxt_enabled = true }
+switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", serial = "SN-SW-002", endpoint_role = "host", is_primary = false, nmxc_enabled = true, nmxt_enabled = true, nvlink_domain_uuid = "9f4b45ec-705a-4af4-89f7-a112bc9c8f4e" }
 "#;
 
         let config: Config = Figment::new()
@@ -3884,6 +4482,11 @@ switch = { id = "fsw100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0", 
         assert!(!switch.is_primary);
         assert_eq!(switch.nmxc_enabled, Some(true));
         assert_eq!(switch.nmxt_enabled, Some(true));
+
+        assert_eq!(
+            switch.nvlink_domain_uuid.as_deref(),
+            Some("9f4b45ec-705a-4af4-89f7-a112bc9c8f4e")
+        );
     }
 
     #[test]
@@ -4427,7 +5030,29 @@ max_backoff = "45s"
     #[test]
     fn test_sse_log_config_defaults() {
         let defaults = SseLogConfig::default();
+
         assert_eq!(defaults.initial_backoff, Duration::from_secs(1));
         assert_eq!(defaults.max_backoff, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reachability_validation_rejects_non_positive_runtime_values() {
+        let mut config = ReachabilityCollectorConfig {
+            interval: Duration::ZERO,
+            ..ReachabilityCollectorConfig::default()
+        };
+
+        assert_eq!(
+            config.validate().expect_err("zero interval must fail"),
+            "[collectors.reachability].interval must be greater than 0"
+        );
+
+        config.interval = Duration::from_secs(1);
+        config.timeout = Duration::ZERO;
+
+        assert_eq!(
+            config.validate().expect_err("zero timeout must fail"),
+            "[collectors.reachability].timeout must be greater than 0"
+        );
     }
 }

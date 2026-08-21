@@ -968,7 +968,9 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 		tenantID                               uuid.UUID
 		siteID                                 uuid.UUID
 		networkVirtualizationType              *string
+		slaacEnabled                           bool
 		routingProfile                         *string
+		routingProfileOverrides                *VpcRoutingProfileOverrides
 		controllerVpcID                        *uuid.UUID
 		activeVni                              *int
 		networkSecurityGroupID                 *string
@@ -997,6 +999,11 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 	st := testBuildSite(t, dbSession, nil, ip.ID, "test-site", "Test Site", ip.Org, ipu.ID)
 
 	networkSecurityGroup := testInstanceBuildNetworkSecurityGroup(t, dbSession, tn, st, "testNetworkSecurityGroup")
+	routingProfileOverrides := &VpcRoutingProfileOverrides{
+		RouteTargetImports:           &[]VpcRouteTarget{{ASN: 64512, VNI: 101}},
+		LeakDefaultRouteFromUnderlay: cutil.GetPtr(false),
+		AllowedAnycastPrefixes:       &[]string{},
+	}
 
 	vpc := &Vpc{
 		Name:                      "test-vpc",
@@ -1006,7 +1013,9 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 		TenantID:                  tn.ID,
 		SiteID:                    st.ID,
 		NetworkVirtualizationType: cutil.GetPtr(VpcEthernetVirtualizer),
+		SlaacEnabled:              true,
 		RoutingProfile:            cutil.GetPtr("INTERNAL"),
+		RoutingProfileOverrides:   routingProfileOverrides,
 		ControllerVpcID:           cutil.GetPtr(uuid.New()),
 		ActiveVni:                 nil,
 		Vni:                       cutil.GetPtr(555),
@@ -1053,7 +1062,9 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 				tenantID:                               vpc.TenantID,
 				siteID:                                 vpc.SiteID,
 				networkVirtualizationType:              vpc.NetworkVirtualizationType,
+				slaacEnabled:                           vpc.SlaacEnabled,
 				routingProfile:                         vpc.RoutingProfile,
+				routingProfileOverrides:                vpc.RoutingProfileOverrides,
 				controllerVpcID:                        vpc.ControllerVpcID,
 				activeVni:                              vpc.ActiveVni,
 				vni:                                    vpc.Vni,
@@ -1084,7 +1095,9 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 				TenantID:                               tt.args.tenantID,
 				SiteID:                                 tt.args.siteID,
 				NetworkVirtualizationType:              tt.args.networkVirtualizationType,
+				SlaacEnabled:                           tt.args.slaacEnabled,
 				RoutingProfile:                         tt.args.routingProfile,
+				RoutingProfileOverrides:                tt.args.routingProfileOverrides,
 				ControllerVpcID:                        tt.args.controllerVpcID,
 				Vni:                                    tt.args.vni,
 				NetworkSecurityGroupID:                 tt.args.networkSecurityGroupID,
@@ -1104,9 +1117,11 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 			assert.Equal(t, tt.want.TenantID, got.TenantID)
 			assert.Equal(t, tt.want.SiteID, got.SiteID)
 			assert.Equal(t, *tt.want.NetworkVirtualizationType, *got.NetworkVirtualizationType)
+			assert.Equal(t, tt.want.SlaacEnabled, got.SlaacEnabled)
 			assert.Equal(t, len(tt.want.Labels), len(got.Labels))
 			assert.Equal(t, *tt.want.ControllerVpcID, *got.ControllerVpcID)
 			assert.Equal(t, tt.want.RoutingProfile, got.RoutingProfile)
+			assert.Equal(t, tt.want.RoutingProfileOverrides, got.RoutingProfileOverrides)
 			if tt.want.Vni != nil {
 				assert.NotNil(t, got.Vni)
 				assert.Equal(t, *tt.want.Vni, *got.Vni)
@@ -1116,6 +1131,12 @@ func TestVpcSQLDAO_CreateFromParams(t *testing.T) {
 			assert.True(t, proto.Equal(tt.want.NetworkSecurityGroupPropagationDetails, got.NetworkSecurityGroupPropagationDetails))
 			assert.Equal(t, tt.want.Status, got.Status)
 			assert.Equal(t, tt.want.CreatedBy, got.CreatedBy)
+
+			// A fresh read proves the JSONB override value was persisted.
+			persisted, gerr := vsd.GetByID(tt.args.ctx, nil, got.ID, nil)
+			require.NoError(t, gerr)
+			assert.Equal(t, tt.want.SlaacEnabled, persisted.SlaacEnabled)
+			assert.Equal(t, tt.want.RoutingProfileOverrides, persisted.RoutingProfileOverrides)
 
 			if tt.verifyChildSpanner {
 				span := otrace.SpanFromContext(ctx)
@@ -1148,18 +1169,31 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 	networkSecurityGroup2 := testInstanceBuildNetworkSecurityGroup(t, dbSession, tn, st, "testNetworkSecurityGroup2")
 
 	vpc := testBuildVpc(t, dbSession, nil, "test-vpc", nil, tn.Org, ip.ID, tn.ID, st.ID, nil, cutil.GetPtr(VpcEthernetVirtualizer), nil, nil, nil, tnu.ID, &networkSecurityGroup.ID)
+	routingProfileOverrides := &VpcRoutingProfileOverrides{
+		RouteTargetsOnExports:         &[]VpcRouteTarget{{ASN: 64513, VNI: 202}},
+		TenantLeakCommunitiesAccepted: cutil.GetPtr(true),
+	}
+	effectiveRoutingProfile := &VpcEffectiveRoutingProfile{
+		RouteTargetsOnExports:         []VpcRouteTarget{{ASN: 64513, VNI: 202}},
+		TenantLeakCommunitiesAccepted: true,
+		Internal:                      true,
+		AccessTier:                    9,
+	}
 
 	uvpc := &Vpc{
 		Name:                      "test-updated",
 		Description:               cutil.GetPtr("Test Updated"),
 		NetworkVirtualizationType: cutil.GetPtr(VpcEthernetVirtualizerWithNVUE),
 		RoutingProfile:            cutil.GetPtr("EXTERNAL"),
+		RoutingProfileOverrides:   routingProfileOverrides,
+		EffectiveRoutingProfile:   effectiveRoutingProfile,
 		NetworkSecurityGroupID:    &networkSecurityGroup2.ID,
 		ControllerVpcID:           cutil.GetPtr(uuid.New()),
 		ActiveVni:                 cutil.GetPtr(777),
 		Vni:                       cutil.GetPtr(888),
 		Status:                    VpcStatusReady,
 		IsMissingOnSite:           true,
+		SlaacEnabled:              true,
 		Labels: map[string]string{
 			"zone": "west1",
 		},
@@ -1186,6 +1220,8 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 		description                            *string
 		networkVirtualizationType              *string
 		routingProfile                         *string
+		routingProfileOverrides                *VpcRoutingProfileOverrides
+		effectiveRoutingProfile                *VpcEffectiveRoutingProfile
 		networkSecurityGroupID                 *string
 		NetworkSecurityGroupPropagationDetails *NetworkSecurityGroupPropagationDetails
 		ControllervpcID                        *uuid.UUID
@@ -1194,6 +1230,7 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 		labels                                 map[string]string
 		Status                                 string
 		IsMissingOnSite                        bool
+		SlaacEnabled                           bool
 	}
 	tests := []struct {
 		name               string
@@ -1215,6 +1252,8 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 				description:                            uvpc.Description,
 				networkVirtualizationType:              uvpc.NetworkVirtualizationType,
 				routingProfile:                         uvpc.RoutingProfile,
+				routingProfileOverrides:                uvpc.RoutingProfileOverrides,
+				effectiveRoutingProfile:                uvpc.EffectiveRoutingProfile,
 				networkSecurityGroupID:                 uvpc.NetworkSecurityGroupID,
 				NetworkSecurityGroupPropagationDetails: uvpc.NetworkSecurityGroupPropagationDetails,
 				ControllervpcID:                        uvpc.ControllerVpcID,
@@ -1223,6 +1262,7 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 				labels:                                 uvpc.Labels,
 				Status:                                 uvpc.Status,
 				IsMissingOnSite:                        uvpc.IsMissingOnSite,
+				SlaacEnabled:                           uvpc.SlaacEnabled,
 			},
 			want:               uvpc,
 			wantErr:            false,
@@ -1241,6 +1281,8 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 				Description:                            tt.args.description,
 				NetworkVirtualizationType:              tt.args.networkVirtualizationType,
 				RoutingProfile:                         tt.args.routingProfile,
+				RoutingProfileOverrides:                tt.args.routingProfileOverrides,
+				EffectiveRoutingProfile:                tt.args.effectiveRoutingProfile,
 				NetworkSecurityGroupID:                 tt.args.networkSecurityGroupID,
 				NetworkSecurityGroupPropagationDetails: tt.args.NetworkSecurityGroupPropagationDetails,
 				ControllerVpcID:                        tt.args.ControllervpcID,
@@ -1249,6 +1291,7 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 				Labels:                                 tt.args.labels,
 				Status:                                 &tt.args.Status,
 				IsMissingOnSite:                        &tt.args.IsMissingOnSite,
+				SlaacEnabled:                           &tt.args.SlaacEnabled,
 			}
 
 			got, err := vsd.Update(tt.args.ctx, nil, input)
@@ -1260,7 +1303,10 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 			assert.Equal(t, tt.want.Name, got.Name)
 			assert.Equal(t, *tt.want.Description, *got.Description)
 			assert.Equal(t, *tt.want.NetworkVirtualizationType, *got.NetworkVirtualizationType)
+			assert.Equal(t, tt.want.SlaacEnabled, got.SlaacEnabled)
 			assert.Equal(t, tt.want.RoutingProfile, got.RoutingProfile)
+			assert.Equal(t, tt.want.RoutingProfileOverrides, got.RoutingProfileOverrides)
+			assert.Equal(t, tt.want.EffectiveRoutingProfile, got.EffectiveRoutingProfile)
 			assert.Equal(t, *tt.want.ControllerVpcID, *got.ControllerVpcID)
 			assert.Equal(t, *tt.want.ActiveVni, *got.ActiveVni)
 			assert.Equal(t, *tt.want.Vni, *got.Vni)
@@ -1276,6 +1322,13 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 			assert.Equal(t, tt.want.Labels, got.Labels)
 			assert.Equal(t, tt.want.Status, got.Status)
 
+			// A fresh read verifies both JSONB columns, not only the update return value.
+			persisted, gerr := vsd.GetByID(tt.args.ctx, nil, got.ID, nil)
+			require.NoError(t, gerr)
+			assert.Equal(t, tt.want.SlaacEnabled, persisted.SlaacEnabled)
+			assert.Equal(t, tt.want.RoutingProfileOverrides, persisted.RoutingProfileOverrides)
+			assert.Equal(t, tt.want.EffectiveRoutingProfile, persisted.EffectiveRoutingProfile)
+
 			assert.NotEqualValues(t, got.Updated, vpc.Updated)
 
 			if tt.verifyChildSpanner {
@@ -1286,6 +1339,43 @@ func TestVpcSQLDAO_Update(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("persists an explicit SLAAC disable", func(t *testing.T) {
+		vpcDAO := NewVpcDAO(dbSession)
+		persisted, err := vpcDAO.GetByID(ctx, nil, vpc.ID, nil)
+		require.NoError(t, err)
+		require.True(t, persisted.SlaacEnabled)
+
+		updated, err := vpcDAO.Update(ctx, nil, VpcUpdateInput{
+			VpcID:        vpc.ID,
+			SlaacEnabled: cutil.GetPtr(false),
+		})
+		require.NoError(t, err)
+		assert.False(t, updated.SlaacEnabled)
+
+		persisted, err = vpcDAO.GetByID(ctx, nil, vpc.ID, nil)
+		require.NoError(t, err)
+		assert.False(t, persisted.SlaacEnabled)
+	})
+
+	t.Run("preserves an omitted effective routing profile", func(t *testing.T) {
+		// Updating desired overrides alone must not clear cached controller state.
+		replacementOverrides := &VpcRoutingProfileOverrides{
+			AllowedAnycastPrefixes: &[]string{"192.0.2.0/24"},
+		}
+		updated, err := NewVpcDAO(dbSession).Update(ctx, nil, VpcUpdateInput{
+			VpcID:                   vpc.ID,
+			RoutingProfileOverrides: replacementOverrides,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, replacementOverrides, updated.RoutingProfileOverrides)
+		assert.Equal(t, effectiveRoutingProfile, updated.EffectiveRoutingProfile)
+
+		persisted, err := NewVpcDAO(dbSession).GetByID(ctx, nil, vpc.ID, nil)
+		require.NoError(t, err)
+		assert.Equal(t, replacementOverrides, persisted.RoutingProfileOverrides)
+		assert.Equal(t, effectiveRoutingProfile, persisted.EffectiveRoutingProfile)
+	})
 }
 
 func TestVpcSQLDAO_DeleteByID(t *testing.T) {
@@ -1363,6 +1453,86 @@ func TestVpcSQLDAO_DeleteByID(t *testing.T) {
 	}
 }
 
+func TestVpcSQLDAO_ClearDeleted(t *testing.T) {
+	dbSession := testInitDB(t)
+	defer dbSession.Close()
+	testVpcSetupSchema(t, dbSession)
+
+	ipu := testBuildUser(t, dbSession, nil, testGenerateStarfleetID(), cutil.GetPtr("johnd@test.com"), cutil.GetPtr("John"), cutil.GetPtr("Doe"))
+	ip := testBuildInfrastructureProvider(t, dbSession, nil, "test-ip", "Test Provider", ipu.ID)
+	tnu := testBuildUser(t, dbSession, nil, testGenerateStarfleetID(), cutil.GetPtr("jdoe@test.com"), cutil.GetPtr("John"), cutil.GetPtr("Doe"))
+	tn := testBuildTenant(t, dbSession, nil, "test-tenant", "test-tenant-org", tnu.ID)
+	st := testBuildSite(t, dbSession, nil, ip.ID, "test-site", "Test Site", ip.Org, ipu.ID)
+	controllerID := uuid.New()
+	vpc := testBuildVpc(
+		t,
+		dbSession,
+		nil,
+		"test-vpc",
+		nil,
+		tn.Org,
+		ip.ID,
+		tn.ID,
+		st.ID,
+		nil,
+		cutil.GetPtr(VpcEthernetVirtualizer),
+		&controllerID,
+		nil,
+		cutil.GetPtr(VpcStatusError),
+		tnu.ID,
+		nil,
+	)
+
+	vpcDAO := NewVpcDAO(dbSession)
+	require.NoError(t, vpcDAO.DeleteByID(context.Background(), nil, vpc.ID))
+
+	t.Run("clears soft-delete marker", func(t *testing.T) {
+		cleared, err := vpcDAO.Clear(context.Background(), nil, VpcClearInput{
+			VpcID:   vpc.ID,
+			Deleted: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, cleared)
+		assert.Nil(t, cleared.Deleted)
+
+		updated, err := vpcDAO.Update(context.Background(), nil, VpcUpdateInput{
+			VpcID:           vpc.ID,
+			Status:          cutil.GetPtr(VpcStatusReady),
+			IsMissingOnSite: cutil.GetPtr(false),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, VpcStatusReady, updated.Status)
+		assert.False(t, updated.IsMissingOnSite)
+	})
+
+	t.Run("clears soft-delete marker and description together", func(t *testing.T) {
+		_, err := vpcDAO.Update(context.Background(), nil, VpcUpdateInput{
+			VpcID:       vpc.ID,
+			Description: cutil.GetPtr("description to clear"),
+		})
+		require.NoError(t, err)
+		require.NoError(t, vpcDAO.DeleteByID(context.Background(), nil, vpc.ID))
+
+		cleared, err := vpcDAO.Clear(context.Background(), nil, VpcClearInput{
+			VpcID:       vpc.ID,
+			Deleted:     true,
+			Description: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, cleared)
+		assert.Nil(t, cleared.Deleted)
+		assert.Nil(t, cleared.Description)
+	})
+
+	t.Run("returns not found for unknown VPC", func(t *testing.T) {
+		_, err := vpcDAO.Clear(context.Background(), nil, VpcClearInput{
+			VpcID:   uuid.New(),
+			Deleted: true,
+		})
+		assert.ErrorIs(t, err, db.ErrDoesNotExist)
+	})
+}
+
 func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 	// Create test DB
 	dbSession := testInitDB(t)
@@ -1386,6 +1556,14 @@ func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 	vpc.NetworkSecurityGroupPropagationDetails = &NetworkSecurityGroupPropagationDetails{
 		NetworkSecurityGroupPropagationObjectStatus: &corev1.NetworkSecurityGroupPropagationObjectStatus{},
 	}
+	vpc.RoutingProfileOverrides = &VpcRoutingProfileOverrides{
+		LeakDefaultRouteFromUnderlay: cutil.GetPtr(false),
+	}
+	vpc.EffectiveRoutingProfile = &VpcEffectiveRoutingProfile{
+		LeakDefaultRouteFromUnderlay: true,
+		Internal:                     true,
+		AccessTier:                   9,
+	}
 
 	testUpdateVpc(t, dbSession, vpc)
 
@@ -1405,6 +1583,8 @@ func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 		labels                                 bool
 		networkSecuritygroupID                 bool
 		networkSecurityGroupPropagationDetails bool
+		routingProfileOverrides                bool
+		effectiveRoutingProfile                bool
 	}
 	tests := []struct {
 		name               string
@@ -1426,6 +1606,8 @@ func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 				labels:                                 true,
 				networkSecuritygroupID:                 true,
 				networkSecurityGroupPropagationDetails: true,
+				routingProfileOverrides:                true,
+				effectiveRoutingProfile:                true,
 			},
 			wantErr:            false,
 			verifyChildSpanner: true,
@@ -1445,6 +1627,8 @@ func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 				Labels:                                 tt.args.labels,
 				NetworkSecurityGroupID:                 tt.args.networkSecuritygroupID,
 				NetworkSecurityGroupPropagationDetails: tt.args.networkSecurityGroupPropagationDetails,
+				RoutingProfileOverrides:                tt.args.routingProfileOverrides,
+				EffectiveRoutingProfile:                tt.args.effectiveRoutingProfile,
 			}
 
 			got, err := vsd.Clear(tt.args.ctx, tt.args.tx, input)
@@ -1474,6 +1658,20 @@ func TestVpcSQLDAO_ClearFromParams(t *testing.T) {
 				assert.Nil(t, got.NetworkSecurityGroupID)
 				assert.Nil(t, got.NetworkSecurityGroup)
 			}
+
+			if tt.args.routingProfileOverrides {
+				assert.Nil(t, got.RoutingProfileOverrides)
+			}
+
+			if tt.args.effectiveRoutingProfile {
+				assert.Nil(t, got.EffectiveRoutingProfile)
+			}
+
+			// A fresh lookup verifies both JSONB columns were cleared in storage.
+			persisted, gerr := vsd.GetByID(tt.args.ctx, nil, got.ID, nil)
+			require.NoError(t, gerr)
+			assert.Nil(t, persisted.RoutingProfileOverrides)
+			assert.Nil(t, persisted.EffectiveRoutingProfile)
 		})
 	}
 }
@@ -1516,6 +1714,7 @@ func TestVpc_ToProto(t *testing.T) {
 			NetworkSecurityGroupID:    &nsg,
 			NVLinkLogicalPartitionID:  &nvllpID,
 			NetworkVirtualizationType: &fnn,
+			SlaacEnabled:              true,
 			RoutingProfile:            &routingProfile,
 			Vni:                       &requestedVni,
 			ActiveVni:                 &activeVni,
@@ -1543,6 +1742,8 @@ func TestVpc_ToProto(t *testing.T) {
 		assert.Equal(t, nvllpID.String(), got.Config.DefaultNvlinkLogicalPartitionId.Value)
 		require.NotNil(t, got.Config.NetworkVirtualizationType)
 		assert.Equal(t, corev1.VpcVirtualizationType_FNN, *got.Config.NetworkVirtualizationType)
+		require.NotNil(t, got.Config.SlaacEnabled)
+		assert.True(t, *got.Config.SlaacEnabled)
 		require.NotNil(t, got.Config.Vni)
 		assert.Equal(t, uint32(requestedVni), *got.Config.Vni)
 		require.NotNil(t, got.Config.RoutingProfileType)
@@ -1571,6 +1772,8 @@ func TestVpc_ToProto(t *testing.T) {
 		require.NotNil(t, got.Config)
 		assert.Nil(t, got.Config.NetworkSecurityGroupId)
 		assert.Nil(t, got.Config.DefaultNvlinkLogicalPartitionId)
+		require.NotNil(t, got.Config.SlaacEnabled)
+		assert.False(t, *got.Config.SlaacEnabled)
 	})
 
 	t.Run("uses ControllerVpcID for the proto Id when set", func(t *testing.T) {
@@ -1671,6 +1874,7 @@ func TestVpc_FromProto(t *testing.T) {
 				TenantOrganizationId:            "org-1",
 				NetworkSecurityGroupId:          &nsg,
 				NetworkVirtualizationType:       &fnnEnum,
+				SlaacEnabled:                    cutil.GetPtr(true),
 				Vni:                             &requestedVni,
 				RoutingProfileType:              &routingProfile,
 				DefaultNvlinkLogicalPartitionId: &corev1.NVLinkLogicalPartitionId{Value: nvllpID.String()},
@@ -1691,6 +1895,7 @@ func TestVpc_FromProto(t *testing.T) {
 		assert.Equal(t, "nsg-1", *v.NetworkSecurityGroupID)
 		require.NotNil(t, v.NetworkVirtualizationType)
 		assert.Equal(t, VpcFNN, *v.NetworkVirtualizationType)
+		assert.True(t, v.SlaacEnabled)
 		require.NotNil(t, v.Vni)
 		assert.Equal(t, int(requestedVni), *v.Vni)
 		require.NotNil(t, v.ActiveVni)
@@ -1750,10 +1955,13 @@ func TestVpc_FromProto(t *testing.T) {
 			Description:               &staleDesc,
 			NetworkSecurityGroupID:    &staleNSG,
 			NetworkVirtualizationType: &staleVirt,
+			SlaacEnabled:              true,
 			RoutingProfile:            &staleRouting,
 			Vni:                       &staleRequested,
 			ActiveVni:                 &staleActive,
 			NVLinkLogicalPartitionID:  &staleNvllp,
+			RoutingProfileOverrides:   &VpcRoutingProfileOverrides{LeakDefaultRouteFromUnderlay: cutil.GetPtr(false)},
+			EffectiveRoutingProfile:   &VpcEffectiveRoutingProfile{Internal: true, AccessTier: 4},
 			Labels:                    map[string]string{"old": "val"},
 		}
 		v.FromProto(&corev1.Vpc{
@@ -1772,10 +1980,13 @@ func TestVpc_FromProto(t *testing.T) {
 		assert.Empty(t, v.Org)
 		assert.Nil(t, v.NetworkSecurityGroupID)
 		assert.Nil(t, v.NetworkVirtualizationType)
+		assert.False(t, v.SlaacEnabled)
 		assert.Nil(t, v.RoutingProfile)
 		assert.Nil(t, v.Vni)
 		assert.Nil(t, v.ActiveVni)
 		assert.Nil(t, v.NVLinkLogicalPartitionID)
+		assert.Nil(t, v.RoutingProfileOverrides)
+		assert.Nil(t, v.EffectiveRoutingProfile)
 		assert.Nil(t, v.Description)
 		assert.Nil(t, v.Labels)
 	})
@@ -1831,11 +2042,29 @@ func TestVpc_ToProtoFromProto_RoundTrip(t *testing.T) {
 		Org:                       "org-rt",
 		Name:                      "vpc-rt",
 		NetworkVirtualizationType: &fnn,
+		SlaacEnabled:              true,
 		NetworkSecurityGroupID:    &nsg,
 		RoutingProfile:            &routing,
 		Vni:                       &requested,
 		ActiveVni:                 &active,
 		NVLinkLogicalPartitionID:  &nvllpID,
+		RoutingProfileOverrides: &VpcRoutingProfileOverrides{
+			RouteTargetImports:           &[]VpcRouteTarget{{ASN: 64512, VNI: 23}},
+			RouteTargetsOnExports:        &[]VpcRouteTarget{},
+			LeakDefaultRouteFromUnderlay: cutil.GetPtr(false),
+			AcceptedLeaksFromUnderlay:    &[]string{"10.0.0.1/24"},
+			AllowedAnycastPrefixes:       &[]string{},
+		},
+		EffectiveRoutingProfile: &VpcEffectiveRoutingProfile{
+			RouteTargetImports:             []VpcRouteTarget{{ASN: 64512, VNI: 23}},
+			RouteTargetsOnExports:          []VpcRouteTarget{},
+			LeakDefaultRouteFromUnderlay:   true,
+			LeakTenantHostRoutesToUnderlay: true,
+			AcceptedLeaksFromUnderlay:      []string{"10.0.0.0/24"},
+			AllowedAnycastPrefixes:         []string{},
+			Internal:                       true,
+			AccessTier:                     4,
+		},
 	}
 
 	got := &Vpc{}
@@ -1845,9 +2074,44 @@ func TestVpc_ToProtoFromProto_RoundTrip(t *testing.T) {
 	assert.Equal(t, orig.Name, got.Name)
 	assert.Equal(t, orig.Org, got.Org)
 	assert.Equal(t, orig.NetworkVirtualizationType, got.NetworkVirtualizationType)
+	assert.Equal(t, orig.SlaacEnabled, got.SlaacEnabled)
 	assert.Equal(t, orig.NetworkSecurityGroupID, got.NetworkSecurityGroupID)
 	assert.Equal(t, orig.RoutingProfile, got.RoutingProfile)
 	assert.Equal(t, orig.Vni, got.Vni)
 	assert.Equal(t, orig.ActiveVni, got.ActiveVni)
 	assert.Equal(t, orig.NVLinkLogicalPartitionID, got.NVLinkLogicalPartitionID)
+	assert.Equal(t, orig.RoutingProfileOverrides, got.RoutingProfileOverrides)
+	assert.Equal(t, orig.EffectiveRoutingProfile, got.EffectiveRoutingProfile)
+
+	t.Run("normalizes nil effective routing profile lists", func(t *testing.T) {
+		// Core repeated fields canonicalize nil lists to allocated empty slices.
+		profileVpc := &Vpc{
+			ID:   uuid.New(),
+			Name: "vpc-a",
+			EffectiveRoutingProfile: &VpcEffectiveRoutingProfile{
+				LeakDefaultRouteFromUnderlay:   true,
+				LeakTenantHostRoutesToUnderlay: true,
+				TenantLeakCommunitiesAccepted:  true,
+				Internal:                       true,
+				AccessTier:                     4,
+			},
+		}
+
+		roundTripped := &Vpc{}
+		roundTripped.FromProto(profileVpc.ToProto())
+		require.NotNil(t, roundTripped.EffectiveRoutingProfile)
+		assert.NotNil(t, roundTripped.EffectiveRoutingProfile.RouteTargetImports)
+		assert.Empty(t, roundTripped.EffectiveRoutingProfile.RouteTargetImports)
+		assert.NotNil(t, roundTripped.EffectiveRoutingProfile.RouteTargetsOnExports)
+		assert.Empty(t, roundTripped.EffectiveRoutingProfile.RouteTargetsOnExports)
+		assert.NotNil(t, roundTripped.EffectiveRoutingProfile.AcceptedLeaksFromUnderlay)
+		assert.Empty(t, roundTripped.EffectiveRoutingProfile.AcceptedLeaksFromUnderlay)
+		assert.NotNil(t, roundTripped.EffectiveRoutingProfile.AllowedAnycastPrefixes)
+		assert.Empty(t, roundTripped.EffectiveRoutingProfile.AllowedAnycastPrefixes)
+		assert.True(t, roundTripped.EffectiveRoutingProfile.LeakDefaultRouteFromUnderlay)
+		assert.True(t, roundTripped.EffectiveRoutingProfile.LeakTenantHostRoutesToUnderlay)
+		assert.True(t, roundTripped.EffectiveRoutingProfile.TenantLeakCommunitiesAccepted)
+		assert.True(t, roundTripped.EffectiveRoutingProfile.Internal)
+		assert.Equal(t, uint32(4), roundTripped.EffectiveRoutingProfile.AccessTier)
+	})
 }

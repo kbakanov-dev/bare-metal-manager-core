@@ -59,6 +59,8 @@ type APIClient struct {
 
 	BMCResetAPI *BMCResetAPIService
 
+	CredentialRotationAPI *CredentialRotationAPIService
+
 	DPUExtensionServiceAPI *DPUExtensionServiceAPIService
 
 	DPUReprovisionAPI *DPUReprovisionAPIService
@@ -88,6 +90,12 @@ type APIClient struct {
 	InstanceTypeAPI *InstanceTypeAPIService
 
 	MachineAPI *MachineAPIService
+
+	MachineValidationAPI *MachineValidationAPIService
+
+	MeasuredBootTrustedMachineAPI *MeasuredBootTrustedMachineAPIService
+
+	MeasuredBootTrustedProfileAPI *MeasuredBootTrustedProfileAPIService
 
 	MetadataAPI *MetadataAPIService
 
@@ -158,6 +166,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.AuditAPI = (*AuditAPIService)(&c.common)
 	c.BMCCredentialAPI = (*BMCCredentialAPIService)(&c.common)
 	c.BMCResetAPI = (*BMCResetAPIService)(&c.common)
+	c.CredentialRotationAPI = (*CredentialRotationAPIService)(&c.common)
 	c.DPUExtensionServiceAPI = (*DPUExtensionServiceAPIService)(&c.common)
 	c.DPUReprovisionAPI = (*DPUReprovisionAPIService)(&c.common)
 	c.ExpectedMachineAPI = (*ExpectedMachineAPIService)(&c.common)
@@ -173,6 +182,9 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.InstanceAPI = (*InstanceAPIService)(&c.common)
 	c.InstanceTypeAPI = (*InstanceTypeAPIService)(&c.common)
 	c.MachineAPI = (*MachineAPIService)(&c.common)
+	c.MachineValidationAPI = (*MachineValidationAPIService)(&c.common)
+	c.MeasuredBootTrustedMachineAPI = (*MeasuredBootTrustedMachineAPIService)(&c.common)
+	c.MeasuredBootTrustedProfileAPI = (*MeasuredBootTrustedProfileAPIService)(&c.common)
 	c.MetadataAPI = (*MetadataAPIService)(&c.common)
 	c.NVLinkLogicalPartitionAPI = (*NVLinkLogicalPartitionAPIService)(&c.common)
 	c.NetworkSecurityGroupAPI = (*NetworkSecurityGroupAPIService)(&c.common)
@@ -565,6 +577,15 @@ func (c *APIClient) decode(v interface{}, b []byte, contentType string) (err err
 	}
 	if s, ok := v.(*string); ok {
 		*s = string(b)
+		return nil
+	}
+	if r, ok := v.(*io.Reader); ok {
+		*r = bytes.NewReader(b)
+		return nil
+	}
+	// Must stay before the JSON branch: json.Unmarshal would base64-decode into *[]byte.
+	if p, ok := v.(*[]byte); ok {
+		*p = b
 		return nil
 	}
 	if f, ok := v.(*os.File); ok {

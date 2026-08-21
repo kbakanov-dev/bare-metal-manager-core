@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
@@ -26,7 +27,7 @@ use carbide_uuid::infiniband::IBPartitionId;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::MachineId;
 use carbide_uuid::network::NetworkSegmentId;
-use carbide_uuid::vpc::VpcId;
+use carbide_uuid::vpc::{VpcId, VpcPrefixId};
 use db::{
     DatabaseError, ObjectColumnFilter, WithTransaction, extension_service, network_security_group,
 };
@@ -53,18 +54,20 @@ use model::machine::{
 use model::metadata::Metadata;
 use model::network_segment::{NetworkSegmentSearchConfig, NetworkSegmentType};
 use model::os::OperatingSystem;
+use model::tenant::TenantOrganizationId;
 use model::vpc::{FabricInterfaceType, VpcVirtualizationTypeCapabilities};
 use serde_json::json;
 use sqlx::PgConnection;
 use tonic::{Request, Response, Status};
 
 use crate::api::{Api, log_machine_id, log_request_data, log_tenant_organization_id};
-use crate::cfg::file::FnnConfig;
+use crate::cfg::file::CarbideConfig;
 use crate::ethernet_virtualization::validate_instance_interface_routing_profiles;
 use crate::handlers::utils::convert_and_log_machine_id;
 use crate::instance::{
     InstanceAllocationRequest, allocate_ib_port_guid, allocate_instance, allocate_network,
-    allocate_spx_port_mac, validate_ib_partition_ownership, validate_os_definition_usable,
+    allocate_spx_port_mac, validate_ib_partition_ownership,
+    validate_instance_vfs_against_dpf_topology, validate_os_definition_usable,
     validate_spx_partition_ownership,
 };
 use crate::{CarbideError, CarbideResult};
@@ -1243,6 +1246,15 @@ pub(crate) async fn update_instance_config(
             id: instance_id.to_string(),
         })?;
 
+    // power_profile was added to the complete-config update request after the
+    // API was deployed. Preserve the stored value when older clients omit it;
+    // an explicit empty string is the wire representation for clearing it.
+    config.power_profile = match config.power_profile.take() {
+        Some(profile) if profile.is_empty() => None,
+        Some(profile) => Some(profile),
+        None => instance.config.power_profile.clone(),
+    };
+
     log_machine_id(&instance.machine_id);
     log_tenant_organization_id(instance.config.tenant.tenant_organization_id.as_str());
 
@@ -1377,12 +1389,7 @@ pub(crate) async fn update_instance_config(
     }
 
     update_instance_network_config(
-        api.runtime_config
-            .vmaas_config
-            .as_ref()
-            .map(|vc| vc.allow_instance_vf)
-            .unwrap_or(true),
-        api.runtime_config.fnn.as_ref(),
+        &api.runtime_config,
         &instance,
         &mut config.network,
         &mh_snapshot,
@@ -1445,8 +1452,7 @@ pub(crate) async fn update_instance_config(
 /// indicate the state machine to start updating network on DPUs. This function also increments
 /// network_config_version.
 async fn update_instance_network_config(
-    allow_instance_vf: bool,
-    fnn_config: Option<&FnnConfig>,
+    runtime_config: &CarbideConfig,
     instance: &InstanceSnapshot,
     network: &mut InstanceNetworkConfig,
     mh_snapshot: &ManagedHostStateSnapshot,
@@ -1537,16 +1543,34 @@ async fn update_instance_network_config(
         return Err(ConfigValidationError::InstanceDeletionIsRequested.into());
     }
 
+    // Preserve caller intent long enough to enforce prefix family and VPC allocation policy.
+    // Resource reuse below deliberately restores stored requested addresses for matching explicit
+    // prefixes, which must not erase a newly requested address before validation.
+    validate_primary_address_update_intent_before_resource_reuse(
+        network,
+        &instance.config.tenant.tenant_organization_id,
+        txn,
+    )
+    .await?;
+
     // This is the use case of adding/removing new VF.
     // Copy the resources if same interface and network are mentioned.
     network.copy_existing_resources(&instance.config.network);
 
-    // Resolve prefix-backed network resources before validating the generated segment IDs.
+    // Resolve resources associated with network prefixes before validating the generated
+    // segment IDs.
     allocate_network(network, &instance.config.tenant.tenant_organization_id, txn).await?;
     network
-        .validate(allow_instance_vf)
+        .validate(
+            runtime_config
+                .vmaas_config
+                .as_ref()
+                .map(|config| config.allow_instance_vf)
+                .unwrap_or(true),
+        )
         .map_err(CarbideError::from)?;
-    validate_instance_interface_routing_profiles(txn, network, fnn_config).await?;
+    validate_instance_vfs_against_dpf_topology(network, runtime_config)?;
+    validate_instance_interface_routing_profiles(txn, network, runtime_config.fnn.as_ref()).await?;
 
     // Allocate IPs and add them to the network config
     let updated_network_config = db::instance_network_config::with_allocated_ips(
@@ -1565,6 +1589,102 @@ async fn update_instance_network_config(
         txn,
     )
     .await?;
+
+    Ok(())
+}
+
+/// Validates explicit primary update intent before stored resources can replace it.
+///
+/// Resource reuse intentionally restores the stored primary requested address before normal
+/// allocation validation. Validate that caller intent here so it cannot be erased. An IPv6
+/// sidecar participates in resource identity, so a changed sidecar reaches the canonical
+/// allocation validator without this earlier check.
+async fn validate_primary_address_update_intent_before_resource_reuse(
+    network: &InstanceNetworkConfig,
+    tenant_organization_id: &TenantOrganizationId,
+    txn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), CarbideError> {
+    let requested_prefixes: Vec<(VpcPrefixId, IpAddr)> = network
+        .interfaces
+        .iter()
+        .filter_map(|interface| {
+            interface.requested_ip_addr.and_then(|address| {
+                match interface.network_details.as_ref() {
+                    Some(model::instance::config::network::NetworkDetails::VpcPrefixId(
+                        vpc_prefix_id,
+                    )) => Some((*vpc_prefix_id, address)),
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+
+    if requested_prefixes.is_empty() {
+        return Ok(());
+    }
+
+    // Load the same persisted prefix and VPC policy used by allocation. Missing or deleted
+    // selections remain the allocation path's responsibility so it retains its canonical errors.
+    let mut vpc_prefix_ids = requested_prefixes
+        .iter()
+        .map(|(vpc_prefix_id, _)| *vpc_prefix_id)
+        .collect_vec();
+    vpc_prefix_ids.sort_unstable();
+    vpc_prefix_ids.dedup();
+    let prefixes = db::vpc_prefix::get_for_allocation_by_ids(txn.as_mut(), &vpc_prefix_ids)
+        .await?
+        .into_iter()
+        .map(|prefix| (prefix.id, prefix))
+        .collect::<HashMap<_, _>>();
+
+    let mut vpc_ids = prefixes
+        .values()
+        .filter(|prefix| !prefix.is_marked_as_deleted())
+        .map(|prefix| prefix.vpc_id)
+        .collect_vec();
+    vpc_ids.sort_unstable();
+    vpc_ids.dedup();
+    let vpcs = if vpc_ids.is_empty() {
+        HashMap::new()
+    } else {
+        db::vpc::find_by(
+            txn.as_mut(),
+            ObjectColumnFilter::List(db::vpc::IdColumn, &vpc_ids),
+        )
+        .await?
+        .into_iter()
+        .map(|vpc| (vpc.id, vpc))
+        .collect::<HashMap<_, _>>()
+    };
+
+    for (vpc_prefix_id, requested_ip_addr) in requested_prefixes {
+        let Some(prefix) = prefixes
+            .get(&vpc_prefix_id)
+            .filter(|prefix| !prefix.is_marked_as_deleted())
+        else {
+            continue;
+        };
+        let Some(vpc) = vpcs.get(&prefix.vpc_id) else {
+            continue;
+        };
+        if vpc.config.tenant_organization_id != tenant_organization_id.to_string() {
+            return Err(CarbideError::FailedPrecondition(format!(
+                "VPC prefix `{vpc_prefix_id}` belongs to VPC `{}`, which is not owned by tenant `{tenant_organization_id}`",
+                vpc.id,
+            )));
+        }
+        if prefix.config.prefix.is_ipv6() != requested_ip_addr.is_ipv6() {
+            return Err(CarbideError::InvalidArgument(format!(
+                "requested IP address `{requested_ip_addr}` does not match VPC prefix `{vpc_prefix_id}`",
+            )));
+        }
+        if prefix.config.prefix.is_ipv6() && vpc.config.slaac_enabled {
+            return Err(CarbideError::InvalidArgument(format!(
+                "requested IPv6 address `{requested_ip_addr}` is invalid because VPC `{}` has SLAAC enabled",
+                vpc.id,
+            )));
+        }
+    }
 
     Ok(())
 }
@@ -1685,6 +1805,18 @@ async fn update_instance_extension_services_config(
         return Err(ConfigValidationError::InstanceDeletionIsRequested.into());
     }
 
+    if mh_snapshot.host_snapshot.config.dpf.used_for_ingestion
+        && instance
+            .config
+            .extension_services
+            .has_new_active_services(extension_services)
+    {
+        return Err(CarbideError::FailedPrecondition(format!(
+            "DPU extension services are not supported on DPF-managed host {}",
+            mh_snapshot.host_snapshot.id
+        )));
+    }
+
     // Calculate the new extension services config.
     let new_extension_services_config = instance
         .config
@@ -1722,7 +1854,7 @@ fn snapshot_to_instance(
         })
 }
 
-pub async fn force_delete_instance(
+pub(super) async fn force_delete_instance(
     instance_id: InstanceId,
     api: &Api,
     response: &mut AdminForceDeleteMachineResponse,
@@ -1743,24 +1875,6 @@ pub async fn force_delete_instance(
 
     let mut network_segment_ids_with_vpc = vec![];
     if let Some(update_network_req) = &instance.update_network_config_request {
-        // Not sure if new config is applied yet. Free all the resources.
-        let mut addresses = update_network_req
-            .new_config
-            .interfaces
-            .iter()
-            .flat_map(|x| x.ip_addrs.values().copied().collect_vec())
-            .collect_vec();
-
-        addresses.extend(
-            update_network_req
-                .old_config
-                .interfaces
-                .iter()
-                .flat_map(|x| x.ip_addrs.values().collect_vec()),
-        );
-
-        db::instance_address::delete_addresses(&mut txn, &addresses).await?;
-
         network_segment_ids_with_vpc = update_network_req
             .new_config
             .interfaces
@@ -1819,7 +1933,7 @@ pub async fn force_delete_instance(
     Ok(())
 }
 
-pub async fn update_instance_nvlink_config(
+async fn update_instance_nvlink_config(
     mh_snapshot: &ManagedHostStateSnapshot,
     instance: &InstanceSnapshot,
     nvlcfg: &InstanceNvLinkConfig,
@@ -1859,7 +1973,7 @@ pub async fn update_instance_nvlink_config(
     Ok(())
 }
 
-pub async fn update_instance_spx_config(
+async fn update_instance_spx_config(
     mh_snapshot: &ManagedHostStateSnapshot,
     instance: &InstanceSnapshot,
     spxcfg: &mut InstanceSpxConfig,

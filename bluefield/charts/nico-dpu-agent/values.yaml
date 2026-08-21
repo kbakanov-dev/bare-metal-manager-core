@@ -53,6 +53,15 @@ securityContext:
       - NET_RAW
 tolerations: []
 
+lldpSidecar:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
 ### Values for agent operation
 hbn:
   nvue_https_address: "nvue"
@@ -67,3 +76,5 @@ dhcp_server:
 fmds:
   # Will be updated in dpf_services.rs
   service_name: ""
+  # Empty keeps NICo's Forge signer.
+  sign_proxy_url: ""

@@ -536,6 +536,18 @@ func (ib *APIMachineInfiniBandInterface) FromProto(protoIB *corev1.InfinibandInt
 	}
 }
 
+// APIMachineLifecycleState is the data structure to capture API representation of Machine lifecycle state
+type APIMachineLifecycleState struct {
+	// Value is the current lifecycle state value
+	Value string `json:"value"`
+	// IsAboveSLA indicates if the machine has been in the state longer than the defined SLA
+	IsAboveSLA bool `json:"isAboveSLA"`
+	// Updated indicates when the state was updated to the latest value
+	Updated *time.Time `json:"updated"`
+	// SLASeconds is the defined SLA for the current state in seconds
+	SLASeconds int64 `json:"slaSeconds"`
+}
+
 // APIMachineMetadata is the data structure to capture API representation of a Machine's Metadata Info
 type APIMachineMetadata struct {
 	// DMIData is the DMI data of the machine
@@ -548,6 +560,8 @@ type APIMachineMetadata struct {
 	NetworkInterfaces []APIMachineNetworkInterface `json:"networkInterfaces,omitempty"`
 	// InfiniBandInterfaces is the list of InfiniBand interfaces of the machine
 	InfiniBandInterfaces []APIMachineInfiniBandInterface `json:"infinibandInterfaces,omitempty"`
+	// LifecycleState is the machine lifecycle state details
+	LifecycleState *APIMachineLifecycleState `json:"lifecycleState,omitempty"`
 }
 
 // NewAPIMachine accepts a DB layer Machine object and returns an API object
@@ -617,7 +631,7 @@ func NewAPIMachine(dbm *cdbm.Machine, dbmcs []cdbm.MachineCapability, dbmis []cd
 				apim.ScoutVersion = machine.LastScoutObservedVersion
 			}
 		}
-		for _, dpuID := range dbm.Metadata.GetAssociatedDpuMachineIds() {
+		for _, dpuID := range dbm.Metadata.GetStatus().GetAssociatedDpuMachineIds() {
 			if id := dpuID.GetId(); id != "" {
 				apim.AssociatedDpuMachineIds = append(apim.AssociatedDpuMachineIds, id)
 			}
@@ -637,23 +651,24 @@ func NewAPIMachine(dbm *cdbm.Machine, dbmcs []cdbm.MachineCapability, dbmis []cd
 
 		// Get the Machine json body
 		machine := dbm.Metadata
+		discoveryInfo := machine.GetStatus().GetDiscoveryInfo()
 		// BMCInfo
 		if machine.BmcInfo != nil {
 			apim.Metadata.BMCInfo = &APIBMCInfo{}
 			apim.Metadata.BMCInfo.FromProto(machine.BmcInfo)
 		}
 
-		if machine.DiscoveryInfo != nil {
+		if discoveryInfo != nil {
 			// DMIData
-			if machine.DiscoveryInfo.DmiData != nil {
+			if discoveryInfo.DmiData != nil {
 				apim.Metadata.DMIData = &APIDMIData{}
-				apim.Metadata.DMIData.FromProto(machine.DiscoveryInfo.DmiData)
+				apim.Metadata.DMIData.FromProto(discoveryInfo.DmiData)
 			}
 
 			// GPUInfo
-			if len(machine.DiscoveryInfo.Gpus) > 0 {
+			if len(discoveryInfo.Gpus) > 0 {
 				apim.Metadata.GPUs = []APIMachineGPUInfo{}
-				for _, gpuInfo := range machine.DiscoveryInfo.Gpus {
+				for _, gpuInfo := range discoveryInfo.Gpus {
 					lgpuInfo := APIMachineGPUInfo{}
 					lgpuInfo.FromProto(gpuInfo)
 					apim.Metadata.GPUs = append(apim.Metadata.GPUs, lgpuInfo)
@@ -661,9 +676,9 @@ func NewAPIMachine(dbm *cdbm.Machine, dbmcs []cdbm.MachineCapability, dbmis []cd
 			}
 
 			// Machine Network Interface Info
-			if len(machine.DiscoveryInfo.NetworkInterfaces) > 0 {
+			if len(discoveryInfo.NetworkInterfaces) > 0 {
 				apim.Metadata.NetworkInterfaces = []APIMachineNetworkInterface{}
-				for _, nwiInfo := range machine.DiscoveryInfo.NetworkInterfaces {
+				for _, nwiInfo := range discoveryInfo.NetworkInterfaces {
 					lnwiInfo := APIMachineNetworkInterface{}
 					lnwiInfo.FromProto(nwiInfo)
 					apim.Metadata.NetworkInterfaces = append(apim.Metadata.NetworkInterfaces, lnwiInfo)
@@ -671,9 +686,9 @@ func NewAPIMachine(dbm *cdbm.Machine, dbmcs []cdbm.MachineCapability, dbmis []cd
 			}
 
 			// Machine InfiniBand Interface Info
-			if len(machine.DiscoveryInfo.InfinibandInterfaces) > 0 {
+			if len(discoveryInfo.InfinibandInterfaces) > 0 {
 				apim.Metadata.InfiniBandInterfaces = []APIMachineInfiniBandInterface{}
-				for _, ibiInfo := range machine.DiscoveryInfo.InfinibandInterfaces {
+				for _, ibiInfo := range discoveryInfo.InfinibandInterfaces {
 					libiInfo := APIMachineInfiniBandInterface{}
 					libiInfo.FromProto(ibiInfo)
 					apim.Metadata.InfiniBandInterfaces = append(apim.Metadata.InfiniBandInterfaces, libiInfo)
@@ -681,6 +696,22 @@ func NewAPIMachine(dbm *cdbm.Machine, dbmcs []cdbm.MachineCapability, dbmis []cd
 			}
 		}
 
+		// machine lifecycle state
+		apim.Metadata.LifecycleState = &APIMachineLifecycleState{
+			Value:      machine.State,
+			IsAboveSLA: machine.GetStateSla().GetTimeInStateAboveSla(),
+			SLASeconds: machine.GetStateSla().GetSla().GetSeconds(),
+		}
+		if events := machine.GetEvents(); len(events) > 0 {
+			for _, event := range events {
+				if event.GetVersion() == machine.GetStateVersion() {
+					if ts := event.GetTime(); ts != nil {
+						apim.Metadata.LifecycleState.Updated = new(ts.AsTime())
+					}
+					break
+				}
+			}
+		}
 	}
 
 	apim.Health = nil

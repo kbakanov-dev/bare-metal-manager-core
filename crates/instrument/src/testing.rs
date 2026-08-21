@@ -92,6 +92,7 @@ impl CapturedLog {
 /// events at every level. Internal diagnostics whose target starts with
 /// `opentelemetry` are excluded.
 pub fn capture_logs(f: impl FnOnce()) -> Vec<CapturedLog> {
+    keep_callsites_enabled();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let layer = CaptureLayer {
         captured: captured.clone(),
@@ -114,6 +115,7 @@ pub async fn capture_logs_async<F>(future: F) -> (F::Output, Vec<CapturedLog>)
 where
     F: Future,
 {
+    keep_callsites_enabled();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let layer = CaptureLayer {
         captured: captured.clone(),
@@ -122,6 +124,17 @@ where
     let output = future.with_subscriber(subscriber).await;
     let logs = captured.lock().unwrap_or_else(|p| p.into_inner());
     (output, logs.clone())
+}
+
+/// Keeps tracing's process-wide callsite cache interested at every level.
+///
+/// A test harness may run capture and non-capture tests concurrently. Without
+/// a persistent interested dispatch, registering or dropping their temporary
+/// dispatches can rebuild the global callsite cache while another capture is
+/// active and briefly disable records that its subscriber accepts.
+fn keep_callsites_enabled() {
+    static DISPATCH: OnceLock<tracing::Dispatch> = OnceLock::new();
+    DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
 }
 
 struct CaptureLayer {
@@ -249,6 +262,13 @@ impl MetricsCapture {
         self.counter_delta(&format!("{name}#sum"), labels)
     }
 
+    /// The named gauge's current value (with exactly these label pairs). A
+    /// gauge holds a level rather than accumulating, so this reads the value
+    /// as it stands rather than the movement since [`MetricsCapture::start`].
+    pub fn gauge_value(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+        snapshot(test_registry()).value(name, labels)
+    }
+
     /// The current registry contents in Prometheus text exposition format --
     /// handy for eyeballing exact rendered names and labels in a failing test.
     pub fn render(&self) -> String {
@@ -292,6 +312,12 @@ fn snapshot(registry: &prometheus::Registry) -> Snapshot {
                     values.insert(
                         (family.name().to_string(), labels),
                         metric.get_counter().value(),
+                    );
+                }
+                prometheus::proto::MetricType::GAUGE => {
+                    values.insert(
+                        (family.name().to_string(), labels),
+                        metric.get_gauge().value(),
                     );
                 }
                 prometheus::proto::MetricType::HISTOGRAM => {

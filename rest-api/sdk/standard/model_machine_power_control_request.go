@@ -24,7 +24,7 @@ var _ MappedNullable = &MachinePowerControlRequest{}
 
 // MachinePowerControlRequest Request to power control a Machine
 type MachinePowerControlRequest struct {
-	// Power control action to apply.
+	// Redfish power control action to apply to the Machine. ACPowercycle is not supported on Viking systems.
 	Action string `json:"action"`
 	// Acknowledges that an Instance is currently attached to the Machine and this action may disrupt Tenant workload on the Instance.
 	AcknowledgeAttachedInstance *bool `json:"acknowledgeAttachedInstance,omitempty"`
@@ -148,7 +148,6 @@ func (o *MachinePowerControlRequest) UnmarshalJSON(data []byte) (err error) {
 	varMachinePowerControlRequest := _MachinePowerControlRequest{}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	err = decoder.Decode(&varMachinePowerControlRequest)
 
 	if err != nil {

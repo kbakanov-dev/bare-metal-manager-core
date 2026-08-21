@@ -48,7 +48,7 @@ use crate::api::{Api, log_request_data, log_request_data_redacted};
 use crate::auth::AuthContext;
 use crate::handlers::component_manager::component_manager_error_to_status;
 
-pub async fn get_rack(
+pub(crate) async fn get_rack(
     api: &Api,
     request: Request<rpc::GetRackRequest>,
 ) -> Result<Response<rpc::GetRackResponse>, Status> {
@@ -85,7 +85,7 @@ pub async fn get_rack(
     Ok(Response::new(rpc::GetRackResponse { rack: result }))
 }
 
-pub async fn find_ids(
+pub(crate) async fn find_ids(
     api: &Api,
     request: Request<rpc::RackSearchFilter>,
 ) -> Result<Response<rpc::RackIdList>, Status> {
@@ -98,7 +98,7 @@ pub async fn find_ids(
     Ok(Response::new(rpc::RackIdList { rack_ids }))
 }
 
-pub async fn find_by_ids(
+pub(crate) async fn find_by_ids(
     api: &Api,
     request: Request<rpc::RacksByIdsRequest>,
 ) -> Result<Response<rpc::RackList>, Status> {
@@ -136,7 +136,7 @@ pub async fn find_by_ids(
     Ok(Response::new(rpc::RackList { racks: result }))
 }
 
-pub async fn find_rack_state_histories(
+pub(crate) async fn find_rack_state_histories(
     api: &Api,
     request: Request<rpc::RackStateHistoriesRequest>,
 ) -> Result<Response<rpc::StateHistories>, Status> {
@@ -181,7 +181,7 @@ pub async fn find_rack_state_histories(
     Ok(tonic::Response::new(response))
 }
 
-pub async fn delete_rack(
+pub(crate) async fn delete_rack(
     api: &Api,
     request: Request<rpc::DeleteRackRequest>,
 ) -> Result<Response<()>, Status> {
@@ -252,7 +252,7 @@ async fn delete_rack_maintenance_access_token_after_force_delete(
 /// Force deletes a rack from the database.
 /// Unlike `delete_rack` (soft delete), this immediately hard-deletes the rack
 /// while retaining its state history.
-pub async fn admin_force_delete_rack(
+pub(crate) async fn admin_force_delete_rack(
     api: &Api,
     request: Request<rpc::AdminForceDeleteRackRequest>,
 ) -> Result<Response<rpc::AdminForceDeleteRackResponse>, Status> {
@@ -297,7 +297,7 @@ pub async fn admin_force_delete_rack(
     }))
 }
 
-pub async fn list_rack_health_reports(
+pub(crate) async fn list_rack_health_reports(
     api: &Api,
     request: Request<rpc::ListRackHealthReportsRequest>,
 ) -> Result<Response<rpc::ListHealthReportResponse>, Status> {
@@ -332,7 +332,7 @@ pub async fn list_rack_health_reports(
     }))
 }
 
-pub async fn insert_rack_health_report(
+pub(crate) async fn insert_rack_health_report(
     api: &Api,
     request: Request<rpc::InsertRackHealthReportRequest>,
 ) -> Result<Response<()>, Status> {
@@ -381,7 +381,7 @@ pub async fn insert_rack_health_report(
         report.observed_at = Some(chrono::Utc::now());
     }
     report.triggered_by = triggered_by;
-    report.update_in_alert_since(None);
+    report.update_in_alert_since(rack.health_reports.by_source(&report.source));
 
     match remove_rack_override_by_source(&rack, &mut txn, report.source.clone()).await {
         Ok(_) | Err(CarbideError::NotFoundError { .. }) => {}
@@ -399,7 +399,7 @@ pub async fn insert_rack_health_report(
     Ok(Response::new(()))
 }
 
-pub async fn remove_rack_health_report(
+pub(crate) async fn remove_rack_health_report(
     api: &Api,
     request: Request<rpc::RemoveRackHealthReportRequest>,
 ) -> Result<Response<()>, Status> {
@@ -449,7 +449,7 @@ async fn remove_rack_override_by_source(
     Ok(())
 }
 
-pub async fn get_rack_profile(
+pub(crate) async fn get_rack_profile(
     api: &Api,
     request: Request<rpc::GetRackProfileRequest>,
 ) -> Result<Response<rpc::GetRackProfileResponse>, Status> {
@@ -496,6 +496,29 @@ pub async fn get_rack_profile(
         rack_profile_id: Some(rack_profile_id.clone()),
         profile: Some(rpc_profile),
     }))
+}
+
+pub(crate) fn list_rack_profiles(
+    api: &Api,
+    request: Request<()>,
+) -> Result<Response<rpc::ListRackProfilesResponse>, Status> {
+    log_request_data(&request);
+
+    Ok(Response::new(rpc::ListRackProfilesResponse {
+        rack_profiles: configured_rack_profiles(&api.runtime_config.rack_profiles),
+    }))
+}
+
+fn configured_rack_profiles(
+    config: &model::rack_type::RackProfileConfig,
+) -> Vec<rpc::ConfiguredRackProfile> {
+    let mut rack_profiles = config.rack_profiles.iter().collect::<Vec<_>>();
+    rack_profiles.sort_unstable_by_key(|(rack_profile_id, _)| *rack_profile_id);
+
+    rack_profiles
+        .into_iter()
+        .map(|(rack_profile_id, profile)| (rack_profile_id.as_str(), profile).into())
+        .collect()
 }
 
 pub(crate) async fn update_rack_metadata(
@@ -568,6 +591,100 @@ fn set_maintenance_access_token(
 
     *maintenance_access_token = Some(access_token);
     Ok(())
+}
+
+#[derive(Event)]
+#[event(
+    event_name = "rack_maintenance_termination_access_token_cleanup_failed",
+    metric_name = "carbide_rack_maintenance_access_token_cleanup_failures_total",
+    component = "nico-api",
+    log = warn,
+    metric = counter,
+    message = "failed to delete rack maintenance access token during termination",
+    describe = "Number of rack maintenance access token cleanup failures"
+)]
+struct RackMaintenanceTerminationAccessTokenCleanupFailed {
+    #[context]
+    rack_id: RackId,
+    #[context]
+    error: String,
+}
+
+async fn delete_rack_maintenance_access_token_after_termination(
+    credential_manager: &dyn CredentialManager,
+    rack_id: &RackId,
+) {
+    if let Err(error) = credential_manager
+        .delete_credentials(&rack_maintenance_access_token_key(rack_id))
+        .await
+    {
+        emit(RackMaintenanceTerminationAccessTokenCleanupFailed {
+            rack_id: rack_id.clone(),
+            error: error.to_string(),
+        });
+    }
+}
+
+pub(crate) async fn terminate_rack_maintenance(
+    api: &Api,
+    request: Request<rpc::RackMaintenanceTerminateRequest>,
+) -> Result<Response<rpc::RackMaintenanceTerminateResponse>, Status> {
+    log_request_data(&request);
+    let request = request.into_inner();
+    let rack_id = request
+        .rack_id
+        .ok_or_else(|| CarbideError::InvalidArgument("rack_id is required".into()))?;
+
+    let mut txn = api.txn_begin().await?;
+    if !db_rack::lock_for_update(txn.as_mut(), &rack_id)
+        .await
+        .map_err(CarbideError::from)?
+    {
+        return Err(CarbideError::NotFoundError {
+            kind: "rack",
+            id: rack_id.to_string(),
+        }
+        .into());
+    }
+
+    let mut rack = db_rack::find_by(
+        &mut txn,
+        ObjectColumnFilter::One(db_rack::IdColumn, &rack_id),
+    )
+    .await
+    .map_err(CarbideError::from)?
+    .pop()
+    .ok_or_else(|| CarbideError::NotFoundError {
+        kind: "rack",
+        id: rack_id.to_string(),
+    })?;
+
+    if !matches!(rack.controller_state.value, RackState::Maintenance { .. }) {
+        return Err(CarbideError::InvalidArgument(format!(
+            "rack {rack_id} is not in maintenance (current: {:?})",
+            rack.controller_state.value
+        ))
+        .into());
+    }
+
+    if !rack.config.maintenance_termination_requested {
+        rack.config.maintenance_termination_requested = true;
+        db_rack::update(txn.as_mut(), &rack_id, &rack.config)
+            .await
+            .map_err(CarbideError::from)?;
+    }
+    txn.commit().await?;
+
+    // The database request is durable before external credential cleanup. The
+    // rack controller will still terminate if the credential store is unavailable.
+    delete_rack_maintenance_access_token_after_termination(
+        api.credential_manager.as_ref(),
+        &rack_id,
+    )
+    .await;
+
+    tracing::info!(rack_id = %rack_id, "Rack maintenance termination requested");
+    Ok(Response::new(rpc::RackMaintenanceTerminateResponse {}))
 }
 
 pub(crate) async fn on_demand_rack_maintenance(
@@ -851,11 +968,42 @@ pub(crate) async fn on_demand_rack_maintenance(
 mod tests {
     use carbide_instrument::testing::{MetricsCapture, capture_logs};
     use carbide_secrets::test_support::credentials::TestCredentialManager;
+    use model::rack_type::{RackProfile, RackProfileConfig};
 
     use super::*;
 
     const ACCESS_TOKEN_CLEANUP_FAILURE_METRIC: &str =
         "carbide_rack_maintenance_access_token_cleanup_failures_total";
+
+    #[test]
+    fn configured_rack_profiles_are_sorted_and_support_empty_config() {
+        carbide_test_support::value_scenarios!(
+            run = |rack_profile_ids: &[&str]| {
+                let config = RackProfileConfig {
+                    rack_profiles: rack_profile_ids
+                        .iter()
+                        .map(|rack_profile_id| {
+                            ((*rack_profile_id).to_string(), RackProfile::default())
+                        })
+                        .collect(),
+                };
+
+                configured_rack_profiles(&config)
+                    .into_iter()
+                    .map(|configured| {
+                        configured
+                            .rack_profile_id
+                            .expect("configured profile must have an ID")
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            "runtime rack profile configuration" {
+                &[][..] => Vec::<String>::new(),
+                &["zulu", "alpha"][..] => vec!["alpha".to_string(), "zulu".to_string()],
+            }
+        );
+    }
 
     #[derive(Debug, PartialEq)]
     struct AccessTokenCleanupObservation {

@@ -38,6 +38,7 @@ pub mod allocation_type;
 pub mod attestation;
 pub mod bmc_info;
 pub mod bmc_redfish_session;
+pub mod bmc_suppression;
 pub mod component_manager;
 pub mod compute_allocation;
 pub mod controller_outcome;
@@ -67,6 +68,7 @@ pub mod machine_boot_interface;
 pub mod machine_boot_override;
 pub mod machine_interface;
 pub mod machine_interface_address;
+pub mod machine_pending_action;
 pub mod machine_update_module;
 pub mod machine_validation;
 pub mod metadata;
@@ -114,6 +116,12 @@ pub enum ConfigValidationError {
     /// A configuration value is invalid
     #[error("invalid value: {0}")]
     InvalidValue(String),
+
+    #[error(
+        "initial VPC `{name}` cannot define `routing_profile_overrides`; inline routing-profile \
+         overrides are only supported by VPC creation requests"
+    )]
+    InitialVpcRoutingProfileOverridesUnsupported { name: String },
 
     #[error("found unknown segments")]
     UnknownSegments,
@@ -307,7 +315,7 @@ mod tests {
     use super::*;
 
     #[test]
-    pub fn serialize_mac_address() {
+    fn serialize_mac_address() {
         let mac = MacAddress::new([1, 2, 3, 4, 5, 6]);
         let serialized = serde_json::to_string(&SerializableMacAddress::from(mac)).unwrap();
         assert_eq!(serialized, "\"01:02:03:04:05:06\"");

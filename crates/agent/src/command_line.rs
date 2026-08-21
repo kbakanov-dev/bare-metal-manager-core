@@ -18,7 +18,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use carbide_network::ip::prefix::Ipv4Net;
 use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_uuid::machine::MachineId;
 use clap::{Parser, ValueEnum};
@@ -60,7 +59,10 @@ pub enum AgentCommand {
     Health,
 
     #[clap(about = "Print LLDP neighbors visible on this host and exit")]
-    LldpNeighbors,
+    LldpNeighbors(LldpNeighborsOptions),
+
+    #[clap(about = "Continuously publish host LLDP snapshots for a containerized agent")]
+    SidecarMode,
 
     #[clap(about = "One-off network monitor")]
     Network(NetworkOptions),
@@ -72,7 +74,7 @@ pub enum AgentCommand {
     Write(WriteTarget),
 }
 
-pub const DEFAULT_BOOTSTRAP_CA_URL: &str = "http://carbide-pxe.forge/api/v0/tls/root_ca";
+const DEFAULT_BOOTSTRAP_CA_URL: &str = "http://carbide-pxe.forge/api/v0/tls/root_ca";
 
 fn parse_bootstrap_ca_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|error| format!("invalid URL: {error}"))?;
@@ -214,36 +216,6 @@ pub struct NvueOptions {
         default_value_t = false
     )]
     pub stateful_acls_enabled: bool,
-
-    #[clap(
-        long,
-        help = "IP to be used for a local VTEP when configuring an additional overlay network"
-    )]
-    pub secondary_overlay_vtep_ip: Option<IpAddr>,
-
-    #[clap(
-        long,
-        help = "Prefix to be used for configuring a set of internal bridges to be used with advanced routing for traffic interception.  Prefix length is expected to be /29 or smaller (i.e., 8 or more IP addresses)."
-    )]
-    pub internal_bridge_routing_prefix: Option<Ipv4Net>,
-
-    #[clap(
-        long,
-        help = "The name of a patch-port to be used with advanced routing for traffic interception that connects the HBN pod to an intermediate bridge between VFs and HBN."
-    )]
-    pub vf_intercept_bridge_port_name: Option<String>,
-
-    #[clap(
-        long,
-        help = "The name of patch-port to be used with advanced routing for traffic interception that connects the HBN pod to an intermediate bridge between the host PF and HBN."
-    )]
-    pub host_intercept_bridge_port_name: Option<String>,
-
-    #[clap(
-        long,
-        help = "The SF used for routing intercepted VF traffic to the HBN pod."
-    )]
-    pub vf_intercept_bridge_sf: Option<String>,
 
     #[clap(
         long,
@@ -447,6 +419,17 @@ pub struct HardwareOptions {
         help = "Write the hardware output (a JSON-serialized rpc::DiscoveryInfo message) to the specified file"
     )]
     pub output_file: Option<PathBuf>,
+    #[clap(
+        long,
+        default_value = "dpu-os",
+        help = "Set the platform type. Specify \"dpu-os\" or \"containerized\".",
+        env = "AGENT_PLATFORM_TYPE"
+    )]
+    pub agent_platform_type: AgentPlatformType,
+}
+
+#[derive(Parser, Debug)]
+pub struct LldpNeighborsOptions {
     #[clap(
         long,
         default_value = "dpu-os",
@@ -737,5 +720,33 @@ mod tests {
                 "containerized" => true,
             }
         );
+    }
+
+    #[test]
+    fn test_lldp_neighbors_subcommand_accepts_platform_types() {
+        value_scenarios!(run = |value: &str| {
+            Options::try_parse_from([
+                "forge-dpu-agent",
+                "lldp-neighbors",
+                "--agent-platform-type",
+                value,
+            ])
+            .is_ok_and(|opts| matches!(opts.cmd, Some(AgentCommand::LldpNeighbors(_))))
+        };
+            "supported LLDP platform types parse" {
+                "dpu-os" => true,
+                "containerized" => true,
+            }
+
+            "unknown LLDP platform types are rejected" {
+                "init-container" => false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_sidecar_mode_subcommand_parses_without_args() {
+        let opts = Options::try_parse_from(["forge-dpu-agent", "sidecar-mode"]).unwrap();
+        assert!(matches!(opts.cmd, Some(AgentCommand::SidecarMode)));
     }
 }

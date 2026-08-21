@@ -85,6 +85,7 @@ func TestMachineDetailToSpec(t *testing.T) {
 	assert.Equal(t, "SN-001", s.SerialNumber)
 	assert.Equal(t, "Foxconn", s.Manufacturer)
 	assert.Equal(t, "MGX-Compute-Gen2", s.Model)
+	assert.Equal(t, "compute node", s.Description)
 	assert.Equal(t, 5, s.SlotID)
 	assert.Equal(t, 1, s.TrayIndex)
 	assert.Equal(t, 3, s.HostID)
@@ -97,20 +98,24 @@ func TestSwitchDetailToSpec_TypeIsNVSwitch(t *testing.T) {
 	s := switchDetailToSpec(nicoapi.ExpectedSwitchDetail{
 		SwitchSerialNumber: "SW-1",
 		BMCMACAddress:      "00:00:00:00:00:01",
+		Description:        "fabric switch",
 		Labels:             map[string]string{labelComponentManufacturer: "NVIDIA"},
 	})
 	assert.Equal(t, devicetypes.ComponentTypeToString(devicetypes.ComponentTypeNVSwitch), s.Type)
 	assert.Equal(t, "SW-1", s.SerialNumber)
+	assert.Equal(t, "fabric switch", s.Description)
 }
 
 func TestPowerShelfDetailToSpec_TypeIsPowerShelf(t *testing.T) {
 	s := powerShelfDetailToSpec(nicoapi.ExpectedPowerShelfDetail{
 		ShelfSerialNumber: "PS-1",
 		BMCMACAddress:     "00:00:00:00:00:02",
+		Description:       "power shelf",
 		Labels:            map[string]string{labelComponentManufacturer: "NVIDIA"},
 	})
 	assert.Equal(t, devicetypes.ComponentTypeToString(devicetypes.ComponentTypePowerShelf), s.Type)
 	assert.Equal(t, "PS-1", s.SerialNumber)
+	assert.Equal(t, "power shelf", s.Description)
 }
 
 func TestSpecValid(t *testing.T) {
@@ -121,17 +126,115 @@ func TestSpecValid(t *testing.T) {
 	}
 	assert.True(t, specValid(base), "complete spec should be valid")
 
-	for name, mutate := range map[string]func(*expectedComponentSpec){
-		"missing manufacturer": func(s *expectedComponentSpec) { s.Manufacturer = "" },
-		"missing serial":       func(s *expectedComponentSpec) { s.SerialNumber = "" },
-		"missing bmc mac":      func(s *expectedComponentSpec) { s.BMC.MACAddress = "" },
+	for name, tc := range map[string]struct {
+		mutate func(*expectedComponentSpec)
+		want   bool
+	}{
+		"missing manufacturer": {mutate: func(s *expectedComponentSpec) { s.Manufacturer = "" }, want: true},
+		"missing serial":       {mutate: func(s *expectedComponentSpec) { s.SerialNumber = "" }, want: true},
+		"missing both labels": {mutate: func(s *expectedComponentSpec) {
+			s.Manufacturer = ""
+			s.SerialNumber = ""
+		}, want: true},
+		"missing bmc mac": {mutate: func(s *expectedComponentSpec) { s.BMC.MACAddress = "" }, want: false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := base
-			mutate(&s)
-			assert.False(t, specValid(s))
+			tc.mutate(&s)
+			assert.Equal(t, tc.want, specValid(s))
 		})
 	}
+}
+
+func TestHostBMCMACs(t *testing.T) {
+	hostType := devicetypes.BMCTypeToString(devicetypes.BMCTypeHost)
+
+	t.Run("returns the normalised MAC of every host BMC", func(t *testing.T) {
+		c := &model.Component{BMCs: []model.BMC{
+			{MacAddress: "AA:BB:CC:DD:EE:FF", Type: hostType},
+			{MacAddress: "aa:bb:cc:dd:ee:01", Type: hostType},
+		}}
+		assert.Equal(t, []string{"aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:01"}, hostBMCMACs(c))
+	})
+
+	t.Run("non-host BMCs are ignored", func(t *testing.T) {
+		c := &model.Component{BMCs: []model.BMC{
+			{MacAddress: "aa:bb:cc:dd:ee:ff", Type: devicetypes.BMCTypeToString(devicetypes.BMCTypeDPU)},
+		}}
+		assert.Empty(t, hostBMCMACs(c))
+	})
+
+	t.Run("a component with no BMC at all yields nothing", func(t *testing.T) {
+		assert.Empty(t, hostBMCMACs(&model.Component{}))
+	})
+}
+
+func TestStillReportedByCore(t *testing.T) {
+	seenMACs := map[string]struct{}{"aa:bb:cc:dd:ee:ff": {}}
+	seenNaturalKeys := map[string]struct{}{naturalKey("Foxconn", "SN-1"): {}}
+
+	tests := []struct {
+		name       string
+		macs       []string
+		naturalKey string
+		want       bool
+	}{
+		{name: "MAC still reported", macs: []string{"aa:bb:cc:dd:ee:ff"}, want: true},
+		{
+			name:       "BMC board swapped, chassis pair still reported",
+			macs:       []string{"aa:bb:cc:dd:ee:02"},
+			naturalKey: naturalKey("Foxconn", "SN-1"),
+			want:       true,
+		},
+		{
+			name:       "chassis relabelled, MAC still reported",
+			macs:       []string{"aa:bb:cc:dd:ee:ff"},
+			naturalKey: naturalKey("Wistron", "SN-9"),
+			want:       true,
+		},
+		{name: "neither is reported", macs: []string{"aa:bb:cc:dd:ee:02"}, naturalKey: naturalKey("Wistron", "SN-9")},
+		{name: "no MAC and no pair", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, stillReportedByCore(tc.macs, tc.naturalKey, seenMACs, seenNaturalKeys))
+		})
+	}
+}
+
+func TestClearComponentLabelsIfSlotTaken(t *testing.T) {
+	owner := &model.Component{ID: uuid.New(), Manufacturer: "Foxconn", SerialNumber: "SN-1"}
+	flowByNaturalKey := map[string]*model.Component{
+		naturalKey("Foxconn", "SN-1"): owner,
+	}
+
+	t.Run("labels held by another component are dropped", func(t *testing.T) {
+		desired := model.Component{Manufacturer: "Foxconn", SerialNumber: "SN-1"}
+		clearComponentLabelsIfSlotTaken(&desired, flowByNaturalKey, uuid.New(), "Compute")
+		assert.Empty(t, desired.Manufacturer)
+		assert.Empty(t, desired.SerialNumber)
+	})
+
+	t.Run("the component already holding the pair keeps it", func(t *testing.T) {
+		desired := model.Component{Manufacturer: "Foxconn", SerialNumber: "SN-1"}
+		clearComponentLabelsIfSlotTaken(&desired, flowByNaturalKey, owner.ID, "Compute")
+		assert.Equal(t, "Foxconn", desired.Manufacturer)
+		assert.Equal(t, "SN-1", desired.SerialNumber)
+	})
+
+	t.Run("an unclaimed pair is kept", func(t *testing.T) {
+		desired := model.Component{Manufacturer: "Wistron", SerialNumber: "SN-9"}
+		clearComponentLabelsIfSlotTaken(&desired, flowByNaturalKey, uuid.Nil, "Compute")
+		assert.Equal(t, "Wistron", desired.Manufacturer)
+		assert.Equal(t, "SN-9", desired.SerialNumber)
+	})
+
+	t.Run("a half-populated pair occupies no slot and is left alone", func(t *testing.T) {
+		desired := model.Component{SerialNumber: "SN-1"}
+		clearComponentLabelsIfSlotTaken(&desired, flowByNaturalKey, uuid.Nil, "Compute")
+		assert.Equal(t, "SN-1", desired.SerialNumber)
+	})
 }
 
 func TestResolveRackID(t *testing.T) {
@@ -162,6 +265,7 @@ func TestComponentFromSpec(t *testing.T) {
 		SerialNumber: "SN-1",
 		Model:        "MGX",
 		Name:         "node-1",
+		Description:  "compute node",
 		SlotID:       5,
 		TrayIndex:    1,
 		HostID:       3,
@@ -172,6 +276,7 @@ func TestComponentFromSpec(t *testing.T) {
 	assert.Equal(t, "Foxconn", c.Manufacturer)
 	assert.Equal(t, "SN-1", c.SerialNumber)
 	assert.Equal(t, "MGX", c.Model)
+	assert.Equal(t, map[string]any{expectedDescriptionKey: "compute node"}, c.Description)
 	assert.Empty(t, c.FirmwareVersion, "firmware_version is owned by runtime sync, mirror must leave it unset")
 	assert.Equal(t, 5, c.SlotID)
 	assert.Equal(t, 1, c.TrayIndex)
@@ -208,6 +313,45 @@ func TestDiffComponentFields(t *testing.T) {
 		desired.FirmwareVersion = "2.0"
 		assert.Empty(t, diffComponentFields(base(), desired, expectedComponentSpec{}))
 	})
+
+	for _, tc := range []struct {
+		name        string
+		existing    map[string]any
+		expected    string
+		wantChanged bool
+	}{
+		{
+			name:        "new expected description is detected",
+			expected:    "new description",
+			wantChanged: true,
+		},
+		{
+			name:     "unchanged expected description produces no diff",
+			existing: map[string]any{expectedDescriptionKey: "same", "operator": "keep"},
+			expected: "same",
+		},
+		{
+			name:        "cleared expected description is detected",
+			existing:    map[string]any{expectedDescriptionKey: "old", "operator": "keep"},
+			wantChanged: true,
+		},
+		{
+			name:     "unrelated description entries do not produce a diff",
+			existing: map[string]any{"operator": "keep"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := base()
+			existing.Description = tc.existing
+			diffs := diffComponentFields(existing, base(), expectedComponentSpec{Description: tc.expected})
+			if tc.wantChanged {
+				require.Len(t, diffs, 1)
+				assert.Equal(t, expectedDescriptionKey, diffs[0].field)
+			} else {
+				assert.Empty(t, diffs)
+			}
+		})
+	}
 
 	for name, mutate := range map[string]func(*model.Component){
 		"name":       func(c *model.Component) { c.Name = "n2" },
@@ -253,6 +397,10 @@ func TestApplyComponentChanges_DoesNotTouchIdentityOrRuntimeFields(t *testing.T)
 		Model:        "old-model",
 		RackID:       rackA,
 		ComponentID:  &extID, // runtime-owned, must not be touched
+		Description: map[string]any{
+			"nvos_ip":  "10.0.0.2",
+			"operator": "keep",
+		},
 	}
 	desired := &model.Component{
 		Name:   "new",
@@ -260,7 +408,7 @@ func TestApplyComponentChanges_DoesNotTouchIdentityOrRuntimeFields(t *testing.T)
 		RackID: rackB,
 	}
 
-	applyComponentChanges(existing, desired, expectedComponentSpec{})
+	applyComponentChanges(existing, desired, expectedComponentSpec{Description: "Core description"})
 
 	assert.Equal(t, "new", existing.Name)
 	assert.Equal(t, "new-model", existing.Model)
@@ -270,6 +418,24 @@ func TestApplyComponentChanges_DoesNotTouchIdentityOrRuntimeFields(t *testing.T)
 	assert.Equal(t, "SN-1", existing.SerialNumber, "SerialNumber is identity")
 	require.NotNil(t, existing.ComponentID)
 	assert.Equal(t, "runtime-id", *existing.ComponentID, "external_id is runtime-owned")
+	assert.Equal(t, "10.0.0.2", existing.Description["nvos_ip"], "runtime-owned description entry must survive")
+	assert.Equal(t, "keep", existing.Description["operator"], "operator-owned description entry must survive")
+	assert.Equal(t, "Core description", existing.Description[expectedDescriptionKey])
+}
+
+func TestComponentDescriptionWithExpected(t *testing.T) {
+	existing := map[string]any{
+		expectedDescriptionKey: "old",
+		"operator":             "keep",
+	}
+
+	updated := componentDescriptionWithExpected(existing, "new")
+	assert.Equal(t, map[string]any{expectedDescriptionKey: "new", "operator": "keep"}, updated)
+	assert.Equal(t, "old", existing[expectedDescriptionKey], "helper must not mutate the input map")
+
+	cleared := componentDescriptionWithExpected(updated, "")
+	assert.Equal(t, map[string]any{"operator": "keep"}, cleared)
+	assert.Nil(t, componentDescriptionWithExpected(map[string]any{expectedDescriptionKey: "old"}, ""))
 }
 
 func TestApplyComponentChanges_PreservedFieldsKeepFlowValue(t *testing.T) {

@@ -236,21 +236,6 @@ func testInstanceBuildTenant(t *testing.T, dbSession *cdb.Session, name string, 
 
 	return tn
 }
-func testInstanceUpdateTenantCapability(t *testing.T, dbSession *cdb.Session, tn *cdbm.Tenant) *cdbm.Tenant {
-	tncfg := cdbm.TenantConfig{
-		TargetedInstanceCreation: true,
-	}
-
-	tnDAO := cdbm.NewTenantDAO(dbSession)
-	tn, err := tnDAO.Update(context.Background(), nil, cdbm.TenantUpdateInput{
-		TenantID: tn.ID,
-		Config:   &tncfg,
-	})
-	assert.Nil(t, err)
-
-	return tn
-}
-
 func testInstanceBuildUser(t *testing.T, dbSession *cdb.Session, starfleetID string, org string, roles []string) *cdbm.User {
 	uDAO := cdbm.NewUserDAO(dbSession)
 
@@ -708,7 +693,7 @@ func assertInterfaceRoutingProfilePrefixes(t *testing.T, actual *corev1.Instance
 
 // assertInterfaceVpcSelection verifies that an Interface carries the expected
 // Controller-managed VPC selection intent.
-func assertInterfaceVpcSelection(t *testing.T, actual *corev1.InstanceInterfaceConfig, controllerVpcID uuid.UUID) {
+func assertInterfaceVpcSelection(t *testing.T, actual *corev1.InstanceInterfaceConfig, controllerVpcID uuid.UUID, familyMode cdbm.InterfaceVpcIPFamilyMode) {
 	t.Helper()
 
 	require.NotNil(t, actual)
@@ -717,7 +702,19 @@ func assertInterfaceVpcSelection(t *testing.T, actual *corev1.InstanceInterfaceC
 	require.NotNil(t, selection.Vpc)
 	require.NotNil(t, selection.Vpc.VpcId)
 	assert.Equal(t, controllerVpcID.String(), selection.Vpc.VpcId.Value)
-	assert.Equal(t, corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY, selection.Vpc.FamilyMode)
+
+	var expectedFamilyMode corev1.InstanceInterfaceIpFamilyMode
+	switch familyMode {
+	case cdbm.InterfaceVpcIPFamilyModeIPv4Only:
+		expectedFamilyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV4_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeIPv6Only:
+		expectedFamilyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_IPV6_ONLY
+	case cdbm.InterfaceVpcIPFamilyModeDualStack:
+		expectedFamilyMode = corev1.InstanceInterfaceIpFamilyMode_INSTANCE_INTERFACE_IP_FAMILY_MODE_DUAL_STACK
+	default:
+		require.FailNow(t, "unsupported VPC IP family mode", "mode: %s", familyMode)
+	}
+	assert.Equal(t, expectedFamilyMode, selection.Vpc.FamilyMode)
 }
 
 func TestBuildInstanceNetworkConfig(t *testing.T) {
@@ -792,7 +789,9 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 	// Tenant 1
 	tnu1 := testInstanceBuildUser(t, dbSession, "test-starfleet-id-2", tnOrg, tnOrgRoles)
 	tn1 := testInstanceBuildTenant(t, dbSession, "test-tenant", tnOrg, tnu1)
-	tn1 = testInstanceUpdateTenantCapability(t, dbSession, tn1)
+	// Privilege is resolved site-scoped. TenantSite associations without an
+	// explicit override inherit tn1's Ready TenantAccount default.
+	_ = common.TestBuildTenantAccountWithTargetedInstanceCreation(t, dbSession, ip, &tn1.ID, tnOrg, cdbm.TenantAccountStatusReady, tnu1)
 
 	ts1 := testBuildTenantSiteAssociation(t, dbSession, tnOrg, tn1.ID, st1.ID, tnu1.ID)
 	assert.NotNil(t, ts1)
@@ -1701,7 +1700,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 			verifyChildSpanner: true,
 		},
 		{
-			name: "test Instance create API endpoint preserves VPC selection intent",
+			name: "test Instance create API endpoint preserves IPv6-only and dual-stack VPC selection intent",
 			fields: fields{
 				dbSession: dbSession,
 				tc:        tc,
@@ -1718,12 +1717,12 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 					Interfaces: []model.APIInterfaceCreateOrUpdateRequest{
 						{
 							VpcID:      cutil.GetPtr(vpc9.ID.String()),
-							IPFamilies: []model.IPFamily{model.IPFamilyIPv4},
+							IPFamilies: []model.IPFamily{model.IPFamilyIPv6},
 							IsPhysical: true,
 						},
 						{
 							VpcID:      cutil.GetPtr(vpc9Secondary.ID.String()),
-							IPFamilies: []model.IPFamily{model.IPFamilyIPv4},
+							IPFamilies: []model.IPFamily{model.IPFamilyIPv4, model.IPFamilyIPv6},
 						},
 					},
 				},
@@ -3900,7 +3899,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 							require.NotNil(t, dbIfcs[i].VpcID)
 							assert.Equal(t, *tt.args.reqData.Interfaces[i].VpcID, dbIfcs[i].VpcID.String())
 							require.NotNil(t, dbIfcs[i].VpcIPFamilyMode)
-							assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *dbIfcs[i].VpcIPFamilyMode)
+							assert.Equal(t, tt.args.reqData.Interfaces[i].VpcIPFamilyMode(), *dbIfcs[i].VpcIPFamilyMode)
 							assert.Nil(t, dbIfcs[i].VpcPrefixID)
 						}
 					}
@@ -3938,7 +3937,7 @@ func TestCreateInstanceHandler_Handle(t *testing.T) {
 					if reqIfc.VpcID != nil {
 						expectedControllerVpcID, ok := tt.expectedControllerVpcIDs[*reqIfc.VpcID]
 						require.True(t, ok)
-						assertInterfaceVpcSelection(t, req.Config.Network.Interfaces[i], expectedControllerVpcID)
+						assertInterfaceVpcSelection(t, req.Config.Network.Interfaces[i], expectedControllerVpcID, reqIfc.VpcIPFamilyMode())
 					}
 				}
 			}
@@ -6059,7 +6058,7 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "test Instance update API endpoint preserves requested VPC selection intent",
+			name: "test Instance update API endpoint preserves requested IPv6-only and dual-stack VPC selection intent",
 			fields: fields{
 				dbSession: dbSession,
 				tc:        tc,
@@ -6072,12 +6071,12 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 					Interfaces: []model.APIInterfaceCreateOrUpdateRequest{
 						{
 							VpcID:      cutil.GetPtr(vpcSelection.ID.String()),
-							IPFamilies: []model.IPFamily{model.IPFamilyIPv4},
+							IPFamilies: []model.IPFamily{model.IPFamilyIPv6},
 							IsPhysical: true,
 						},
 						{
 							VpcID:      cutil.GetPtr(vpcSelectionSecondary.ID.String()),
-							IPFamilies: []model.IPFamily{model.IPFamilyIPv4},
+							IPFamilies: []model.IPFamily{model.IPFamilyIPv4, model.IPFamilyIPv6},
 						},
 					},
 				},
@@ -7162,7 +7161,7 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 					require.NotNil(t, persistedIfcs[i].VpcID)
 					assert.Equal(t, *reqIfc.VpcID, persistedIfcs[i].VpcID.String())
 					require.NotNil(t, persistedIfcs[i].VpcIPFamilyMode)
-					assert.Equal(t, cdbm.InterfaceVpcIPFamilyModeIPv4Only, *persistedIfcs[i].VpcIPFamilyMode)
+					assert.Equal(t, reqIfc.VpcIPFamilyMode(), *persistedIfcs[i].VpcIPFamilyMode)
 					assert.Nil(t, persistedIfcs[i].VpcPrefixID)
 				}
 			}
@@ -7408,7 +7407,7 @@ func TestUpdateInstanceHandler_Handle(t *testing.T) {
 								}
 								expectedControllerVpcID, ok := tt.expectedControllerVpcIDs[interfaceVpcID]
 								require.True(t, ok)
-								assertInterfaceVpcSelection(t, siteIfc, expectedControllerVpcID)
+								assertInterfaceVpcSelection(t, siteIfc, expectedControllerVpcID, *reqInsIfcs[i].VpcIPFamilyMode)
 							default:
 								assert.Failf(t, "unexpected Interface network details", "%T", networkDetails)
 							}
@@ -10631,6 +10630,20 @@ func TestBuildInstanceOsConfig_TemplatedIPXE(t *testing.T) {
 	osSynced := buildOS("tmpl-os-instance-os-synced")
 	testInstanceBuildOperatingSystemSiteAssociation(t, dbSession, site.ID, osSynced.ID)
 
+	providerOS := &cdbm.OperatingSystem{
+		ID:                       uuid.New(),
+		Name:                     "tmpl-os-instance-provider-os",
+		Org:                      ip.Org,
+		InfrastructureProviderID: &ip.ID,
+		Type:                     cdbm.OperatingSystemTypeTemplatedIPXE,
+		IsActive:                 true,
+		Status:                   cdbm.OperatingSystemStatusReady,
+		CreatedBy:                user.ID,
+	}
+	_, err := dbSession.DB.NewInsert().Model(providerOS).Exec(context.Background())
+	require.NoError(t, err)
+	testInstanceBuildOperatingSystemSiteAssociation(t, dbSession, site.ID, providerOS.ID)
+
 	t.Run("create", func(t *testing.T) {
 		ec := newTemplatedOsEchoContext(t)
 		h := CreateInstanceHandler{dbSession: dbSession, cfg: cfg}
@@ -10681,6 +10694,52 @@ func TestBuildInstanceOsConfig_TemplatedIPXE(t *testing.T) {
 		assert.Equal(t, osSynced.ID, *osID)
 		assertTemplatedOsConfig(t, osConfig, osSynced.ID)
 	})
+
+	providerCases := []struct {
+		name  string
+		build func() (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError)
+	}{
+		{
+			name: "create allows provider-owned OS",
+			build: func() (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+				h := CreateInstanceHandler{dbSession: dbSession, cfg: cfg}
+				req := &model.APIInstanceCreateRequest{
+					TenantID:          tenant.ID.String(),
+					OperatingSystemID: cutil.GetPtr(providerOS.ID.String()),
+				}
+				return h.buildInstanceCreateRequestOsConfig(newTemplatedOsEchoContext(t), &logger, req, site)
+			},
+		},
+		{
+			name: "update allows provider-owned OS",
+			build: func() (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+				h := UpdateInstanceHandler{dbSession: dbSession, cfg: cfg}
+				instance := &cdbm.Instance{ID: uuid.New(), TenantID: tenant.ID, Tenant: tenant}
+				req := &model.APIInstanceUpdateRequest{OperatingSystemID: cutil.GetPtr(providerOS.ID.String())}
+				return h.buildInstanceUpdateRequestOsConfig(newTemplatedOsEchoContext(t), &logger, req, instance, site)
+			},
+		},
+		{
+			name: "batch create allows provider-owned OS",
+			build: func() (*corev1.InstanceOperatingSystemConfig, *uuid.UUID, *cutil.APIError) {
+				h := BatchCreateInstanceHandler{dbSession: dbSession, cfg: cfg}
+				req := &model.APIBatchInstanceCreateRequest{
+					TenantID:          tenant.ID.String(),
+					OperatingSystemID: cutil.GetPtr(providerOS.ID.String()),
+				}
+				return h.buildBatchInstanceCreateRequestOsConfig(newTemplatedOsEchoContext(t), &logger, req, site)
+			},
+		},
+	}
+	for _, tc := range providerCases {
+		t.Run(tc.name, func(t *testing.T) {
+			osConfig, osID, apiErr := tc.build()
+			require.Nil(t, apiErr)
+			require.NotNil(t, osID)
+			assert.Equal(t, providerOS.ID, *osID)
+			assertTemplatedOsConfig(t, osConfig, providerOS.ID)
+		})
+	}
 
 	// The following cases exercise the shared validator through the create path;
 	// the same validator gates the update and batch paths.

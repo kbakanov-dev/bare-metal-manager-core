@@ -14,17 +14,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use carbide_secrets::CredentialConfig;
 use carbide_utils::HostPortPair;
+use ipnet::Ipv4Net;
 use tokio::sync::oneshot::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::LOCALHOST_CERTS;
 
 const DOMAIN_NAME: &str = "forge.integrationtest";
+
+/// BMC network used by API integration tests. The `/23` accommodates both 71-BMC rack fixtures
+/// while keeping the SQL allocator's candidate scan bounded.
+pub const TEST_BMC_NETWORK_PREFIX: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 23);
+
+/// DHCP relay address for [`TEST_BMC_NETWORK_PREFIX`].
+pub const TEST_BMC_DHCP_RELAY_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
 
 // Use a struct for the args to start() so that callers can see argument names
 pub struct StartArgs {
@@ -35,7 +43,7 @@ pub struct StartArgs {
     pub bmc_proxy: Option<HostPortPair>,
     pub firmware_directory: PathBuf,
     pub cancel_token: CancellationToken,
-    pub ready_channel: Sender<()>,
+    pub ready_channel: Sender<carbide::ApiServerAddresses>,
     pub credential_config: CredentialConfig,
     pub insecure_discovery: bool,
 }
@@ -137,11 +145,6 @@ pub async fn start(
         prefix = "10.180.62.1/26"
         type = "ipv4"
 
-        [pools.secondary-vtep-ip]
-        ranges = []
-        prefix = "10.181.62.1/26"
-        type = "ipv4"
-
         [pools.vni]
         type = "integer"
 
@@ -190,17 +193,10 @@ pub async fn start(
 
         [networks.DEV1-C09-IPMI-01]
         type = "underlay"
-        prefix = "127.0.0.0/8"
-        gateway = "127.0.0.10"
+        prefix = "{TEST_BMC_NETWORK_PREFIX}"
+        gateway = "{TEST_BMC_DHCP_RELAY_ADDRESS}"
         mtu = 1490
         reserve_first = 0
-
-        [dpu_nic_firmware_update_version]
-        product_x = "v1"
-
-        [ib_fabric_monitor]
-        enabled = true
-        run_interval = "10s"
 
         [site_explorer]
         enabled = true
@@ -209,7 +205,6 @@ pub async fn start(
         explorations_per_run = 90
         create_machines = true
         machines_created_per_run = 30
-        allow_proxy_to_unknown_host = false
         {bmc_proxy_cfg}
         reset_rate_limit = "3600s"
 
@@ -262,6 +257,20 @@ pub async fn start(
         [rack_profiles.NVL72.rack_capabilities.power_shelf]
         count = 0
 
+        [rack_profiles.NVL72_GB300]
+        product_family = "gb300"
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.compute]
+        name = "GB300"
+        count = 18
+        vendor = "Lenovo"
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.switch]
+        count = 0
+
+        [rack_profiles.NVL72_GB300.rack_capabilities.power_shelf]
+        count = 0
+
         [firmware_global]
         autoupdate = true
         host_enable_autoupdate = []
@@ -283,9 +292,6 @@ pub async fn start(
         [fnn.admin_vpc]
         enabled = true
         vpc_vni = 60100
-
-        [multi_dpu]
-        enabled = false
 
         [host_health]
         hardware_health_reports = "Disabled"

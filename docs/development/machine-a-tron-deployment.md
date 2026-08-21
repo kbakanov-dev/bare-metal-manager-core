@@ -1,9 +1,18 @@
-# machine-a-tron Build & Deployment Guide
+# machine-a-tron Build & Deployment Guide <Badge intent="info">Upcoming</Badge>
 
 machine-a-tron is a bare-metal simulator for NICo testing. It hosts mock DPUs and
 servers via Redfish BMC, allowing end-to-end NICo flows without real hardware. This
 guide documents everything needed to build the container image and deploy it on a
 cluster.
+
+<Note title="Version availability">
+Everything in this guide — the `nico-machine-a-tron` Helm chart,
+`helm-prereqs/setup-machine-a-tron.sh`, and the values files it references —
+landed on `main` in July 2026 (#2764) and is **not present in v2.0.x
+releases**. If your checkout is a `v2.0.0` tag or the `release/v2.0` branch,
+these paths will not exist; use a checkout of `main` (or the first release
+that includes them) to follow this guide.
+</Note>
 
 ## Overview
 
@@ -265,7 +274,7 @@ Add this to the nico-core site config under `[site_explorer]`:
 
 ```toml
 [site_explorer]
-bmc_proxy = "nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local:1266"
+bmc_proxy = "nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local:1266"
 ```
 
 **Use the cross-namespace FQDN.** site-explorer runs inside nico-api in
@@ -289,7 +298,7 @@ to work: when set, machine-a-tron calls nico-api's `set_dynamic_config` to set
 `bmc_proxy` at runtime, but that call is rejected with `PermissionDenied` unless
 `allow_changing_bmc_proxy` is true. The two mechanisms are complementary — the
 values file ships `configureBmcProxyHost:
-"nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local"` (FQDN, same
+"nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local"` (FQDN, same
 cross-namespace requirement), and the nico-core `bmc_proxy` setting both
 enables that path and covers the case where the runtime call has not happened
 yet.
@@ -309,55 +318,83 @@ matching `expected_machines` row exists (by BMC MAC) — otherwise it logs
 auto-registers these when `machineATron.registerExpectedMachines: true` (the
 default in the values file). DHCP discovery alone is **not** sufficient.
 
-## Multi-pod simulation with per-BMC ClusterIP services (bmcServices)
+## Multi-pod simulation with Controller Mode
 
-The chart can shard the simulated fleet across several machine-a-tron pods,
-each with a dedicated ClusterIP range where every simulated BMC gets its own
-Service (`pods.<name>.cidr` + `bmcServices.enabled: true`). NICo then dials
-each BMC IP directly — no `bmc_proxy`. A validated two-pod example lives at
-`helm-prereqs/values/machine-a-tron-multipod.yaml` (2 pods × 5
-`wiwynn_gb200_nvl` hosts × 2 DPUs → 30 machines, 15 per pod).
+The chart can shard the simulated fleet across several machine-a-tron pods.
+The `mat-k8s-controller` dynamically creates ClusterIP Services for each BMC,
+with ClusterIP = BMC IP assigned by NICo DHCP. NICo dials each BMC IP directly
+— no `bmc_proxy`. A validated example lives at
+`helm-prereqs/values/machine-a-tron-multipod.yaml`.
 
 Everything single-pod mode needs still applies (namespaces, CA copy, Vault
-seeds, SPIFFE URI). Multi-pod adds the following requirements, all hit in practice:
+seeds, SPIFFE URI). Multi-pod with controller adds the following requirements:
 
-1. **Kubernetes 1.29+** for the `ServiceCIDR` object. On older clusters set
-   `bmcServices.serviceCIDR.create: false` and pick pod CIDRs **inside** the
-   apiserver's `--service-cluster-ip-range` — a static `clusterIP` outside
-   that range is rejected ("the provided IP is not in the valid range").
-   Check the chosen sub-ranges are free of existing ClusterIPs first.
-1. **Image with the `Host`-header routing fallback (PR #3190).** Without a
-   `bmc_proxy` the Redfish client sends no `Forwarded` header; older bmc-mock
-   builds then 404 every request with `no router configured`. Leave
-   `site_explorer.bmc_proxy` unset in this mode.
+1. **`oobDhcpRelayAddress` must be within Kubernetes ServiceCIDR.** All pods
+   can share the same relay address — NICo assigns unique IPs from the network.
+   Default ServiceCIDR ranges:
+   - `10.96.0.0/12` - vanilla Kubernetes (kubeadm)
+   - `10.96.0.0/16` - kind
+   - `10.43.0.0/16` - k3d/K3s
+
+   Check with: `kubectl cluster-info dump | grep service-cluster-ip-range`
+
+1. **NICo siteConfig requirements:**
+
+   ```toml
+   allow_insecure_discovery = true
+
+   [networks.MAT-BMC-SERVICES]
+   type = "underlay"
+   prefix = "10.96.64.0/18"
+   gateway = "10.96.64.1"
+   mtu = 1500
+   ```
+
+1. **Leave `site_explorer.bmc_proxy` unset.** The Redfish client dials each
+   BMC's ClusterIP directly.
+
 1. **Disjoint MAC pools per pod.** The Helm chart **auto-generates** unique
    MAC address pools per pod based on pod index. The format is
    `02:00:PP:XX:XX:XX` where `PP` is the pod index (0x00, 0x01, etc.).
 
    Example with 3 pods:
-
    - Pod mat-0: `02:00:00:00:00:00` (base)
    - Pod mat-1: `02:00:01:00:00:00` (base)
    - Pod mat-2: `02:00:02:00:00:00` (base)
 
-   To override, set per-pod MAC pools in values:
+   Enable with `macAddressPool.enabled: true`.
 
-   ```yaml
-   pods:
-     mat-0:
-       macAddressPool:
-         base: "02:00:00:00:00:00"
-         hostBits: 20
-   ```
+   Example values:
 
-   Or disable auto-generation with `macAddressPool.enabled: false` and use
-   full TOML overrides via `configFiles.matConfigs.<pod>`.
+    ```yaml
+    pods:
+      default: null
+      mat-0:
+        machines:
+          compute:
+            hwType: wiwynn_gb200_nvl
+            hostCount: 100
+            dpuPerHostCount: 2
+            oobDhcpRelayAddress: "10.96.64.1"  # All pods share same relay
+            adminDhcpRelayAddress: "192.168.176.1"
+      mat-1:
+        machines:
+          compute:
+            hwType: wiwynn_gb200_nvl
+            hostCount: 100
+            dpuPerHostCount: 2
+            oobDhcpRelayAddress: "10.96.64.1"  # NICo assigns unique IPs
+            adminDhcpRelayAddress: "192.168.176.1"
 
-1. **One NICo network segment per pod CIDR.** `network_prefixes` allows one
-   IPv4 prefix per segment, so each pod CIDR needs its own cloned underlay
-   segment (same technique as the scale-mode segment fallback), gateway `.1`,
-   `num_reserved 1` — BMC Service IPs start at `.2`, matching the DHCP
-   allocator.
+    macAddressPool:
+      enabled: true
+
+    mat-k8s-controller:
+      enabled: true
+      config:
+        insecureSkipVerify: true  # For self-signed certs
+    ```
+
 1. **Hardware-type specifics.** Vendors libredfish does not recognize (e.g.
    `wiwynn_gb200_nvl` reports `WIWYNN`) resolve to `unknown`, so seed the
    host factory credential at
@@ -432,7 +469,7 @@ The `machine_dhcp_records` view inner-joins the singleton control row `machine_i
 | Machine creation fails `No IP addresses left in prefix <admin-cidr>` | Admin pool too small: creation needs one host-PF IP per DPU | Fit `hostCount×dpuPerHostCount` ≤ usable admin-pool IPs (the script auto-fits) |
 | `No IP addresses left in prefix ...`; machines stuck in `BmcInit` | OOB DHCP pool too small for host×DPU count | Sizing: `hostCount + hostCount×dpuPerHostCount` ≤ usable pool IPs; use ≥ /27 or reduce counts |
 | Redfish `connection refused` on every endpoint despite bmc_proxy set | Bare service name resolves against nico-system, not nico-mat | Use the cross-namespace FQDN in `bmc_proxy` |
-| Redfish redirect ignored; `endpoint_explorations=0` | Wrong config field (`override_target_host` is not real) | Use `bmc_proxy = "nico-machine-a-tron-bmc-mock.nico-mat.svc.cluster.local:1266"` under `[site_explorer]` |
+| Redfish redirect ignored; `endpoint_explorations=0` | Wrong config field (`override_target_host` is not real) | Use `bmc_proxy = "nico-machine-a-tron-default-bmc-mock.nico-mat.svc.cluster.local:1266"` under `[site_explorer]` |
 | `Refusing to create managed host, expected machines entry not found` | No `expected_machines` row for the discovered BMC MAC | Set `machineATron.registerExpectedMachines: true` (default) so machine-a-tron auto-registers them |
 | `Refusing to create managed host`; machine-a-tron logs `PermissionDenied` on registration | nico-api build lacks the `Machineatron` → `AddExpectedMachine` RBAC grant | Rebuild nico-api with the grant (internal_rbac_rules.rs); the setup script also has a DB fallback |
 | `SIGSEGV` compiling `aws-lc-sys` | QEMU emulates the `.S` assembler, which crashes | True cross-compilation (native arm64 host → x86_64 target) instead of QEMU |

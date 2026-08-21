@@ -35,8 +35,9 @@ func TestNewAPIRoutes(t *testing.T) {
 
 	routeCount := map[string]int{
 		"metadata":                  1,
-		"credential":                2,
-		"site-explorer":             1,
+		"credential":                4,
+		"measured-boot":             6,
+		"site-explorer":             2,
 		"service-account":           1,
 		"infrastructure-provider":   4,
 		"tenant":                    4,
@@ -57,7 +58,7 @@ func TestNewAPIRoutes(t *testing.T) {
 		"expected-rack":             7,
 		"expected-switch":           5,
 		"instance-type":             5,
-		"machine":                   12,
+		"machine":                   15,
 		"allocation":                6,
 		"subnet":                    5,
 		"machine-instance-type":     3,
@@ -71,7 +72,7 @@ func TestNewAPIRoutes(t *testing.T) {
 		"network-security-group":    5,
 		"machine-validation":        11,
 		"dpu-extension-service":     7,
-		"sku":                       2,
+		"sku":                       5,
 		"task":                      2,
 		"rule":                      5,
 		"run":                       8,
@@ -115,10 +116,22 @@ func TestNewAPIRoutes(t *testing.T) {
 
 			bmcCredentialPath := "/org/:orgName/" + cfg.GetAPIName() + "/credential/bmc"
 			assertRouteExists(t, got, http.MethodPut, bmcCredentialPath)
+			siteExplorerEndpointPath := "/org/:orgName/" + cfg.GetAPIName() + "/site-explorer/endpoint"
+			assertRouteExists(t, got, http.MethodGet, siteExplorerEndpointPath)
 			siteExplorerActionPath := "/org/:orgName/" + cfg.GetAPIName() + "/site-explorer/endpoint/action"
 			assertRouteExists(t, got, http.MethodPost, siteExplorerActionPath)
 			uefiCredentialPath := "/org/:orgName/" + cfg.GetAPIName() + "/credential/uefi"
 			assertRouteExists(t, got, http.MethodPost, uefiCredentialPath)
+			measuredBootPath := "/org/:orgName/" + cfg.GetAPIName() + "/measured-boot"
+			assertRouteExists(t, got, http.MethodPost, measuredBootPath+"/trusted-machine")
+			assertRouteExists(t, got, http.MethodGet, measuredBootPath+"/trusted-machine")
+			assertRouteExists(t, got, http.MethodDelete, measuredBootPath+"/trusted-machine/:id")
+			assertRouteExists(t, got, http.MethodPost, measuredBootPath+"/trusted-profile")
+			assertRouteExists(t, got, http.MethodGet, measuredBootPath+"/trusted-profile")
+			assertRouteExists(t, got, http.MethodDelete, measuredBootPath+"/trusted-profile/:id")
+			credentialRotationPath := "/org/:orgName/" + cfg.GetAPIName() + "/credential/rotation"
+			assertRouteExists(t, got, http.MethodPost, credentialRotationPath)
+			assertRouteExists(t, got, http.MethodGet, credentialRotationPath)
 
 			machineAdminPath := "/org/:orgName/" + cfg.GetAPIName() + "/machine/:id"
 			assertRouteExists(t, got, http.MethodPatch, machineAdminPath+"/bmc/reset")
@@ -127,6 +140,13 @@ func TestNewAPIRoutes(t *testing.T) {
 			assertRouteExists(t, got, http.MethodPut, machineAdminPath+"/health-report")
 			assertRouteExists(t, got, http.MethodDelete, machineAdminPath+"/health-report/:source")
 			assertRouteExists(t, got, http.MethodPatch, machineAdminPath+"/power")
+			assertRouteExists(t, got, http.MethodPost, machineAdminPath+"/validation/run")
+			assertRouteExists(t, got, http.MethodGet, machineAdminPath+"/validation/run")
+			assertRouteExists(t, got, http.MethodGet, machineAdminPath+"/validation/result")
+
+			siteMachineValidationPath := "/org/:orgName/" + cfg.GetAPIName() + "/site/:siteID/machine-validation/machine/:machineID"
+			assertRouteExists(t, got, http.MethodGet, siteMachineValidationPath+"/runs")
+			assertRouteExists(t, got, http.MethodGet, siteMachineValidationPath+"/results")
 
 			expectedMachineBatchPath := "/org/:orgName/" + cfg.GetAPIName() + "/expected-machine/batch"
 			assertRouteExists(t, got, http.MethodPost, expectedMachineBatchPath)
@@ -137,7 +157,14 @@ func TestNewAPIRoutes(t *testing.T) {
 			assertRouteExists(t, got, http.MethodGet, ipxeTemplatePath)
 			assertRouteExists(t, got, http.MethodGet, ipxeTemplatePath+"/:id")
 
+			skuPath := "/org/:orgName/" + cfg.GetAPIName() + "/sku"
+			assertRouteExists(t, got, http.MethodPost, skuPath)
+			assertRouteExists(t, got, http.MethodGet, skuPath)
+			assertRouteExists(t, got, http.MethodGet, skuPath+"/:id")
+			assertRouteExists(t, got, http.MethodPatch, skuPath+"/:id")
+			assertRouteExists(t, got, http.MethodDelete, skuPath+"/:id")
 			runPath := "/org/:orgName/" + cfg.GetAPIName() + "/task/run"
+
 			assertRouteExists(t, got, http.MethodPost, runPath)
 			assertRouteExists(t, got, http.MethodGet, runPath)
 			assertRouteExists(t, got, http.MethodGet, runPath+"/:id")

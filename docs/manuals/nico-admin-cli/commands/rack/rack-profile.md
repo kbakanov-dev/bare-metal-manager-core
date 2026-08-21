@@ -30,7 +30,7 @@ Sort output by specified field\
 \
 *Possible values:*
 
-- primary-id: Sort by the primary id
+- primary-id: Sort by the primary ID
 
 - state: Sort by state
 
@@ -41,6 +41,7 @@ Print help (see a summary with -h)
 
 | Subcommand | Description |
 |---|---|
+| [`list`](./rack-profile-list.md) | List configured rack profiles |
 | [`show`](./rack-profile-show.md) | Show rack profile for a given rack |
 
 ---

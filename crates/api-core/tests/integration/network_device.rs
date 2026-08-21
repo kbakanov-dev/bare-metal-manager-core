@@ -24,17 +24,13 @@ use rpc::forge::NetworkDeviceIdList;
 
 async fn init(pool: PgPool) -> TestHarness {
     let env = TestHarness::builder(pool)
-        .with_resource_pools(
-            ResourcePoolBuilder::default()
-                .with_secondary_vtep_ip("192.0.7.0/24")
-                .build(),
-        )
+        .with_resource_pools(ResourcePoolBuilder::default().build())
         .build()
         .await;
     let network_controller = env.network_controller();
     let domain = env.test_domain().await;
     let underlay_segment = network_controller.create_underlay_segment(&domain).await;
-    let admin_segment = network_controller.create_admin_segment(&domain).await;
+    network_controller.create_admin_segment(&domain).await;
     let site_explorer = env.default_test_site_explorer();
     let (managed_host, _) = env
         .managed_host_builder(&site_explorer, underlay_segment)
@@ -43,7 +39,7 @@ async fn init(pool: PgPool) -> TestHarness {
         .await;
     managed_host
         .first_dpu()
-        .discover_oob_iface(admin_segment)
+        .discover_oob_iface(underlay_segment)
         .await;
     env
 }

@@ -17,6 +17,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use carbide_site_explorer::config::SiteExplorerConfig;
@@ -27,9 +28,11 @@ use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use mac_address::MacAddress;
 use model::expected_machine::{
-    ExpectedHostNic, ExpectedMachine, ExpectedMachineData, HostDpuPolicy,
+    ExpectedInterface, ExpectedInterfaceRole, ExpectedMachine, ExpectedMachineData, HostDpuPolicy,
 };
-use model::machine_boot_interface::MachineBootInterface;
+use model::machine_boot_interface::{
+    BootInterfaceSelectionSource, MachineBootInterface, MachineBootInterfaceTarget,
+};
 use model::test_support::ManagedHostConfig;
 
 struct ZeroDpuEnv {
@@ -37,6 +40,7 @@ struct ZeroDpuEnv {
     test_harness: TestHarness,
     underlay_segment: TestNetworkSegment,
     host_inband_segment: TestNetworkSegment,
+    create_machines: Arc<AtomicBool>,
     site_explorer: TestSiteExplorer,
 }
 
@@ -59,6 +63,7 @@ async fn init(pool: PgPool) -> ZeroDpuEnv {
         endpoint_explorer.clone(),
         Arc::new(api.runtime_config.get_firmware_config()),
     ));
+    let create_machines = Arc::new(AtomicBool::new(true));
     let site_explorer = TestSiteExplorer::new(
         SiteExplorer::new(
             api.database_connection.clone(),
@@ -68,7 +73,7 @@ async fn init(pool: PgPool) -> ZeroDpuEnv {
                 explorations_per_run: 1,
                 concurrent_explorations: 1,
                 run_interval: Duration::from_secs(1),
-                create_machines: Arc::new(true.into()),
+                create_machines: create_machines.clone(),
                 ..Default::default()
             },
             test_harness.test_meter.meter(),
@@ -87,6 +92,7 @@ async fn init(pool: PgPool) -> ZeroDpuEnv {
         test_harness,
         underlay_segment,
         host_inband_segment,
+        create_machines,
         site_explorer,
     }
 }
@@ -244,6 +250,17 @@ async fn test_predicted_interface_hands_boot_interface_id_to_real_row(
         Some("NIC.Embedded.1-1-1"),
         "predicted interface should hold the report-derived boot interface id"
     );
+    let desired = db::machine_desired_boot_interface::get(txn.as_mut(), &predicted.machine_id)
+        .await?
+        .expect("site-explorer should initialize the host's desired boot interface");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::Pair(MachineBootInterface {
+            mac_address: inband_mac,
+            interface_id: "NIC.Embedded.1-1-1".to_string(),
+        }),
+        "the desired target should be ready before the predicted NIC's first DHCP",
+    );
     txn.rollback().await?;
 
     // The in-band NIC's first DHCP promotes the prediction into a
@@ -379,8 +396,10 @@ async fn test_zero_dpu_recovers_primary_from_retained_boot_interface(
     pool: PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let env = init(pool).await;
-    let mock_host = zero_dpu_host();
+    let mut mock_host = zero_dpu_host();
     let inband_mac = *mock_host.non_dpu_macs.first().unwrap();
+    let other_retained_mac = MacAddress::from_str("d4:04:e6:84:20:02")?;
+    mock_host.non_dpu_macs.push(other_retained_mac);
     register_zero_dpu_expected_machine(&env, &mock_host).await?;
 
     // The host's boot interface was retained by a prior `--delete-interfaces`,
@@ -434,6 +453,49 @@ async fn test_zero_dpu_recovers_primary_from_retained_boot_interface(
         predicted.primary_interface,
         "a zero-DPU host with no declared primary should recover its primary from \
          retained_boot_interfaces, so the controller has a boot target",
+    );
+    txn.rollback().await?;
+
+    // Promotion consumes the primary NIC's retention record. Record retained
+    // metadata for the other NIC before the next exploration: every deleted
+    // interface can leave one of these records, so its presence alone must not
+    // replace a settled primary.
+    env.api()
+        .discover_dhcp(
+            rpc::forge::DhcpDiscovery::builder(inband_mac, env.host_inband_segment.relay_address)
+                .vendor_string("Bluefield")
+                .tonic_request(),
+        )
+        .await?;
+    let mut txn = env.pool.begin().await?;
+    db::retained_boot_interface::upsert(txn.as_mut(), other_retained_mac, "NIC.Embedded.2-1-1")
+        .await?;
+    txn.commit().await?;
+    env.site_explorer.run_single_iteration().await?;
+
+    let mut txn = env.pool.begin().await?;
+    let promoted = db::machine_interface::find_by_mac_address(txn.as_mut(), inband_mac)
+        .await?
+        .into_iter()
+        .next()
+        .expect("the retained-primary prediction should promote on DHCP");
+    assert!(
+        promoted.primary_interface,
+        "an exploration refresh must preserve the settled primary after retention is consumed",
+    );
+    assert!(
+        db::retained_boot_interface::find_by_mac(txn.as_mut(), inband_mac, None)
+            .await?
+            .is_none(),
+        "promotion should consume the retained fallback before the refresh",
+    );
+    let other_prediction =
+        db::predicted_machine_interface::find_by_mac_address(txn.as_mut(), other_retained_mac)
+            .await?
+            .expect("the other reported NIC should remain a pending prediction");
+    assert!(
+        !other_prediction.primary_interface,
+        "retained metadata for another NIC must not replace the settled primary",
     );
     txn.rollback().await?;
 
@@ -623,10 +685,20 @@ async fn test_exploration_refreshes_pending_predicted_boot_interface_id(
         predicted.boot_interface_id.is_none(),
         "an id-less report can't give the prediction a boot interface id"
     );
+    let desired = db::machine_desired_boot_interface::get(txn.as_mut(), &predicted.machine_id)
+        .await?
+        .expect("site-explorer should initialize a MAC-only desired target");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::MacOnly(inband_mac),
+        "the missing Redfish id should not prevent target initialization",
+    );
     txn.rollback().await?;
 
-    // Second exploration: the BMC now resolves the id; the pending
-    // prediction picks it up.
+    // Second exploration: machine creation is disabled, but the BMC now
+    // resolves the id. The always-running reconciliation pass still enriches
+    // the existing desired target.
+    env.create_machines.store(false, Ordering::Relaxed);
     env.site_explorer
         .insert_endpoint_result(host_bmc_ip, Ok(mock_host.clone().into()));
     env.site_explorer.run_single_iteration().await?;
@@ -639,6 +711,209 @@ async fn test_exploration_refreshes_pending_predicted_boot_interface_id(
         predicted.boot_interface_id.as_deref(),
         Some("NIC.Embedded.1-1-1"),
         "the next exploration that resolves the id refreshes the prediction"
+    );
+    let desired = db::machine_desired_boot_interface::get(txn.as_mut(), &predicted.machine_id)
+        .await?
+        .expect("the desired target should still exist");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::Pair(MachineBootInterface {
+            mac_address: inband_mac,
+            interface_id: "NIC.Embedded.1-1-1".to_string(),
+        }),
+        "the existing-object pass should commit same-MAC id enrichment",
+    );
+    txn.rollback().await?;
+
+    // An existing host also remains repairable without its ExpectedMachine.
+    // Clear the target to model an older or independently registered row,
+    // restore the creation setting, and verify that reconciliation is not
+    // hidden behind the ExpectedMachine gate.
+    let mut txn = env.pool.begin().await?;
+    sqlx::query("DELETE FROM machine_boot_interfaces WHERE machine_id = $1")
+        .bind(predicted.machine_id)
+        .execute(txn.as_mut())
+        .await?;
+    db::expected_machine::delete_by_mac(txn.as_mut(), mock_host.bmc_mac_address).await?;
+    txn.commit().await?;
+    env.create_machines.store(true, Ordering::Relaxed);
+
+    env.site_explorer.run_single_iteration().await?;
+
+    let desired = db::machine_desired_boot_interface::get(&env.pool, &predicted.machine_id)
+        .await?
+        .expect("the existing host should be reinitialized without an ExpectedMachine");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::Pair(MachineBootInterface {
+            mac_address: inband_mac,
+            interface_id: "NIC.Embedded.1-1-1".to_string(),
+        }),
+    );
+
+    Ok(())
+}
+
+/// A BMC may report onboard System interfaces first and learn the declared
+/// boot NIC later through supplemental adapter-Port inventory. The refresh
+/// must add that hardware-discovered NIC to the existing predicted host and
+/// make it the boot target with only its MAC and record `ExpectedMachine` as
+/// its selection source, without requiring another forced deletion.
+#[sqlx_test]
+async fn test_exploration_refresh_adds_declared_adapter_port_to_predicted_host(
+    pool: PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let env = init(pool).await;
+    let system_macs = vec![
+        MacAddress::from_str("0a:8f:c3:a5:8a:41")?,
+        MacAddress::from_str("00:62:0b:4c:28:a8")?,
+        MacAddress::from_str("00:62:0b:4c:28:a9")?,
+        MacAddress::from_str("00:62:0b:4c:28:aa")?,
+        MacAddress::from_str("00:62:0b:4c:28:ab")?,
+    ];
+    let declared_port_mac = MacAddress::from_str("94:6d:ae:53:cb:9b")?;
+    let unrelated_port_mac = MacAddress::from_str("94:6d:ae:53:cb:9a")?;
+    let mock_host = ManagedHostConfig {
+        dpus: vec![],
+        non_dpu_macs: system_macs.clone(),
+        ..ManagedHostConfig::default()
+    };
+
+    let mut txn = env.pool.begin().await?;
+    db::expected_machine::create(
+        &mut txn,
+        ExpectedMachine {
+            id: None,
+            bmc_mac_address: mock_host.bmc_mac_address,
+            data: ExpectedMachineData {
+                serial_number: mock_host.serial.clone(),
+                dpu_policy: HostDpuPolicy::Ignore,
+                interfaces: vec![ExpectedInterface {
+                    mac_address: declared_port_mac,
+                    role: ExpectedInterfaceRole::Host,
+                    primary: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        },
+    )
+    .await?;
+    txn.commit().await?;
+
+    let host_bmc_response = env
+        .api()
+        .discover_dhcp(
+            rpc::forge::DhcpDiscovery::builder(
+                mock_host.bmc_mac_address,
+                env.underlay_segment.relay_address,
+            )
+            .vendor_string("SomeVendor")
+            .tonic_request(),
+        )
+        .await?
+        .into_inner();
+    let host_bmc_ip = host_bmc_response.address.parse()?;
+
+    // The first report has the exact partial-inventory shape from QA: five
+    // usable System MACs, but not the declared ConnectX-7 MAC.
+    env.site_explorer
+        .insert_endpoint_result(host_bmc_ip, Ok(mock_host.clone().into()));
+    env.site_explorer.run_single_iteration().await?;
+    let mut txn = env.pool.begin().await?;
+    db::explored_endpoints::set_preingestion_complete(host_bmc_ip, &mut txn).await?;
+    txn.commit().await?;
+    env.site_explorer.run_single_iteration().await?;
+
+    let mut txn = env.pool.begin().await?;
+    let initial_prediction =
+        db::predicted_machine_interface::find_by_mac_address(txn.as_mut(), system_macs[0])
+            .await?
+            .expect("partial System inventory should mint the predicted host");
+    let machine_id = initial_prediction.machine_id;
+    let predictions =
+        db::predicted_machine_interface::find_by_machine_id(txn.as_mut(), &machine_id).await?;
+    assert_eq!(predictions.len(), system_macs.len());
+    assert!(
+        predictions
+            .iter()
+            .all(|prediction| !prediction.primary_interface)
+    );
+    assert!(
+        db::machine_desired_boot_interface::get(txn.as_mut(), &machine_id)
+            .await?
+            .is_none(),
+        "several non-primary System candidates do not identify a boot NIC",
+    );
+    // Leave one old prediction flagged primary, then omit it from the next
+    // report. Selecting the declared Port must clear stale primary intent
+    // across the whole predicted host, not only the refreshed candidates.
+    db::predicted_machine_interface::set_primary_interface(
+        initial_prediction.id,
+        true,
+        txn.as_mut(),
+    )
+    .await?;
+    txn.commit().await?;
+
+    // The refreshed report adds the declared MAC only to adapter-Port
+    // inventory. An unrelated Port proves ExpectedMachine is selection policy
+    // over discovered hardware, not a reason to ingest every chassis MAC.
+    let mut refreshed_report: model::site_explorer::EndpointExplorationReport =
+        mock_host.clone().into();
+    refreshed_report.systems[0]
+        .ethernet_interfaces
+        .retain(|interface| interface.mac_address != Some(system_macs[0]));
+    refreshed_report.chassis[0].network_adapters[0].port_mac_addresses =
+        vec![declared_port_mac, unrelated_port_mac];
+    env.site_explorer
+        .insert_endpoint_result(host_bmc_ip, Ok(refreshed_report));
+    env.site_explorer.run_single_iteration().await?;
+
+    let mut txn = env.pool.begin().await?;
+    let predictions =
+        db::predicted_machine_interface::find_by_machine_id(txn.as_mut(), &machine_id).await?;
+    assert_eq!(predictions.len(), system_macs.len() + 1);
+    let declared_prediction = predictions
+        .iter()
+        .find(|prediction| prediction.mac_address == declared_port_mac)
+        .expect("the refreshed report should add the declared Port MAC");
+    assert!(declared_prediction.primary_interface);
+    assert!(
+        predictions.iter().all(|prediction| {
+            prediction.mac_address == declared_port_mac || !prediction.primary_interface
+        }),
+        "the declared Port must be the only primary prediction, including stale inventory",
+    );
+    assert!(
+        declared_prediction.boot_interface_id.is_none(),
+        "adapter Port inventory does not supply a System boot-interface id",
+    );
+    assert!(
+        predictions
+            .iter()
+            .all(|prediction| prediction.mac_address != unrelated_port_mac),
+        "an undeclared supplemental Port must not become a Host prediction",
+    );
+    let desired = db::machine_desired_boot_interface::get(txn.as_mut(), &machine_id)
+        .await?
+        .expect("the declared Port prediction should settle the boot target");
+    assert_eq!(
+        desired.value,
+        MachineBootInterfaceTarget::MacOnly(declared_port_mac),
+    );
+    let selection_source: BootInterfaceSelectionSource = sqlx::query_scalar(
+        "SELECT selection_source
+         FROM machine_boot_interfaces
+         WHERE machine_id = $1",
+    )
+    .bind(machine_id)
+    .fetch_one(txn.as_mut())
+    .await?;
+    assert_eq!(
+        selection_source,
+        BootInterfaceSelectionSource::ExpectedMachine,
+        "the refresh must retain that ExpectedMachine selected the declared Port",
     );
     txn.rollback().await?;
 
@@ -663,7 +938,7 @@ async fn test_zero_dpu_multi_nic_no_declaration_adopts_without_primary_collision
         non_dpu_macs: vec![nic_a, nic_b],
         ..ManagedHostConfig::default()
     };
-    // No declared primary: `Ignore` with empty host_nics.
+    // No declared primary: `Ignore` with an empty interface list.
     register_zero_dpu_expected_machine(&env, &mock_host).await?;
 
     // Both NICs lease before site-explorer runs -> two anonymous primary rows.
@@ -782,13 +1057,13 @@ async fn test_zero_dpu_declared_primary_promotes_as_primary(
             data: ExpectedMachineData {
                 serial_number: mock_host.serial.clone(),
                 dpu_policy: HostDpuPolicy::Ignore,
-                host_nics: vec![
-                    ExpectedHostNic {
+                interfaces: vec![
+                    ExpectedInterface {
                         mac_address: primary_nic,
                         primary: Some(true),
                         ..Default::default()
                     },
-                    ExpectedHostNic {
+                    ExpectedInterface {
                         mac_address: other_nic,
                         primary: None,
                         ..Default::default()

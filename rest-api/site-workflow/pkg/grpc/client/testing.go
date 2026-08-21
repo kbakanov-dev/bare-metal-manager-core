@@ -62,15 +62,22 @@ func incrementMAC(mac net.HardwareAddr) {
 // MockCoreGrpcService is a mock implementation of Core gRPC protobuf Service
 type MockCoreGrpcServiceClient struct {
 	corev1.ForgeClient
+	BuildCapabilities []corev1.BuildCapability
 }
 
 /* Version mock methods */
 func (mcgsc *MockCoreGrpcServiceClient) Version(ctx context.Context, in *corev1.VersionRequest, opts ...grpc.CallOption) (*corev1.BuildInfo, error) {
 	out := new(corev1.BuildInfo)
 	out.BuildVersion = "1.0.0"
-	if siteFabricPrefixes, ok := ctx.Value("siteFabricPrefixes").([]string); ok {
-		out.RuntimeConfig = &corev1.RuntimeConfig{
-			SiteFabricPrefixes: siteFabricPrefixes,
+	out.Capabilities = mcgsc.BuildCapabilities
+	// Core reports the runtime config only when the request asks for it, so a
+	// caller that omits DisplayConfig gets BuildInfo with no RuntimeConfig.
+	if in.GetDisplayConfig() {
+		siteFabricPrefixes, ok := ctx.Value("siteFabricPrefixes").([]string)
+		if ok {
+			out.RuntimeConfig = &corev1.RuntimeConfig{
+				SiteFabricPrefixes: siteFabricPrefixes,
+			}
 		}
 	}
 	return out, nil

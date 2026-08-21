@@ -6,6 +6,7 @@ package site
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	cdbp "github.com/NVIDIA/infra-controller/rest-api/db/pkg/db/paginator"
 	cdbu "github.com/NVIDIA/infra-controller/rest-api/db/pkg/util"
 	cipam "github.com/NVIDIA/infra-controller/rest-api/ipam"
+	corev1 "github.com/NVIDIA/infra-controller/rest-api/proto/core/gen/v1"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/internal/config"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
@@ -31,6 +33,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/uptrace/bun/extra/bundebug"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	tnsv1 "go.temporal.io/api/namespace/v1"
@@ -88,11 +91,7 @@ func TestManageSite_DeleteSiteComponentsFromDB(t *testing.T) {
 	tnRoles := []string{"FORGE_TENANT_ADMIN"}
 
 	tnu := util.TestBuildUser(t, dbSession, uuid.New().String(), []string{tnOrg}, tnRoles)
-	tncfg := cdbm.TenantConfig{
-		EnableSSHAccess: true,
-	}
-
-	tenant := util.TestBuildTenant(t, dbSession, "test-tenant", tnOrg, &tncfg, tnu)
+	tenant := util.TestBuildTenant(t, dbSession, "test-tenant", tnOrg, nil, tnu)
 
 	vpcDAO := cdbm.NewVpcDAO(dbSession)
 	ibpDAO := cdbm.NewInfiniBandPartitionDAO(dbSession)
@@ -1015,8 +1014,7 @@ func TestManageSite_DeleteSiteComponentsFromDB_NewResources(t *testing.T) {
 	tnOrg := "test-tenant-org-1"
 	tnRoles := []string{"FORGE_TENANT_ADMIN"}
 	tnu := util.TestBuildUser(t, dbSession, uuid.New().String(), []string{tnOrg}, tnRoles)
-	tncfg := cdbm.TenantConfig{EnableSSHAccess: true}
-	tenant := util.TestBuildTenant(t, dbSession, "test-tenant", tnOrg, &tncfg, tnu)
+	tenant := util.TestBuildTenant(t, dbSession, "test-tenant", tnOrg, nil, tnu)
 
 	iDAO := cdbm.NewInstanceDAO(dbSession)
 	operatingSystem := util.TestBuildOperatingSystem(t, dbSession, "test-os")
@@ -1240,6 +1238,251 @@ func TestManageSite_DeleteSiteComponentsFromDB_NewResources(t *testing.T) {
 	assertPresent("ssh_key_association (intentionally not cleaned)", &cdbm.SSHKeyAssociation{}, "ska.id", site1Resources.sshKeyAssocID)
 }
 
+func TestManageSite_UpdateSiteInDB(t *testing.T) {
+	ctx := context.Background()
+	resources := setupSiteFabricIPBlockTest(t)
+	mst := NewManageSite(resources.dbSession, nil, nil, nil)
+	siteDAO := cdbm.NewSiteDAO(resources.dbSession)
+
+	createSite := func(t *testing.T, version *string, config *cdbm.SiteConfig) *cdbm.Site {
+		t.Helper()
+		site := &cdbm.Site{
+			ID:                       uuid.New(),
+			Name:                     "test-site-" + uuid.NewString(),
+			DisplayName:              cutil.GetPtr("Test"),
+			Org:                      "test",
+			InfrastructureProviderID: resources.provider.ID,
+			SiteControllerVersion:    version,
+			SiteAgentVersion:         cutil.GetPtr("1.0.0"),
+			IsInfinityEnabled:        true,
+			Status:                   cdbm.SiteStatusRegistered,
+			CreatedBy:                resources.user.ID,
+			Config:                   config,
+		}
+		_, err := resources.dbSession.DB.NewInsert().Model(site).Exec(ctx)
+		require.NoError(t, err)
+		return site
+	}
+
+	tests := []struct {
+		name                  string
+		existingVersion       *string
+		existingConfig        *cdbm.SiteConfig
+		buildInfo             *corev1.BuildInfo
+		wantVersion           *string
+		wantVpcSlaac          bool
+		wantDBUpdate          bool
+		wantVpcSlaacKeyAbsent bool
+		wantErr               bool
+		wantNonRetryable      bool
+		useUnknownSiteID      bool
+		omitVpcSlaacKey       bool
+	}{
+		{
+			name:            "updates version while VPC SLAAC remains false",
+			existingVersion: nil,
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo:       &corev1.BuildInfo{BuildVersion: "1.2.3"},
+			wantVersion:     cutil.GetPtr("1.2.3"),
+			wantDBUpdate:    true,
+		},
+		{
+			name:            "updates version and advertised VPC SLAAC together",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo: &corev1.BuildInfo{
+				BuildVersion: "2.0.0",
+				Capabilities: []corev1.BuildCapability{
+					corev1.BuildCapability_BUILD_CAPABILITY_VPC_SLAAC,
+				},
+			},
+			wantVersion:  cutil.GetPtr("2.0.0"),
+			wantVpcSlaac: true,
+			wantDBUpdate: true,
+		},
+		{
+			name:            "skips update when version and false VPC SLAAC match",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo:       &corev1.BuildInfo{BuildVersion: "1.0.0"},
+			wantVersion:     cutil.GetPtr("1.0.0"),
+		},
+		{
+			name:            "skips update when version and true VPC SLAAC match",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{VpcSlaac: true},
+			buildInfo: &corev1.BuildInfo{
+				BuildVersion: "1.0.0",
+				Capabilities: []corev1.BuildCapability{
+					corev1.BuildCapability_BUILD_CAPABILITY_VPC_SLAAC,
+				},
+			},
+			wantVersion:  cutil.GetPtr("1.0.0"),
+			wantVpcSlaac: true,
+		},
+		{
+			name:            "preserves stored version when build info omits it",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo:       &corev1.BuildInfo{},
+			wantVersion:     cutil.GetPtr("1.0.0"),
+		},
+		{
+			name:                  "leaves equivalent missing VPC SLAAC key untouched",
+			existingVersion:       cutil.GetPtr("1.0.0"),
+			existingConfig:        &cdbm.SiteConfig{NativeNetworking: true},
+			buildInfo:             &corev1.BuildInfo{BuildVersion: "1.0.0"},
+			wantVersion:           cutil.GetPtr("1.0.0"),
+			wantVpcSlaac:          false,
+			wantVpcSlaacKeyAbsent: true,
+			omitVpcSlaacKey:       true,
+		},
+		{
+			name:                  "updates version without adding an equivalent missing VPC SLAAC key",
+			existingVersion:       cutil.GetPtr("1.0.0"),
+			existingConfig:        &cdbm.SiteConfig{NativeNetworking: true},
+			buildInfo:             &corev1.BuildInfo{BuildVersion: "2.0.0"},
+			wantVersion:           cutil.GetPtr("2.0.0"),
+			wantVpcSlaac:          false,
+			wantDBUpdate:          true,
+			wantVpcSlaacKeyAbsent: true,
+			omitVpcSlaacKey:       true,
+		},
+		{
+			name:            "leaves version empty when site and build info both lack it",
+			existingVersion: nil,
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo:       &corev1.BuildInfo{},
+			wantVersion:     nil,
+		},
+		{
+			name:            "updates advertised VPC SLAAC when version is unchanged",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{},
+			buildInfo: &corev1.BuildInfo{
+				BuildVersion: "1.0.0",
+				Capabilities: []corev1.BuildCapability{
+					corev1.BuildCapability_BUILD_CAPABILITY_VPC_SLAAC,
+				},
+			},
+			wantVersion:  cutil.GetPtr("1.0.0"),
+			wantVpcSlaac: true,
+			wantDBUpdate: true,
+		},
+		{
+			name:            "clears stale VPC SLAAC when capability is absent",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  &cdbm.SiteConfig{VpcSlaac: true},
+			buildInfo:       &corev1.BuildInfo{BuildVersion: "1.0.0"},
+			wantVersion:     cutil.GetPtr("1.0.0"),
+			wantVpcSlaac:    false,
+			wantDBUpdate:    true,
+		},
+		{
+			name:            "initializes nil config with advertised VPC SLAAC",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  nil,
+			buildInfo: &corev1.BuildInfo{
+				BuildVersion: "1.0.0",
+				Capabilities: []corev1.BuildCapability{
+					corev1.BuildCapability_BUILD_CAPABILITY_VPC_SLAAC,
+				},
+			},
+			wantVersion:  cutil.GetPtr("1.0.0"),
+			wantVpcSlaac: true,
+			wantDBUpdate: true,
+		},
+		{
+			name:            "initializes nil config when VPC SLAAC is unsupported",
+			existingVersion: cutil.GetPtr("1.0.0"),
+			existingConfig:  nil,
+			buildInfo:       &corev1.BuildInfo{BuildVersion: "1.0.0"},
+			wantVersion:     cutil.GetPtr("1.0.0"),
+			wantVpcSlaac:    false,
+			wantDBUpdate:    true,
+		},
+		{
+			name:             "unknown site returns non-retryable error",
+			existingConfig:   &cdbm.SiteConfig{},
+			buildInfo:        &corev1.BuildInfo{BuildVersion: "1.2.3"},
+			wantErr:          true,
+			wantNonRetryable: true,
+			useUnknownSiteID: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := createSite(t, tt.existingVersion, tt.existingConfig)
+			if tt.omitVpcSlaacKey {
+				_, err := resources.dbSession.DB.NewUpdate().
+					Model((*cdbm.Site)(nil)).
+					Set("config = config - 'vpc_slaac'").
+					Where("id = ?", site.ID).
+					Exec(ctx)
+				require.NoError(t, err)
+			}
+
+			originalUpdated := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+			_, err := resources.dbSession.DB.NewUpdate().
+				Model((*cdbm.Site)(nil)).
+				Set("updated = ?", originalUpdated).
+				Where("id = ?", site.ID).
+				Exec(ctx)
+			require.NoError(t, err)
+
+			siteID := site.ID
+			if tt.useUnknownSiteID {
+				siteID = uuid.New()
+			}
+
+			err = mst.UpdateSiteInDB(ctx, siteID, tt.buildInfo)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.wantNonRetryable {
+					var applicationErr *temporal.ApplicationError
+					require.ErrorAs(t, err, &applicationErr)
+					assert.True(t, applicationErr.NonRetryable())
+					assert.Equal(t, "Site not found", applicationErr.Type())
+					assert.True(t, errors.Is(applicationErr.Unwrap(), cdb.ErrDoesNotExist))
+				}
+				return
+			}
+
+			require.NoError(t, err)
+
+			got, err := siteDAO.GetByID(ctx, nil, site.ID, nil, false)
+			require.NoError(t, err)
+			if tt.wantVersion == nil {
+				assert.Nil(t, got.SiteControllerVersion)
+			} else {
+				require.NotNil(t, got.SiteControllerVersion)
+				assert.Equal(t, *tt.wantVersion, *got.SiteControllerVersion)
+			}
+			require.NotNil(t, got.Config)
+			assert.Equal(t, tt.wantVpcSlaac, got.Config.VpcSlaac)
+			if tt.wantDBUpdate {
+				assert.True(t, got.Updated.After(originalUpdated))
+			} else {
+				assert.True(t, got.Updated.Equal(originalUpdated))
+			}
+
+			var persistedVpcSlaac sql.NullBool
+			err = resources.dbSession.DB.NewRaw(
+				`SELECT (config->>'vpc_slaac')::boolean FROM site WHERE id = ?`,
+				site.ID,
+			).Scan(ctx, &persistedVpcSlaac)
+			require.NoError(t, err)
+			if tt.wantVpcSlaacKeyAbsent {
+				assert.False(t, persistedVpcSlaac.Valid)
+			} else {
+				require.True(t, persistedVpcSlaac.Valid)
+				assert.Equal(t, tt.wantVpcSlaac, persistedVpcSlaac.Bool)
+			}
+		})
+	}
+}
+
 type siteFabricIPBlockTestResources struct {
 	dbSession *cdb.Session
 	user      *cdbm.User
@@ -1412,7 +1655,7 @@ func TestManageSite_UpdateIPBlocksInDBFromFabricPrefixes_ReturnsErrorWhenFabricB
 	mst := NewManageSite(resources.dbSession, nil, nil, nil)
 
 	err := cdb.WithTx(ctx, resources.dbSession, func(tx *cdb.Tx) error {
-		require.NoError(t, tx.AcquireAdvisoryLock(ctx, siteFabricIPBlocksLockID(resources.site), false))
+		require.NoError(t, tx.AcquireAdvisoryLock(ctx, getSiteFabricIPBlockLockID(resources.site), false))
 
 		derr := mst.UpdateIPBlocksInDBFromFabricPrefixes(ctx, resources.site.ID, []string{"10.0.0.0/16"})
 		assert.ErrorIs(t, derr, cdb.ErrXactAdvisoryLockFailed)

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: test postgres-up postgres-down ensure-postgres postgres-wait clean check-source-headers fix-source-headers
+.PHONY: test postgres-up postgres-down ensure-postgres postgres-wait clean check-source-headers fix-source-headers check-command-bundle
 .PHONY: build docker-build docker-build-local
-.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
+.PHONY: test-ipam test-site-agent test-site-manager test-workflow test-db test-api test-auth test-common test-cert-manager test-site-workflow test-flow test-powershelf-manager test-nvswitch-manager test-proto migrate core-mock-server-build core-mock-server-start core-mock-server-stop flow-mock-server-build flow-mock-server-start flow-mock-server-stop
 .PHONY: validate-openapi preview-openapi generate-client
 .PHONY: core-proto core-proto-clean core-proto-fetch core-proto-fmt core-protogen flow-proto flow-protogen tools-build tools-clean
 .PHONY: pre-commit-install pre-commit-run pre-commit-update
@@ -109,6 +109,11 @@ check-source-headers:
 fix-source-headers:
 	python3 scripts/check_source_headers.py --fix
 
+check-command-bundle:
+	python3 -c 'import sys; sys.exit("error: Python 3.10 or newer is required") if sys.version_info < (3, 10) else None'
+	python3 -B ../.github/ci/test_rest_command_bundle.py
+	python3 -B ../.github/ci/rest_command_bundle.py check
+
 ensure-postgres:
 	@docker inspect $(POSTGRES_CONTAINER_NAME) > /dev/null 2>&1 || $(MAKE) postgres-up
 	@$(MAKE) postgres-wait
@@ -150,6 +155,9 @@ test-site-manager:
 test-workflow:
 	$(MAKE) ensure-postgres
 	cd workflow && go test -p 1 ./... -count=1
+
+test-proto:
+	cd proto && go test ./... -count=1
 
 test-db:
 	$(MAKE) ensure-postgres
@@ -252,7 +260,7 @@ test-nvswitch-manager:
 		DB_NAME=$(POSTGRES_DB) \
 		go test -p 1 ./... -count=1
 
-test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager
+test: test-ipam test-db test-api test-auth test-common test-cert-manager test-site-workflow test-site-manager test-workflow test-site-agent test-flow test-powershelf-manager test-nvswitch-manager test-proto
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -340,7 +348,8 @@ core-protogen: .tools-stamp
 	echo "Generating protobuf for Core"
 	cd proto/core && PATH="$(TOOLS_DIR):$$PATH" $(BUF) generate
 	go fmt ./...
-	python3 scripts/check_source_headers.py --fix
+	python3 scripts/check_source_headers.py --fix \
+		--include-untracked 'proto/core/gen/v1/*.pb.go'
 
 flow-proto:
 	$(MAKE) flow-proto-clean
@@ -552,34 +561,8 @@ kind-reset-infra: docker-build-local
 	kubectl -n temporal rollout status deployment/temporal-matching --timeout=360s || true
 	kubectl -n temporal rollout status deployment/temporal-worker --timeout=360s || true
 	@echo "Creating Temporal namespaces with TLS (idempotent, with retry)..."
-	@# rollout status reporting the frontend Available does not guarantee it is
-	@# yet serving registration RPCs, so a single-shot create can lose the race
-	@# and (previously) be silently swallowed by `|| true`, leaving the cloud
-	@# worker stuck in CrashLoopBackOff ("Namespace cloud is not found").
-	@# The loop's success condition is a confirmed `describe`, not a successful
-	@# `create`: `create` returning OK does not guarantee the namespace is
-	@# immediately visible (propagation lag), so we re-check with `describe` and
-	@# retry transient NOT_FOUND responses. Fail loudly if it never confirms.
 	@for ns in cloud site; do \
-		echo "Registering Temporal namespace: $$ns"; \
-		ok=""; \
-		for attempt in $$(seq 1 30); do \
-			if kubectl -n temporal exec deploy/temporal-admintools -- temporal operator namespace describe --namespace $$ns --address temporal-frontend.temporal:7233 \
-				--tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt \
-				--tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
-				--tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
-				--tls-server-name interservice.server.temporal.local >/dev/null 2>&1; then \
-				echo "  namespace $$ns confirmed"; ok=1; break; \
-			fi; \
-			kubectl -n temporal exec deploy/temporal-admintools -- temporal operator namespace create --namespace $$ns --address temporal-frontend.temporal:7233 \
-				--tls-cert-path /var/secrets/temporal/certs/server-interservice/tls.crt \
-				--tls-key-path /var/secrets/temporal/certs/server-interservice/tls.key \
-				--tls-ca-path /var/secrets/temporal/certs/server-interservice/ca.crt \
-				--tls-server-name interservice.server.temporal.local || true; \
-			echo "  attempt $$attempt: namespace $$ns not confirmed yet, retrying in 5s..."; \
-			sleep 5; \
-		done; \
-		[ -n "$$ok" ] || { echo "ERROR: Temporal namespace $$ns was not created" >&2; exit 1; }; \
+		./scripts/setup-local.sh temporal-namespace "$$ns" || exit 1; \
 	done
 	@echo "Temporal Helm deployment ready"
 
@@ -852,19 +835,51 @@ test-temporal-e2e:
 # OpenAPI spec path or URL for SDK generation. Override with: OPENAPI_SPEC=/path/to/spec.yaml make generate-sdk
 OPENAPI_SPEC ?= openapi/spec.yaml
 
-# Generate Go API SDK from OpenAPI spec using openapi-generator
-# Requires: brew install openapi-generator
-generate-sdk:
-	openapi-generator generate \
+# The generated SDK is byte-for-byte dependent on the generator version, so it is
+# pinned here rather than resolved from PATH. Homebrew publishes no versioned
+# formula, so the jar is fetched and checksum-verified directly. Bump the version
+# and checksum together with a regenerated sdk/standard.
+OPENAPI_GENERATOR_VERSION := 7.24.0
+OPENAPI_GENERATOR_SHA256  := 4b83ccc6fd43056c8c631cd0195e5100bd0550912502527bab09ac76152dab0c
+OPENAPI_GENERATOR_JAR     := $(TOOLS_DIR)/openapi-generator-cli-$(OPENAPI_GENERATOR_VERSION).jar
+OPENAPI_GENERATOR_URL     := https://repo1.maven.org/maven2/org/openapitools/openapi-generator-cli/$(OPENAPI_GENERATOR_VERSION)/openapi-generator-cli-$(OPENAPI_GENERATOR_VERSION).jar
+
+# macOS ships a /usr/bin/java stub that only prints an install prompt, so prefer the
+# keg-only JDK that Homebrew installs as an openapi-generator dependency.
+# Recursively expanded to keep the brew lookup out of unrelated targets.
+BREW_OPENJDK = $(shell brew --prefix openjdk 2>/dev/null)
+JAVA        ?= $(if $(wildcard $(BREW_OPENJDK)/bin/java),$(BREW_OPENJDK)/bin/java,java)
+
+# sha256sum is the Linux default and shasum the macOS one; prefer whichever exists.
+SHA256SUM = $(if $(shell command -v sha256sum 2>/dev/null),sha256sum,shasum -a 256)
+
+# Verified under a temp name so a partial download is never cached as a usable jar.
+$(OPENAPI_GENERATOR_JAR):
+	@mkdir -p $(TOOLS_DIR)
+	curl -fsSL -o $@.tmp $(OPENAPI_GENERATOR_URL)
+	echo "$(OPENAPI_GENERATOR_SHA256)  $@.tmp" | $(SHA256SUM) -c -
+	mv $@.tmp $@
+
+# Generate Go API SDK from OpenAPI spec using openapi-generator.
+#
+# Previous output is cleared first because the generator only ever writes files, so
+# a schema dropped from the spec would otherwise leave its model behind. Generated
+# files use the api_ / model_ prefixes, which hand-written helpers must avoid.
+generate-sdk: $(OPENAPI_GENERATOR_JAR)
+	rm -f sdk/standard/api_*.go sdk/standard/model_*.go
+	$(JAVA) -jar $(OPENAPI_GENERATOR_JAR) generate \
 		-i $(OPENAPI_SPEC) \
 		-g go \
 		-o sdk/standard \
 		-t openapi/templates/go \
 		--package-name standard \
 		--additional-properties=isGoSubmodule=true,enumClassPrefix=true \
+		--type-mappings integer+int64=int64,integer+uint32=uint32,integer+uint64=uint64 \
 		--global-property=apis,models,supportingFiles
 	rm -rf sdk/standard/docs sdk/standard/api sdk/standard/README.md sdk/standard/test sdk/standard/.openapi-generator
-	python3 scripts/check_source_headers.py --fix
+	python3 scripts/check_source_headers.py --fix \
+		--include-untracked 'sdk/standard/api_*.go' \
+		--include-untracked 'sdk/standard/model_*.go'
 	@echo "Client generated in sdk/standard/"
 	cd sdk/standard && go build ./...
 	@echo "Client compiles successfully"

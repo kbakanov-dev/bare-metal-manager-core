@@ -68,12 +68,12 @@
 //! already at the rotate-TO value already has the policy in effect; recovery has
 //! nothing to restore.
 //!
-//! # Entry gate ([`BmcRotationGate`])
+//! # Entry gate ([`RotationGate`])
 //!
 //! Controllers must not pay a per-device `device_rotation_status` query on every
-//! 30-second sweep. [`BmcRotationGate`] caches the cheap per-type aggregate
+//! 30-second sweep. [`RotationGate`] caches the cheap per-type aggregate
 //! ([`rotation_status`]) with a short TTL, so a controller's per-object entry
-//! guard ([`BmcRotationGate::bmc_rotation_needed`]) hits the database per-device
+//! guard ([`RotationGate::rotation_needed`]) hits the database per-device
 //! only when the site-wide aggregate says some device actually lags. In steady
 //! state (nothing staged, or fully converged) the gate is one cached aggregate
 //! query per TTL window, not O(devices).
@@ -81,7 +81,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use carbide_instrument::{Event, LabelValue, emit};
+use carbide_instrument::{Event, LabelValue, MetricFamily, emit};
 use carbide_redfish::libredfish::RedfishClientPool;
 use carbide_secrets::credentials::{
     BmcCredentialType, CredentialKey, CredentialManager, Credentials,
@@ -95,7 +95,13 @@ use db::credential_rotation::{
 };
 use libredfish::model::service_root::RedfishVendor;
 use mac_address::MacAddress;
+use model::bmc_info::BmcInfo;
+use model::machine::Machine;
+use model::power_shelf::PowerShelf;
+use model::switch::Switch;
 use sqlx::PgPool;
+
+pub mod site_explorer_pause;
 
 /// All work in this crate is the `bmc` credential family.
 const BMC: CredentialRotationType = CredentialRotationType::Bmc;
@@ -108,15 +114,24 @@ enum BmcCredentialRotationResult {
     Quarantined,
 }
 
+/// The one metric the Events below record.
+#[derive(MetricFamily)]
+#[metric(
+    name = "carbide_bmc_credential_rotation_results_total",
+    kind = counter,
+    component = "credential-rotation",
+    describe = "Number of persisted BMC credential rotation results, by result"
+)]
+struct BmcCredentialRotationResults {
+    result: BmcCredentialRotationResult,
+}
+
 #[derive(Event)]
 #[event(
     event_name = "bmc_credential_rotation_converged",
-    metric_name = "carbide_bmc_credential_rotation_results_total",
-    component = "credential-rotation",
+    metric_family = BmcCredentialRotationResults,
     log = info,
-    metric = counter,
-    message = "BMC credential rotated and converged",
-    describe = "Number of persisted BMC credential rotation results, by result"
+    message = "BMC credential rotated and converged"
 )]
 struct BmcCredentialRotationConverged {
     #[label]
@@ -140,12 +155,9 @@ impl BmcCredentialRotationConverged {
 #[derive(Event)]
 #[event(
     event_name = "bmc_credential_rotation_recovered",
-    metric_name = "carbide_bmc_credential_rotation_results_total",
-    component = "credential-rotation",
+    metric_family = BmcCredentialRotationResults,
     log = warn,
-    metric = counter,
-    message = "BMC already at rotate-to credential; recovered from an interrupted prior rotation",
-    describe = "Number of persisted BMC credential rotation results, by result"
+    message = "BMC already at rotate-to credential; recovered from an interrupted prior rotation"
 )]
 struct BmcCredentialRotationRecovered {
     #[label]
@@ -172,12 +184,9 @@ impl BmcCredentialRotationRecovered {
 #[derive(Event)]
 #[event(
     event_name = "bmc_credential_rotation_quarantined",
-    metric_name = "carbide_bmc_credential_rotation_results_total",
-    component = "credential-rotation",
+    metric_family = BmcCredentialRotationResults,
     log = warn,
-    metric = counter,
-    message = "BMC credential rotation attempt failed; quarantining",
-    describe = "Number of persisted BMC credential rotation results, by result"
+    message = "BMC credential rotation attempt failed; quarantining"
 )]
 struct BmcCredentialRotationQuarantined {
     #[label]
@@ -201,7 +210,7 @@ impl BmcCredentialRotationQuarantined {
     }
 }
 
-/// Default freshness window for the [`BmcRotationGate`] aggregate cache. Short
+/// Default freshness window for the [`RotationGate`] aggregate cache. Short
 /// enough that a freshly staged rotation is picked up within roughly one sweep,
 /// long enough that steady-state sweeps don't hammer the aggregate query.
 const DEFAULT_AGGREGATE_TTL: Duration = Duration::from_secs(15);
@@ -212,22 +221,63 @@ pub enum RotateOutcome {
     /// The device is at the target version (just rotated, or already there).
     /// The controller transitions back to its steady (`Ready`) state.
     Converged,
-    /// The attempt failed; a backoff window was recorded. The controller
-    /// returns to steady state and its entry guard skips this device (it reads
-    /// as `quarantined`) until `until` passes.
+    /// The attempt failed *before* the hardware password changed (or the change
+    /// itself failed), so the stored per-device secret still authenticates the
+    /// BMC. A backoff window was recorded. The controller returns to steady
+    /// state and its entry guard skips this device (it reads as `quarantined`)
+    /// until `until` passes.
     Quarantined { until: DateTime<Utc> },
+    /// The BMC reached the rotate-to password but persisting the new per-device
+    /// secret to the credential store failed: the hardware is AHEAD of the
+    /// store (the BMC is on the new password while the store still serves the
+    /// old one). The device is intentionally left **not quarantined and not
+    /// converged**, so it keeps reading as `needs_rotation` and the engine's
+    /// change-then-verify recovery re-persists and converges on a later tick.
+    ///
+    /// The controller must **remain in its rotation state** (keeping the device
+    /// suppressed from site-explorer and out of the allocatable pool) and
+    /// re-tick until the store write succeeds -- reconciliation is retried every
+    /// sweep rather than backed off, and is never abandoned.
+    CredentialStoreReconcilePending,
     /// Nothing to do: no rotation row for this device (not under management, or
     /// the row was torn down). The controller transitions back without acting.
     NoWork,
 }
 
+/// How the engine obtains the dispatch vendor `set_bmc_root_password` branches
+/// on for a rotation target.
+///
+/// The precise Redfish dispatch vendor is not persisted for any device family
+/// (the stored hardware vendor is DMI-derived and too coarse). The distinction
+/// is instead about *who* resolves it: a caller that already holds the exact
+/// vendor hands it over (`Fixed`), while a caller that would otherwise have to
+/// probe an authenticated BMC to learn it defers that probe to the engine
+/// (`Probe`), so the probe runs inside the engine's quarantine-on-failure
+/// envelope.
+#[derive(Debug, Clone)]
+pub enum DispatchVendor {
+    /// The caller already holds the precise vendor: the switch controller (a
+    /// compile-time constant, NVIDIA MGX) and the machine controller (which
+    /// probes it in its own controller layer before calling). Nothing persists
+    /// it -- `Fixed` only means "resolved by the caller, not the engine".
+    Fixed(RedfishVendor),
+    /// Resolve the vendor at rotation time by probing the BMC's Chassis
+    /// manufacturer ([`RedfishClientPool::probe_bmc_vendor`]) -- power-shelf
+    /// PMCs (Lite-On/Delta), which do *not* expose a recognized vendor in their
+    /// Redfish service root. The probe runs *inside* the engine's
+    /// quarantine-on-failure envelope and reuses the same credential candidates
+    /// as the rotation itself, so a failed probe records backoff (lockout-safe)
+    /// rather than looping the entry guard, and a stale per-device secret does
+    /// not deadlock recovery.
+    Probe,
+}
+
 /// Where and how to reach a single device's BMC for rotation.
 ///
 /// `device_mac` is the BMC MAC that keys both the `device_credential_rotation`
-/// row and the per-device Vault secret. `vendor` is resolved by the caller,
-/// which for switch / power-shelf BMCs means probing at rotation time via
-/// [`RedfishClientPool::probe_bmc_vendor`] (the precise dispatch vendor is not
-/// persisted anywhere).
+/// row and the per-device Vault secret. `vendor` is either the caller-known
+/// dispatch vendor or a directive to probe it at rotation time (see
+/// [`DispatchVendor`]).
 #[derive(Debug, Clone)]
 pub struct BmcRotationTarget {
     /// BMC MAC keying the rotation row and the per-device secret.
@@ -236,8 +286,348 @@ pub struct BmcRotationTarget {
     pub host: String,
     /// BMC port, when non-default.
     pub port: Option<u16>,
-    /// Precise dispatch vendor `set_bmc_root_password` branches on.
-    pub vendor: RedfishVendor,
+    /// How to obtain the dispatch vendor `set_bmc_root_password` branches on.
+    pub vendor: DispatchVendor,
+}
+
+/// A reachable, keyable BMC endpoint: the MAC that keys both the
+/// `device_credential_rotation` row and the per-device Vault secret, plus where
+/// to reach it. Vendor-independent -- it is the precursor a controller resolves
+/// a dispatch vendor for (by probing at rotation time) to form a
+/// [`BmcRotationTarget`]. Each device state controller builds these from its own
+/// snapshot: the machine controller from the host BMC and each DPU BMC, the
+/// switch controller from the switch's single BMC.
+#[derive(Debug, Clone)]
+pub struct BmcEndpoint {
+    /// BMC MAC keying the rotation row and the per-device secret.
+    pub device_mac: MacAddress,
+    /// BMC host (IP or hostname).
+    pub host: String,
+    /// BMC port, when non-default.
+    pub port: Option<u16>,
+}
+
+impl BmcEndpoint {
+    /// Build an endpoint from a device's BMC info, or `None` when the BMC lacks
+    /// a MAC or IP (unkeyable / unreachable, so there is nothing to rotate).
+    fn from_bmc_info(info: &BmcInfo) -> Option<Self> {
+        Some(Self {
+            device_mac: info.mac?,
+            host: info.ip?.to_string(),
+            port: info.port,
+        })
+    }
+
+    /// The BMC endpoint of a machine (a managed host or one of its DPUs), or
+    /// `None` when that machine's BMC is unkeyable / unreachable.
+    pub fn from_machine(machine: &Machine) -> Option<Self> {
+        Self::from_bmc_info(&machine.status.bmc_info)
+    }
+
+    /// The BMC endpoint of a switch, or `None` when the switch has no BMC info
+    /// or it is unkeyable / unreachable.
+    pub fn from_switch(switch: &Switch) -> Option<Self> {
+        Self::from_bmc_info(switch.bmc_info.as_ref()?)
+    }
+
+    /// The BMC (PMC) endpoint of a power shelf, or `None` when the power shelf
+    /// has no BMC info or it is unkeyable / unreachable.
+    pub fn from_power_shelf(power_shelf: &PowerShelf) -> Option<Self> {
+        Self::from_bmc_info(power_shelf.bmc_info.as_ref()?)
+    }
+
+    /// Pair this endpoint with a caller-known dispatch `vendor` to form the
+    /// [`BmcRotationTarget`] the engine rotates (machine + switch controllers).
+    pub fn into_target(self, vendor: RedfishVendor) -> BmcRotationTarget {
+        self.into_target_with(DispatchVendor::Fixed(vendor))
+    }
+
+    /// Pair this endpoint with a directive to probe the dispatch vendor at
+    /// rotation time (power-shelf controller: Lite-On/Delta PMCs).
+    pub fn into_target_probing_vendor(self) -> BmcRotationTarget {
+        self.into_target_with(DispatchVendor::Probe)
+    }
+
+    fn into_target_with(self, vendor: DispatchVendor) -> BmcRotationTarget {
+        BmcRotationTarget {
+            device_mac: self.device_mac,
+            host: self.host,
+            port: self.port,
+            vendor,
+        }
+    }
+}
+
+#[cfg(test)]
+mod bmc_endpoint_tests {
+    use std::net::IpAddr;
+
+    use super::*;
+
+    fn mac(last: u8) -> MacAddress {
+        MacAddress::new([0x02, 0, 0, 0, 0, last])
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    fn bmc_info(mac: Option<MacAddress>, ip: Option<IpAddr>, port: Option<u16>) -> BmcInfo {
+        BmcInfo {
+            machine_interface_id: None,
+            ip,
+            port,
+            mac,
+            version: None,
+            firmware_version: None,
+        }
+    }
+
+    #[test]
+    fn endpoint_resolves_from_bmc_info() {
+        let endpoint = BmcEndpoint::from_bmc_info(&bmc_info(Some(mac(1)), Some(ip(1)), Some(8443)))
+            .expect("a fully addressable BMC yields an endpoint");
+        assert_eq!(endpoint.device_mac, mac(1));
+        assert_eq!(endpoint.host, ip(1).to_string());
+        assert_eq!(endpoint.port, Some(8443));
+    }
+
+    #[test]
+    fn endpoint_is_none_when_mac_missing() {
+        // No MAC means the rotation row / per-device secret cannot be keyed.
+        assert!(BmcEndpoint::from_bmc_info(&bmc_info(None, Some(ip(1)), None)).is_none());
+    }
+
+    #[test]
+    fn endpoint_is_none_when_ip_missing() {
+        // No IP means the BMC cannot be reached.
+        assert!(BmcEndpoint::from_bmc_info(&bmc_info(Some(mac(1)), None, None)).is_none());
+    }
+}
+
+/// Transient-failure retry budget for a single BMC-rotation entry. Device-level
+/// failures are handled by the engine (quarantine + backoff), so this only
+/// bounds re-entries caused by transient *bookkeeping* errors before a
+/// controller gives up and returns to its steady state; the entry guard
+/// re-enters on the next sweep if a device still lags.
+pub const MAX_BMC_ROTATION_RETRIES: u32 = 3;
+
+/// Outcome of one BMC-rotation tick, as seen by a device state controller.
+///
+/// The tick may cover one device (a switch or power-shelf BMC) or several (a
+/// managed host's host BMC plus each DPU BMC); either way it collapses to
+/// whether every device reached a terminal engine outcome or at least one hit a
+/// transient bookkeeping failure worth retrying.
+pub enum BmcRotationTick {
+    /// Every device reached a terminal outcome (converged, quarantined, or no
+    /// work). The controller should leave the rotation state; the entry guard
+    /// re-enters later if a quarantined device becomes eligible again.
+    Settled,
+    /// At least one device hit a transient bookkeeping failure. The controller
+    /// should retry the tick, bounded by the state's retry budget.
+    Retry,
+    /// At least one device changed its hardware password but the credential
+    /// store persist has not yet succeeded (hardware ahead of the stored
+    /// secret). The controller must **remain** in its rotation state -- keeping
+    /// the device suppressed and out of the allocatable pool -- and wait; a
+    /// later tick's change-then-verify recovery re-persists and converges once
+    /// the store write succeeds. Dominates `Retry` and `Settled` (see
+    /// [`BmcRotationTick::merge`]) so a mixed multi-device tick never leaves the
+    /// rotation state while any device's hardware is ahead of its store.
+    WaitForCredentialStoreReconcile,
+}
+
+impl BmcRotationTick {
+    /// Fold two device outcomes into one tick outcome, strongest wins:
+    /// `WaitForCredentialStoreReconcile` > `Retry` > `Settled`. Holding for a lagging store
+    /// dominates a transient retry so the bounded transient budget can never
+    /// `GaveUp` out of the rotation state (returning the device to an
+    /// allocatable, un-suppressed steady state) while a device's hardware is
+    /// ahead of its stored secret.
+    pub fn merge(self, other: Self) -> Self {
+        use BmcRotationTick::*;
+        match (self, other) {
+            (WaitForCredentialStoreReconcile, _) | (_, WaitForCredentialStoreReconcile) => {
+                WaitForCredentialStoreReconcile
+            }
+            (Retry, _) | (_, Retry) => Retry,
+            (Settled, Settled) => Settled,
+        }
+    }
+}
+
+/// What a state controller should do after one BMC-rotation tick, independent of
+/// which controller or state drives it. Keeping this state-neutral lets the
+/// machine (`ManagedHostState::RotatingBmc`), switch
+/// (`SwitchControllerState::RotatingBmc`), and (later) power-shelf controllers
+/// share one retry/budget policy and remain thin maps onto their own state
+/// constructors.
+pub enum RotationStep {
+    /// The tick reached a terminal outcome for every device (converged,
+    /// quarantined, or no work): leave the rotation state, and it is safe to
+    /// clear any one-shot force request because the forced attempt genuinely
+    /// fired. The entry guard re-enters on a later sweep if a device lags again.
+    Settled,
+    /// The transient-retry budget was exhausted without settling. Leave the
+    /// rotation state, but do *not* treat a force request as satisfied: the
+    /// forced attempt never cleanly ran (the failures were pre-hardware
+    /// bookkeeping errors that record no quarantine), so leaving the flag set
+    /// lets the entry guard re-attempt on a later sweep instead of silently
+    /// dropping the operator's request.
+    GaveUp,
+    /// Re-enter the rotation state carrying this incremented retry count.
+    Retry { retry_count: u32 },
+    /// A device's hardware is ahead of its stored secret (the credential-store
+    /// persist is still pending): **remain** in the rotation state and wait for
+    /// a later tick to reconcile the store. Unlike `Retry` this does *not*
+    /// consume the transient-retry budget -- it is a legitimate hold, not a
+    /// bookkeeping error -- and unlike `Settled`/`GaveUp` it must not resume
+    /// site-explorer or clear a force request, so the device stays suppressed
+    /// and non-allocatable until the store write succeeds.
+    WaitForCredentialStoreReconcile,
+}
+
+/// Fold one tick outcome and the current retry count into the next
+/// [`RotationStep`]. Device-level failures are already handled by the engine
+/// (quarantine + backoff); this only bounds re-entries caused by *transient
+/// bookkeeping* failures before a controller falls back to its steady state.
+///
+/// `object_id` is used only for the give-up log line, so any controller passes
+/// its own identifier (a machine, switch, or power-shelf id).
+pub fn advance(
+    tick: BmcRotationTick,
+    retry_count: u32,
+    object_id: impl std::fmt::Display,
+) -> RotationStep {
+    match tick {
+        BmcRotationTick::Settled => RotationStep::Settled,
+        // A store-reconcile hold is budget-neutral: it is a legitimate wait for
+        // the credential store, not a transient bookkeeping error, so it neither
+        // advances nor exhausts the retry count.
+        BmcRotationTick::WaitForCredentialStoreReconcile => {
+            RotationStep::WaitForCredentialStoreReconcile
+        }
+        BmcRotationTick::Retry => {
+            let next = retry_count + 1;
+            if next >= MAX_BMC_ROTATION_RETRIES {
+                tracing::warn!(
+                    %object_id,
+                    "BMC rotation exhausted its transient-retry budget; returning to steady state (a pending force request stays set so the entry guard re-attempts on a later sweep; a passively-lagging device is re-selected by the gate)"
+                );
+                RotationStep::GaveUp
+            } else {
+                RotationStep::Retry { retry_count: next }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_seam_tests {
+    use super::{BmcRotationTick, MAX_BMC_ROTATION_RETRIES, RotationStep, advance};
+
+    /// Any Display value stands in for a real object id; the seam uses it only
+    /// for the give-up log line.
+    const OBJECT_ID: &str = "test-object";
+
+    #[test]
+    fn advance_settles_regardless_of_retry_count() {
+        // A settled tick always leaves the rotation state, even mid-budget: every
+        // device reached a terminal outcome, so there is nothing left to retry.
+        // `Settled` (not `GaveUp`) is what authorizes the caller to clear a
+        // satisfied force request.
+        assert!(matches!(
+            advance(BmcRotationTick::Settled, 0, OBJECT_ID),
+            RotationStep::Settled
+        ));
+        assert!(matches!(
+            advance(
+                BmcRotationTick::Settled,
+                MAX_BMC_ROTATION_RETRIES - 1,
+                OBJECT_ID
+            ),
+            RotationStep::Settled
+        ));
+    }
+
+    #[test]
+    fn advance_retries_with_incremented_count_within_budget() {
+        // A transient failure below budget re-enters carrying count+1, so the
+        // budget actually advances toward its bound rather than looping forever.
+        let RotationStep::Retry { retry_count } = advance(BmcRotationTick::Retry, 0, OBJECT_ID)
+        else {
+            panic!("a transient failure below budget must retry");
+        };
+        assert_eq!(retry_count, 1);
+    }
+
+    #[test]
+    fn advance_gives_up_at_budget() {
+        // The last attempt before the bound (count+1 == MAX) stops retrying and
+        // falls back to the steady state instead of exceeding the budget. It
+        // reports `GaveUp` rather than `Settled` so the caller leaves a pending
+        // force request in place (the forced attempt never cleanly ran) instead
+        // of silently clearing it.
+        assert!(matches!(
+            advance(
+                BmcRotationTick::Retry,
+                MAX_BMC_ROTATION_RETRIES - 1,
+                OBJECT_ID
+            ),
+            RotationStep::GaveUp
+        ));
+    }
+
+    #[test]
+    fn advance_holds_for_store_reconcile_without_consuming_budget() {
+        // A store-reconcile hold is budget-neutral: it maps straight to
+        // `WaitForCredentialStoreReconcile` regardless of retry count, so waiting for the
+        // credential store never exhausts the transient-retry budget and can
+        // never `GaveUp` out of the rotation state (which would return the device
+        // to an allocatable, un-suppressed steady state while its hardware is
+        // ahead of the store).
+        for count in [0, MAX_BMC_ROTATION_RETRIES - 1, MAX_BMC_ROTATION_RETRIES] {
+            assert!(matches!(
+                advance(
+                    BmcRotationTick::WaitForCredentialStoreReconcile,
+                    count,
+                    OBJECT_ID
+                ),
+                RotationStep::WaitForCredentialStoreReconcile
+            ));
+        }
+    }
+
+    #[test]
+    fn merge_folds_device_outcomes_strongest_wins() {
+        use BmcRotationTick::*;
+        // WaitForCredentialStoreReconcile dominates everything so a mixed multi-device tick
+        // holds; Retry dominates Settled; Settled only survives when both are.
+        assert!(matches!(Settled.merge(Settled), Settled));
+        assert!(matches!(Settled.merge(Retry), Retry));
+        assert!(matches!(Retry.merge(Settled), Retry));
+        assert!(matches!(Retry.merge(Retry), Retry));
+        assert!(matches!(
+            Settled.merge(WaitForCredentialStoreReconcile),
+            WaitForCredentialStoreReconcile
+        ));
+        assert!(matches!(
+            WaitForCredentialStoreReconcile.merge(Settled),
+            WaitForCredentialStoreReconcile
+        ));
+        assert!(matches!(
+            Retry.merge(WaitForCredentialStoreReconcile),
+            WaitForCredentialStoreReconcile
+        ));
+        assert!(matches!(
+            WaitForCredentialStoreReconcile.merge(Retry),
+            WaitForCredentialStoreReconcile
+        ));
+        assert!(matches!(
+            WaitForCredentialStoreReconcile.merge(WaitForCredentialStoreReconcile),
+            WaitForCredentialStoreReconcile
+        ));
+    }
 }
 
 /// Errors that abort a rotation tick as a transient handler failure (so the
@@ -268,11 +658,13 @@ pub fn needs_rotation(status: &DeviceRotationStatus) -> bool {
     !status.converged && !status.quarantined
 }
 
-/// A short-TTL cache of the site-wide BMC rotation aggregate, shared across a
-/// controller's per-object ticks (cheap to clone; `Arc`-backed).
+/// A short-TTL cache of the site-wide rotation aggregate for one credential
+/// family (BMC, host UEFI, ...), shared across a controller's per-object ticks
+/// (cheap to clone; `Arc`-backed). The family is fixed at construction; a
+/// controller that rotates two families holds one gate per family.
 ///
-/// The controller's per-tick entry guard calls
-/// [`Self::bmc_rotation_needed`], which consults the cached aggregate first and
+/// The controller's per-tick entry guard calls [`Self::rotation_needed`], which
+/// consults the cached aggregate first and
 /// only issues the per-device query when the site-wide counts say some device
 /// actually lags. This keeps the steady state (nothing staged / fully
 /// converged) at one cheap aggregate query per TTL window rather than a
@@ -283,9 +675,14 @@ pub fn needs_rotation(status: &DeviceRotationStatus) -> bool {
 /// and the `FOR UPDATE SKIP LOCKED` object claim still serialize the actual
 /// rotation across replicas.
 #[derive(Clone)]
-pub struct BmcRotationGate {
+pub struct RotationGate {
     inner: Arc<Mutex<CachedAggregate>>,
     ttl: Duration,
+    /// The credential family this gate reports on (BMC, host UEFI, ...). A gate
+    /// is single-family: the cached aggregate and the per-device query are both
+    /// scoped to it, so a controller that rotates two families holds one gate
+    /// per family.
+    family: CredentialRotationType,
 }
 
 #[derive(Default)]
@@ -296,24 +693,23 @@ struct CachedAggregate {
     work_pending: bool,
 }
 
-impl Default for BmcRotationGate {
-    fn default() -> Self {
-        Self::with_ttl(DEFAULT_AGGREGATE_TTL)
-    }
-}
-
-impl BmcRotationGate {
-    /// A gate with the default aggregate-cache TTL.
-    pub fn new() -> Self {
-        Self::default()
+impl RotationGate {
+    /// A gate for a credential family with the default aggregate-cache TTL. The
+    /// family is required: the type is family-generic and its cached aggregate
+    /// and per-device query are both scoped to it, so callers always name the
+    /// family they gate on rather than relying on an implicit default.
+    pub fn new_for_family(family: CredentialRotationType) -> Self {
+        Self::with_ttl_and_family(DEFAULT_AGGREGATE_TTL, family)
     }
 
-    /// A gate with an explicit aggregate-cache TTL. A zero TTL disables caching
-    /// (every call re-queries the aggregate) -- useful in tests.
-    pub fn with_ttl(ttl: Duration) -> Self {
+    /// A gate for a credential family with an explicit aggregate-cache TTL. A
+    /// zero TTL disables caching (every call re-queries the aggregate) -- useful
+    /// in tests.
+    pub fn with_ttl_and_family(ttl: Duration, family: CredentialRotationType) -> Self {
         Self {
             inner: Arc::new(Mutex::new(CachedAggregate::default())),
             ttl,
+            family,
         }
     }
 
@@ -341,7 +737,7 @@ impl BmcRotationGate {
         // another tick is harmless: the query is read-only and idempotent, and
         // last-writer-wins on the cache is fine for a gate.
         let mut conn = pool.acquire().await?;
-        let status = rotation_status(&mut conn, BMC).await?;
+        let status = rotation_status(&mut conn, self.family).await?;
         drop(conn);
         let work_pending = status.target_version > 0 && (status.pending + status.quarantined) > 0;
 
@@ -358,7 +754,7 @@ impl BmcRotationGate {
     /// Gated by [`Self::rotation_pending`], so the per-device query runs only
     /// when the cached aggregate says some device lags. A device with no
     /// rotation row (not under management) returns `false`.
-    pub async fn bmc_rotation_needed(
+    pub async fn rotation_needed(
         &self,
         pool: &PgPool,
         device_mac: MacAddress,
@@ -367,7 +763,7 @@ impl BmcRotationGate {
             return Ok(false);
         }
         let mut conn = pool.acquire().await?;
-        let status = device_rotation_status(&mut conn, BMC, device_mac).await?;
+        let status = device_rotation_status(&mut conn, self.family, device_mac).await?;
         Ok(status.as_ref().is_some_and(needs_rotation))
     }
 }
@@ -385,11 +781,18 @@ impl BmcRotationGate {
 /// `RotateCredential` staged the target into. (The Redfish pool's
 /// `credential_reader` is intentionally not used here; the engine owns
 /// credential resolution.)
+/// `force` is the operator escape hatch: when `true`, a device still inside its
+/// backoff window is attempted anyway rather than short-circuiting as
+/// [`RotateOutcome::Quarantined`]. It does not bypass [`RotateOutcome::NoWork`]
+/// (no rotation row) or [`RotateOutcome::Converged`] (already at target) -- there
+/// is nothing to force in those cases -- and a forced attempt that fails
+/// re-quarantines through the normal backoff bookkeeping.
 pub async fn rotate_bmc(
     db_pool: &PgPool,
     credential_manager: &dyn CredentialManager,
     redfish_pool: &dyn RedfishClientPool,
     bmc: &BmcRotationTarget,
+    force: bool,
 ) -> Result<RotateOutcome, RotationEngineError> {
     let mac = bmc.device_mac;
 
@@ -403,7 +806,7 @@ pub async fn rotate_bmc(
     if status.converged {
         return Ok(RotateOutcome::Converged);
     }
-    if status.quarantined {
+    if status.quarantined && !force {
         return Ok(RotateOutcome::Quarantined {
             until: status.quarantined_until.unwrap_or_else(Utc::now),
         });
@@ -450,7 +853,7 @@ pub async fn rotate_bmc(
             }
             Ok(RotateOutcome::Converged)
         }
-        Err(redacted) => {
+        Err(ConvergeError::DeviceFault(redacted)) => {
             let until = backoff_until(status.rotate_attempts, Utc::now());
             let mut conn = db_pool.acquire().await?;
             increment_rotate_attempt(&mut conn, mac, BMC, &redacted, until).await?;
@@ -460,6 +863,26 @@ pub async fn rotate_bmc(
                 redacted,
             ));
             Ok(RotateOutcome::Quarantined { until })
+        }
+        // The hardware reached the target but the store write failed: the BMC is
+        // ahead of the stored secret. Deliberately record *no* backoff and leave
+        // the row not-converged / not-quarantined, so it keeps reading as
+        // `needs_rotation` and the change-then-verify recovery re-persists on a
+        // later tick. The crash marker stays set (we never promoted). The
+        // controller holds in its rotation state until the store reconciles, so
+        // reconciliation is retried every sweep and never abandoned.
+        Err(ConvergeError::CredentialStoreWriteFailed(redacted)) => {
+            // A transient hold, not a terminal result: a plain log rather than a
+            // metric series. The device keeps reading as `needs_rotation`, so the
+            // retry is observable through the existing rotation-state gauges; a
+            // dedicated counter can follow if operators need to trend it.
+            tracing::warn!(
+                %mac,
+                target_version,
+                error = %redacted,
+                "BMC reached the rotate-to password but persisting the new per-device secret failed; holding rotation until the credential store reconciles"
+            );
+            Ok(RotateOutcome::CredentialStoreReconcilePending)
         }
     }
 }
@@ -474,6 +897,33 @@ enum CredentialConvergence {
     /// attempt changed the hardware and crashed before recording success, and
     /// this tick reconciled it. Carries the (redacted) change error for context.
     Recovered { change_error: String },
+}
+
+/// Where a convergence attempt failed, so the caller can tell a *device* fault
+/// (quarantine + backoff; the stored secret still authenticates the BMC) from a
+/// credential-store *persist* failure that lands after the hardware already
+/// changed (hardware AHEAD of the store; hold and reconcile rather than
+/// quarantine). Both carry an already-redacted reason.
+#[derive(Debug)]
+enum ConvergeError {
+    /// The attempt failed before (or at) the hardware change: the stored
+    /// per-device secret still authenticates the BMC, so the device is safe to
+    /// return to steady state after a backoff.
+    DeviceFault(String),
+    /// The hardware reached the rotate-to password but persisting the new
+    /// per-device secret to the credential store failed: the BMC is on the new
+    /// password while the store still serves the old one.
+    CredentialStoreWriteFailed(String),
+}
+
+/// Every pre-persist failure in [`converge_bmc_password`] is a device fault: the
+/// hardware has not (confirmed) moved, so the stored secret is still
+/// authoritative. Only the final store write is special-cased to
+/// [`ConvergeError::CredentialStoreWriteFailed`] explicitly.
+impl From<String> for ConvergeError {
+    fn from(reason: String) -> Self {
+        Self::DeviceFault(reason)
+    }
 }
 
 impl CredentialConvergence {
@@ -499,7 +949,7 @@ async fn converge_bmc_password(
     redfish_pool: &dyn RedfishClientPool,
     bmc: &BmcRotationTarget,
     rotate_to_version: u32,
-) -> Result<CredentialConvergence, String> {
+) -> Result<CredentialConvergence, ConvergeError> {
     let per_device_key = CredentialKey::BmcCredentials {
         credential_type: BmcCredentialType::BmcRoot {
             bmc_mac_address: bmc.device_mac,
@@ -540,7 +990,15 @@ async fn converge_bmc_password(
         password: new_password.clone(),
     };
 
-    let convergence = change_or_recover(redfish_pool, bmc, rotate_from, rotate_to)
+    // Resolve the dispatch vendor before touching the password. For a probe
+    // target this is an authenticated Chassis read, so it must go through the
+    // same redaction and (via the caller) quarantine-on-failure path as the
+    // rotation itself.
+    let vendor = resolve_dispatch_vendor(redfish_pool, bmc, &rotate_from, &rotate_to)
+        .await
+        .map_err(|e| redact(e, &[&current_password, &new_password]))?;
+
+    let convergence = change_or_recover(redfish_pool, bmc, vendor, rotate_from, rotate_to)
         .await
         .map_err(|e| redact(e, &[&current_password, &new_password]))?
         .redacted(&[&current_password, &new_password]);
@@ -555,10 +1013,15 @@ async fn converge_bmc_password(
         .set_credentials(&per_device_key, &updated)
         .await
         .map_err(|e| {
-            redact(
+            // This is the one failure that leaves the hardware ahead of the
+            // store: the password change already succeeded above, so a failed
+            // persist means the BMC is on the new password while the store still
+            // serves the old one. Surface it distinctly so the caller holds and
+            // reconciles instead of quarantining.
+            ConvergeError::CredentialStoreWriteFailed(redact(
                 format!("persist per-device BMC secret: {e}"),
                 &[&current_password, &new_password],
-            )
+            ))
         })?;
 
     Ok(convergence)
@@ -580,6 +1043,7 @@ async fn converge_bmc_password(
 async fn change_or_recover(
     redfish_pool: &dyn RedfishClientPool,
     bmc: &BmcRotationTarget,
+    vendor: RedfishVendor,
     rotate_from: Credentials,
     rotate_to: Credentials,
 ) -> Result<CredentialConvergence, String> {
@@ -592,7 +1056,7 @@ async fn change_or_recover(
         .set_bmc_root_password(
             &bmc.host,
             bmc.port,
-            bmc.vendor,
+            vendor,
             rotate_from,
             new_password.clone(),
         )
@@ -616,6 +1080,45 @@ async fn change_or_recover(
         Err(verify_err) => Err(format!(
             "{change_err}; rotate-to credential probe also failed: {verify_err}"
         )),
+    }
+}
+
+/// Resolve the dispatch vendor `set_bmc_root_password` branches on.
+///
+/// A [`DispatchVendor::Fixed`] target returns immediately. A
+/// [`DispatchVendor::Probe`] target (power-shelf PMCs) probes the BMC's Chassis
+/// manufacturer, trying the per-device secret first and the rotate-TO value
+/// second -- the same two candidates the change path uses. That ordering means
+/// a crash-recovered device (whose per-device secret still lags the hardware)
+/// still resolves its vendor via the rotate-TO value rather than deadlocking,
+/// and it is bounded to at most two logins so it stays clear of BMC lockout. A
+/// probe that never authenticates returns `Err`, which the caller records as a
+/// quarantine with backoff. Returns an already-`to_string`-ed error (still to be
+/// redacted by the caller); never returns a secret-bearing string itself.
+async fn resolve_dispatch_vendor(
+    redfish_pool: &dyn RedfishClientPool,
+    bmc: &BmcRotationTarget,
+    rotate_from: &Credentials,
+    rotate_to: &Credentials,
+) -> Result<RedfishVendor, String> {
+    match &bmc.vendor {
+        DispatchVendor::Fixed(vendor) => Ok(*vendor),
+        DispatchVendor::Probe => {
+            let mut last_err = None;
+            for candidate in [rotate_from, rotate_to] {
+                match redfish_pool
+                    .probe_bmc_vendor(&bmc.host, bmc.port, candidate.clone())
+                    .await
+                {
+                    Ok(vendor) => return Ok(vendor),
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+            }
+            Err(format!(
+                "probe BMC dispatch vendor: {}",
+                last_err.unwrap_or_else(|| "no credential candidates".to_string())
+            ))
+        }
     }
 }
 
@@ -656,8 +1159,9 @@ mod tests {
 
     use super::{
         BMC, BmcCredentialRotationConverged, BmcCredentialRotationQuarantined,
-        BmcCredentialRotationRecovered, BmcRotationGate, BmcRotationTarget, CredentialConvergence,
-        RotateOutcome, change_or_recover, needs_rotation, redact, rotate_bmc,
+        BmcCredentialRotationRecovered, BmcRotationTarget, CredentialConvergence, DispatchVendor,
+        RotateOutcome, RotationGate, change_or_recover, needs_rotation, redact,
+        resolve_dispatch_vendor, rotate_bmc,
     };
 
     const BMC_ROTATION_RESULTS_METRIC: &str = "carbide_bmc_credential_rotation_results_total";
@@ -680,7 +1184,16 @@ mod tests {
             device_mac: test_mac(),
             host: "127.0.0.1".to_string(),
             port: Some(443),
-            vendor: RedfishVendor::NvidiaGBx00,
+            vendor: DispatchVendor::Fixed(RedfishVendor::NvidiaGBx00),
+        }
+    }
+
+    /// A probe-vendor variant of [`target`] for power-shelf-style PMCs, whose
+    /// dispatch vendor the engine resolves at rotation time.
+    fn probe_target() -> BmcRotationTarget {
+        BmcRotationTarget {
+            vendor: DispatchVendor::Probe,
+            ..target()
         }
     }
 
@@ -948,10 +1461,15 @@ mod tests {
         // The BMC is on "old"; the change to "new" authenticates and succeeds.
         let sim = bmc_on_password("old");
 
-        let convergence =
-            change_or_recover(&sim, &target(), creds("root", "old"), creds("root", "new"))
-                .await
-                .expect("the change should succeed");
+        let convergence = change_or_recover(
+            &sim,
+            &target(),
+            RedfishVendor::NvidiaGBx00,
+            creds("root", "old"),
+            creds("root", "new"),
+        )
+        .await
+        .expect("the change should succeed");
 
         assert_eq!(
             convergence,
@@ -973,10 +1491,15 @@ mod tests {
         // re-issuing the change.
         let sim = bmc_on_password("new");
 
-        let convergence =
-            change_or_recover(&sim, &target(), creds("root", "old"), creds("root", "new"))
-                .await
-                .expect("an already-converged BMC must be recovered");
+        let convergence = change_or_recover(
+            &sim,
+            &target(),
+            RedfishVendor::NvidiaGBx00,
+            creds("root", "old"),
+            creds("root", "new"),
+        )
+        .await
+        .expect("an already-converged BMC must be recovered");
 
         assert!(
             matches!(convergence, CredentialConvergence::Recovered { .. }),
@@ -990,9 +1513,15 @@ mod tests {
         // nor the probe (with "new") authenticates: the change error is surfaced.
         let sim = bmc_on_password("mystery");
 
-        change_or_recover(&sim, &target(), creds("root", "old"), creds("root", "new"))
-            .await
-            .expect_err("neither credential authenticating must surface an error");
+        change_or_recover(
+            &sim,
+            &target(),
+            RedfishVendor::NvidiaGBx00,
+            creds("root", "old"),
+            creds("root", "new"),
+        )
+        .await
+        .expect_err("neither credential authenticating must surface an error");
     }
 
     #[tokio::test]
@@ -1004,14 +1533,61 @@ mod tests {
         sim.set_change_password_error("change boom");
         sim.set_get_accounts_error(true);
 
-        let err = change_or_recover(&sim, &target(), creds("root", "old"), creds("root", "new"))
-            .await
-            .expect_err("a failed change plus a failed probe must surface an error");
+        let err = change_or_recover(
+            &sim,
+            &target(),
+            RedfishVendor::NvidiaGBx00,
+            creds("root", "old"),
+            creds("root", "new"),
+        )
+        .await
+        .expect_err("a failed change plus a failed probe must surface an error");
 
         assert!(
             err.contains("probe also failed"),
             "both the change and probe failures must be surfaced: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_dispatch_vendor_returns_the_fixed_vendor_without_probing() {
+        // A Fixed target (machine / switch) returns its vendor verbatim; the sim's
+        // service root would resolve to a different vendor, so a returned NvidiaGBx00
+        // proves the fixed value short-circuits the probe.
+        let sim = RedfishSim::default();
+        let vendor = resolve_dispatch_vendor(
+            &sim,
+            &target(),
+            &creds("root", "old"),
+            &creds("root", "new"),
+        )
+        .await
+        .expect("a fixed vendor resolves without touching the BMC");
+        assert_eq!(vendor, RedfishVendor::NvidiaGBx00);
+    }
+
+    #[tokio::test]
+    async fn resolve_dispatch_vendor_probes_the_chassis_manufacturer_for_power_shelves() {
+        // A Probe target with an unrecognized service-root vendor falls back to the
+        // Chassis manufacturer, the standard power-shelf (Lite-On / Delta)
+        // determination.
+        for (manufacturer, expected) in [
+            ("Lite-On Technology Corp.", RedfishVendor::LiteOnPowerShelf),
+            ("Delta Electronics", RedfishVendor::DeltaPowerShelf),
+        ] {
+            let sim = RedfishSim::default();
+            sim.set_service_root_vendor(Some("Contoso".to_string()));
+            sim.set_chassis_manufacturer(Some(manufacturer.to_string()));
+            let vendor = resolve_dispatch_vendor(
+                &sim,
+                &probe_target(),
+                &creds("root", "old"),
+                &creds("root", "new"),
+            )
+            .await
+            .expect("a Lite-On/Delta chassis must resolve a power-shelf vendor");
+            assert_eq!(vendor, expected, "manufacturer {manufacturer:?}");
+        }
     }
 
     #[test]
@@ -1070,7 +1646,7 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target())
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
             .await
             .expect("rotation must not raise a transient engine error");
 
@@ -1100,6 +1676,100 @@ mod tests {
     }
 
     #[carbide_macros::sqlx_test]
+    async fn rotate_bmc_holds_for_store_reconcile_when_persist_fails_then_converges(pool: PgPool) {
+        // Fault-injection: the BMC accepts the new password but persisting the
+        // new per-device secret to the store fails. The hardware is now AHEAD of
+        // the store.  The engine must NOT quarantine: it reports `CredentialStoreReconcilePending`,
+        // leaves the row not-converged / not-quarantined (so it keeps reading as
+        // `needs_rotation`), and the stored secret still lags. A later tick with
+        // the store writable then recovers (the rotate-to value already authenticates)
+        // and converges, reconciling the store -- reconciliation is never abandoned.
+        seed_device_behind_target(&pool, 1).await;
+        let cm = TestCredentialManager::default();
+        cm.set_credentials(&per_device_key(), &creds("root", "old"))
+            .await
+            .unwrap();
+        cm.set_credentials(&rotate_to_key(1), &creds("root", "new"))
+            .await
+            .unwrap();
+        // The BMC is on the per-device secret ("old"), so the hardware change
+        // old -> new succeeds; only the store write is made to fail.
+        let redfish = bmc_on_password("old");
+        cm.set_set_credentials_failure(true);
+
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .expect("a store-persist failure is not a transient engine error");
+
+        assert_eq!(
+            outcome,
+            RotateOutcome::CredentialStoreReconcilePending,
+            "a persist failure after the hardware changed must hold for reconcile, not quarantine"
+        );
+
+        let status = status_of(&pool).await;
+        assert!(
+            !status.converged,
+            "hardware ahead of store is not converged"
+        );
+        assert!(
+            !status.quarantined,
+            "a persist failure must NOT record a backoff; the device stays eligible so the persist is retried every sweep"
+        );
+        assert_eq!(
+            status.current_version,
+            Some(0),
+            "the convergence marker must not advance while the store lags"
+        );
+        assert_eq!(
+            status.rotating_to_version,
+            Some(1),
+            "the crash marker stays set (we never promoted) so recovery re-enters"
+        );
+        // Hardware is on the new password, but the stored secret still lags.
+        assert!(
+            bmc_accepts(&redfish, "new").await,
+            "the hardware change must have landed even though the persist failed"
+        );
+        assert_eq!(
+            cm.get_credentials(&per_device_key())
+                .await
+                .unwrap()
+                .unwrap(),
+            creds("root", "old"),
+            "the stored secret must still lag after the failed persist"
+        );
+
+        // The store becomes writable again: the next tick's change-then-verify
+        // recovery re-persists and converges, reconciling hardware and store.
+        cm.set_set_credentials_failure(false);
+        let metrics = MetricsCapture::start();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .expect("the reconciling tick must not raise a transient engine error");
+
+        assert_eq!(outcome, RotateOutcome::Converged);
+        assert_eq!(
+            rotation_result_deltas(&metrics),
+            [0.0, 1.0, 0.0],
+            "reconciling an already-changed BMC counts as a recovery"
+        );
+        drop(metrics);
+        let status = status_of(&pool).await;
+        assert!(status.converged);
+        assert_eq!(status.current_version, Some(1));
+        assert_eq!(status.rotating_to_version, None);
+        assert_eq!(
+            cm.get_credentials(&per_device_key())
+                .await
+                .unwrap()
+                .unwrap(),
+            creds("root", "new"),
+            "the store is reconciled to the new password once the write succeeds"
+        );
+    }
+
+    #[carbide_macros::sqlx_test]
     async fn rotate_bmc_recovers_when_hardware_already_changed_before_crash(pool: PgPool) {
         // Models a crash after the hardware password changed but before the
         // per-device secret was persisted: the stored "current" is stale
@@ -1119,7 +1789,9 @@ mod tests {
         let redfish = bmc_on_password("new");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert_eq!(outcome, RotateOutcome::Converged);
         assert_eq!(rotation_result_deltas(&metrics), [0.0, 1.0, 0.0]);
@@ -1154,7 +1826,9 @@ mod tests {
 
         let metrics = MetricsCapture::start();
         let before = Utc::now();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         let until = match outcome {
             RotateOutcome::Quarantined { until } => until,
@@ -1166,9 +1840,9 @@ mod tests {
             "credential material must not become a metric label"
         );
         drop(metrics);
-        // First failure: backoff is the base window (60s) from "now".
-        assert!(until >= before + Duration::seconds(60));
-        assert!(until <= Utc::now() + Duration::seconds(61));
+        // First failure: backoff is the base window (15 minutes) from "now".
+        assert!(until >= before + Duration::minutes(15));
+        assert!(until <= Utc::now() + Duration::minutes(15) + Duration::seconds(1));
 
         let status = status_of(&pool).await;
         assert!(status.quarantined, "device must be in a backoff window");
@@ -1197,7 +1871,9 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert_eq!(outcome, RotateOutcome::Converged);
         assert_eq!(
@@ -1227,7 +1903,9 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, RotateOutcome::Quarantined { .. }));
         assert_eq!(rotation_result_deltas(&metrics), [0.0, 0.0, 1.0]);
@@ -1253,7 +1931,9 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert_eq!(outcome, RotateOutcome::NoWork);
         assert_eq!(
@@ -1287,7 +1967,9 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert!(matches!(outcome, RotateOutcome::Quarantined { .. }));
         assert_eq!(
@@ -1302,6 +1984,56 @@ mod tests {
         );
         // The marker is untouched (still behind target, not converged).
         assert_eq!(status_of(&pool).await.current_version, Some(0));
+    }
+
+    #[carbide_macros::sqlx_test]
+    async fn rotate_bmc_force_attempts_a_quarantined_device(pool: PgPool) {
+        // Same lagging + quarantined device as the skip test, but the operator
+        // force flag makes the engine attempt the change during the backoff
+        // window and converge it, rather than short-circuiting as Quarantined.
+        seed_device_behind_target(&pool, 1).await;
+        let cm = TestCredentialManager::default();
+        cm.set_credentials(&per_device_key(), &creds("root", "old"))
+            .await
+            .unwrap();
+        cm.set_credentials(&rotate_to_key(1), &creds("root", "new"))
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        increment_rotate_attempt(
+            &mut conn,
+            test_mac(),
+            BMC,
+            "earlier failure",
+            Utc::now() + Duration::seconds(3600),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let redfish = bmc_on_password("old");
+
+        // Hold the metrics serialization guard across the converging call: it
+        // emits `converged` into the process-global registry, and without the
+        // guard it could run concurrently with a metric-asserting test and leak
+        // that count into its delta window. This test asserts outcome/state, not
+        // metrics, so the guard is dropped before those checks.
+        let metrics = MetricsCapture::start();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), true)
+            .await
+            .expect("a forced rotation must not raise a transient engine error");
+        drop(metrics);
+
+        assert_eq!(
+            outcome,
+            RotateOutcome::Converged,
+            "force must attempt the change despite an active quarantine window"
+        );
+        let status = status_of(&pool).await;
+        assert_eq!(status.current_version, Some(1));
+        assert!(
+            !redfish.create_client_calls().is_empty(),
+            "a forced device must actually touch hardware"
+        );
     }
 
     #[carbide_macros::sqlx_test]
@@ -1325,7 +2057,9 @@ mod tests {
         let redfish = bmc_on_password("old");
 
         let metrics = MetricsCapture::start();
-        let outcome = rotate_bmc(&pool, &cm, &redfish, &target()).await.unwrap();
+        let outcome = rotate_bmc(&pool, &cm, &redfish, &target(), false)
+            .await
+            .unwrap();
 
         assert_eq!(outcome, RotateOutcome::Converged);
         assert_eq!(rotation_result_deltas(&metrics), [1.0, 0.0, 0.0]);
@@ -1350,13 +2084,13 @@ mod tests {
     async fn rotation_gate_caches_aggregate_and_gates_per_device(pool: PgPool) {
         // Nothing staged yet (bmc seeded at target 0): the gate reports no work
         // without a per-device query.
-        let gate = BmcRotationGate::new();
+        let gate = RotationGate::new_for_family(BMC);
         assert!(
             !gate.rotation_pending(&pool).await.unwrap(),
             "target 0 baseline is not work"
         );
         assert!(
-            !gate.bmc_rotation_needed(&pool, test_mac()).await.unwrap(),
+            !gate.rotation_needed(&pool, test_mac()).await.unwrap(),
             "no work means the per-device guard is false"
         );
 
@@ -1370,15 +2104,15 @@ mod tests {
 
         // A zero-TTL gate always re-queries, so it observes the staged work and
         // the per-device guard now fires.
-        let fresh = BmcRotationGate::with_ttl(StdDuration::ZERO);
+        let fresh = RotationGate::with_ttl_and_family(StdDuration::ZERO, BMC);
         assert!(fresh.rotation_pending(&pool).await.unwrap());
         assert!(
-            fresh.bmc_rotation_needed(&pool, test_mac()).await.unwrap(),
+            fresh.rotation_needed(&pool, test_mac()).await.unwrap(),
             "a lagging device under a live target needs rotation"
         );
         // An unknown device has no row, so the guard is false even when work is
         // pending site-wide.
         let unknown: MacAddress = "02:00:00:00:00:ff".parse().unwrap();
-        assert!(!fresh.bmc_rotation_needed(&pool, unknown).await.unwrap());
+        assert!(!fresh.rotation_needed(&pool, unknown).await.unwrap());
     }
 }

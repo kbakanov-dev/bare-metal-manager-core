@@ -86,6 +86,9 @@ func (dst *TenantIdentityConfigCreateOrUpdateRequest) UnmarshalJSON(data []byte)
 	} else if match == 1 {
 		return nil // exactly one match
 	} else { // no match
+		if err != nil {
+			return fmt.Errorf("data failed to match schemas in oneOf(TenantIdentityConfigCreateOrUpdateRequest): %v", err)
+		}
 		return fmt.Errorf("data failed to match schemas in oneOf(TenantIdentityConfigCreateOrUpdateRequest)")
 	}
 }

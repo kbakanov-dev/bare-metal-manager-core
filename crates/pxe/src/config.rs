@@ -19,19 +19,19 @@ use std::net::IpAddr;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeConfig {
-    pub internal_api_url: String,
-    pub client_facing_api_url: String,
-    pub pxe_url: String,
-    pub static_pxe_url: String,
+    pub(super) internal_api_url: String,
+    pub(super) client_facing_api_url: String,
+    pub(super) pxe_url: String,
+    pub(super) static_pxe_url: String,
     /// CA bundle served to bootstrapping clients. When no dedicated bundle is
     /// configured, this remains the same file used for outbound API trust.
-    pub bootstrap_root_ca_path: String,
-    pub forge_root_ca_path: String,
-    pub server_cert_path: String,
-    pub server_key_path: String,
-    pub bind_address: IpAddr,
-    pub bind_port: u16,
-    pub template_directory: String,
+    pub(super) bootstrap_root_ca_path: String,
+    pub(super) forge_root_ca_path: String,
+    pub(super) server_cert_path: String,
+    pub(super) server_key_path: String,
+    pub(super) bind_address: IpAddr,
+    pub(super) bind_port: u16,
+    pub(super) template_directory: String,
 }
 
 impl RuntimeConfig {
@@ -145,12 +145,16 @@ mod tests {
     }
 
     fn set_env(key: &str, value: &str) {
-        // SAFETY: these tests hold ENV_LOCK while mutating process environment.
+        // SAFETY: Initial lint enablement: callers hold the module-local `ENV_LOCK`,
+        // which serializes these writers but does not prove Unix process-wide exclusion
+        // from environment readers. This needs owner review.
         unsafe { env::set_var(key, value) }
     }
 
     fn remove_env(key: &str) {
-        // SAFETY: these tests hold ENV_LOCK while mutating process environment.
+        // SAFETY: Initial lint enablement: callers hold the module-local `ENV_LOCK`,
+        // which serializes these writers but does not prove Unix process-wide exclusion
+        // from environment readers. This needs owner review.
         unsafe { env::remove_var(key) }
     }
 

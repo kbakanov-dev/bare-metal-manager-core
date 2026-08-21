@@ -48,6 +48,16 @@ const (
 	SeverityCritical    Severity = "critical"
 )
 
+// ParseSeverity converts a string into a validated Severity.
+func ParseSeverity(value string) (Severity, error) {
+	severity := Severity(value)
+	if err := severity.Validate(); err != nil {
+		return SeverityUnspecified, err
+	}
+
+	return severity, nil
+}
+
 // IsUnspecified reports whether no severity was supplied for the event.
 func (s Severity) IsUnspecified() bool {
 	return s == SeverityUnspecified
@@ -109,15 +119,13 @@ func (e *Envelope) Validate() error {
 
 // Resource identifies the resource an event is about.
 type Resource struct {
-	Kind       ResourceKind
-	ExternalID string
-	// ID is the resolved Flow resource UUID. uuid.Nil means that the
-	// resource has not been resolved or is unavailable.
-	ID            uuid.UUID
-	ComponentType flowtypes.ComponentType
+	Kind              ResourceKind
+	ExternalID        string
+	ID                uuid.UUID
+	ComponentTypeHint flowtypes.ComponentType
 }
 
-// Validate checks resource identity and enrichment.
+// Validate checks the caller-supplied resource reference.
 func (r Resource) Validate() error {
 	if err := r.Kind.Validate(); err != nil {
 		return err
@@ -127,15 +135,48 @@ func (r Resource) Validate() error {
 		return err
 	}
 
-	if r.ComponentType != "" {
+	if r.ComponentTypeHint != "" {
 		if r.Kind != ResourceKindComponent {
-			return fmt.Errorf("resource component_type requires component kind")
+			return fmt.Errorf("resource component_type_hint requires component kind")
 		}
 
-		if err := r.ComponentType.Validate(); err != nil {
+		if err := r.ComponentTypeHint.Validate(); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// ResolvedResource contains the canonical inventory identity and attributes
+// established during event enrichment.
+type ResolvedResource struct {
+	Kind          ResourceKind
+	ID            uuid.UUID
+	RackID        uuid.UUID
+	ComponentType flowtypes.ComponentType
+}
+
+// Validate checks the canonical identity and attributes established during
+// enrichment.
+func (r ResolvedResource) Validate() error {
+	if err := r.Kind.Validate(); err != nil {
+		return err
+	}
+	if r.ID == uuid.Nil {
+		return fmt.Errorf("resolved resource id is required")
+	}
+	if r.RackID == uuid.Nil {
+		return fmt.Errorf("resolved resource rack id is required")
+	}
+	if r.Kind == ResourceKindComponent {
+		if err := r.ComponentType.Validate(); err != nil {
+			return fmt.Errorf("resolved resource component type: %w", err)
+		}
+	} else {
+		if r.ID != r.RackID {
+			return fmt.Errorf("resolved rack resource id must equal rack id")
+		}
+	}
 	return nil
 }
