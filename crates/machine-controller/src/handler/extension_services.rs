@@ -20,10 +20,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use carbide_uuid::extension_service::ExtensionServiceId;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::DpuMachineId;
 use chrono::{DateTime, Utc};
 use config_version::Versioned;
-use db::extension_service as db_extension_service;
+use db::machine::ExtensionServiceObservationNotCurrent;
+use db::{ConditionalWrite, extension_service as db_extension_service};
 use eyre::eyre;
 use itertools::Itertools;
 use model::extension_service::{
@@ -122,7 +123,7 @@ pub(super) async fn get_extension_services_status(
         .dpu_snapshots
         .iter()
         .map(|dpu| dpu.id)
-        .collect_vec();
+        .collect::<Vec<_>>();
     let dpf_helm_chart_dpus = if instance_deleted_at.is_some() {
         all_dpus
     } else {
@@ -196,11 +197,11 @@ pub(super) async fn reconcile_dpf_helm_chart_placement(
     mh_snapshot: &ManagedHostStateSnapshot,
     extension_services_config_version: config_version::ConfigVersion,
     dpf_service_configs: &[&InstanceExtensionServiceConfig],
-    target_dpu_ids: &HashSet<MachineId>,
+    target_dpu_ids: &HashSet<DpuMachineId>,
     instance_deleted_at: Option<&DateTime<Utc>>,
     dpf_sdk: &dyn DpfOperations,
     db_pool: &sqlx::PgPool,
-) -> Result<HashMap<MachineId, InstanceExtensionServiceStatusObservation>, StateHandlerError> {
+) -> Result<HashMap<DpuMachineId, InstanceExtensionServiceStatusObservation>, StateHandlerError> {
     if dpf_service_configs.is_empty() {
         return Ok(HashMap::new());
     }
@@ -213,7 +214,8 @@ pub(super) async fn reconcile_dpf_helm_chart_placement(
     let mut observations = HashMap::new();
     let mut ignored_non_target_failure_count = 0;
     for dpu in &mh_snapshot.dpu_snapshots {
-        let is_target = target_dpu_ids.contains(&dpu.id);
+        let dpu_id = dpu.id;
+        let is_target = target_dpu_ids.contains(&dpu_id);
         let is_required = is_target || instance_deleted_at.is_some();
         let label_reconciliation = match dpu.dpf_id() {
             None => {
@@ -268,7 +270,7 @@ pub(super) async fn reconcile_dpf_helm_chart_placement(
         };
 
         let observation = persist_dpf_helm_chart_placement_observation(
-            dpu.id,
+            dpu_id,
             extension_services_config_version,
             dpf_service_configs,
             is_target,
@@ -277,7 +279,7 @@ pub(super) async fn reconcile_dpf_helm_chart_placement(
             db_pool,
         )
         .await?;
-        observations.insert(dpu.id, observation);
+        observations.insert(dpu_id, observation);
     }
 
     if ignored_non_target_failure_count > 0 {
@@ -312,7 +314,7 @@ enum PlacementEvidence<'a> {
 /// pass, so a failure on a later DPU cannot discard the verified results of
 /// DPUs this pass already reconciled.
 async fn persist_dpf_helm_chart_placement_observation(
-    dpu_id: MachineId,
+    dpu_id: DpuMachineId,
     config_version: config_version::ConfigVersion,
     dpf_service_configs: &[&InstanceExtensionServiceConfig],
     is_target: bool,
@@ -331,7 +333,7 @@ async fn persist_dpf_helm_chart_placement_observation(
     );
 
     let mut txn = db_pool.begin().await?;
-    let applied = db::machine::update_extension_service_status_observation(
+    let observation_write = db::machine::update_extension_service_status_observation(
         txn.as_mut(),
         &dpu_id,
         ExtensionServiceType::DpfHelmChart,
@@ -340,19 +342,22 @@ async fn persist_dpf_helm_chart_placement_observation(
     .await?;
     txn.commit().await?;
 
-    warn_if_superseded(applied, dpu_id, observed_at);
+    warn_if_superseded(observation_write, dpu_id, observed_at);
 
     Ok(observation)
 }
 
-/// A rejected write means another writer stored a newer observation for this
-/// DPU, so the caller is racing a concurrent reconciliation of the same host.
-fn warn_if_superseded(applied: bool, dpu_id: MachineId, observed_at: chrono::DateTime<Utc>) {
-    if !applied {
+/// Logs a rejected observation without failing reconciliation for the DPU.
+fn warn_if_superseded(
+    observation_write: ConditionalWrite<(), ExtensionServiceObservationNotCurrent>,
+    dpu_id: DpuMachineId,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    if let ConditionalWrite::NotApplied(ExtensionServiceObservationNotCurrent) = observation_write {
         tracing::warn!(
             dpu_machine_id = %dpu_id,
             %observed_at,
-            "a newer DPF Helm chart placement observation already exists; discarding this one"
+            "DPF Helm chart placement observation write was rejected"
         );
     }
 }

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use carbide_uuid::machine::MachineId;
 use carbide_uuid::machine_validation::{
     MachineValidationAttemptId, MachineValidationId, MachineValidationRunItemId,
 };
@@ -36,6 +37,7 @@ const SUMMARY_LIMIT: usize = 4096;
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct StaleMachineValidationAttempt {
+    pub machine_id: MachineId,
     pub validation_id: MachineValidationId,
     pub run_item_id: MachineValidationRunItemId,
     pub attempt_id: MachineValidationAttemptId,
@@ -44,6 +46,12 @@ pub struct StaleMachineValidationAttempt {
     pub timeout_seconds: i64,
     pub started_at: Option<DateTime<Utc>>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+impl crate::machine::MachineRowLockItem for StaleMachineValidationAttempt {
+    fn machine_id(&self) -> MachineId {
+        self.machine_id
+    }
 }
 
 pub async fn materialize_run_plan(
@@ -180,8 +188,16 @@ pub async fn record_result(
     let state = state_from_result(result);
     let stdout_summary = truncate_summary(&result.stdout);
     let stderr_summary = truncate_summary(&result.stderr);
-    let failure_classification =
-        (state == MachineValidationAttemptState::Failed).then(|| "CommandFailed".to_string());
+    let failure_classification = match state {
+        MachineValidationAttemptState::Failed if result.exit_code == -1 => {
+            Some("FrameworkError".to_string())
+        }
+        MachineValidationAttemptState::Failed if result.exit_code == -2 => {
+            Some("PluginReportedError".to_string())
+        }
+        MachineValidationAttemptState::Failed => Some("CommandFailed".to_string()),
+        _ => None,
+    };
 
     let updated_first_terminal = update_pending_attempt_from_result(
         txn,
@@ -264,6 +280,7 @@ pub async fn find_stale_active_attempts(
     const QUERY: &str = "
         WITH active_attempts AS (
             SELECT
+                validation.machine_id,
                 run_item.run_id AS validation_id,
                 run_item.id AS run_item_id,
                 attempt.id AS attempt_id,
@@ -288,6 +305,7 @@ pub async fn find_stale_active_attempts(
                 AND attempt.state='Running'
         )
         SELECT
+            machine_id,
             validation_id,
             run_item_id,
             attempt_id,
@@ -543,9 +561,11 @@ async fn upsert_run_item_from_test(
                 order_index,
                 attempt,
                 max_attempts,
-                timeout_seconds
+                timeout_seconds,
+                plugin,
+                plugin_full_host_approved
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 1, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 1, $10, $11, $12)
             ON CONFLICT (run_id, test_id) DO UPDATE
             SET
                 test_version=EXCLUDED.test_version,
@@ -577,6 +597,8 @@ async fn upsert_run_item_from_test(
         .bind(MachineValidationRunItemState::Pending.to_string())
         .bind(order_index)
         .bind(test.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS))
+        .bind(test.plugin.clone().map(sqlx::types::Json))
+        .bind(test.full_host_approved)
         .fetch_one(txn)
         .await
         .map_err(|e| DatabaseError::query(QUERY, e))

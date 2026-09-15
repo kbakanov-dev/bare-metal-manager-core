@@ -10,7 +10,7 @@ and Golang that provides site-local, zero-trust, bare-metal lifecycle
 management with DPU-enforced isolation. It automates the complexity of the
 bare-metal lifecycle to fast-track building next-generation AI Cloud offerings.
 
-> **Status:** Experimental/Preview. APIs, configurations, and features may
+> **Status:** Active development. APIs, configurations, and features may
 > change without notice between releases.
 
 ### Key Responsibilities
@@ -136,6 +136,13 @@ no concrete answer, merge it into existing coverage or delete it.
 `STYLE_GUIDE.md` remains the source for helper APIs and table layout. For
 changes written by agents, the rules above for choosing cases replace its
 recommendation to enumerate every branch and input variant.
+
+For state-machine branch tests, reload persisted state after the controller
+iteration and assert the branch-owned fields or counters. An unchanged visible
+state or absence of an external action does not prove which branch ran.
+For retry tests, inject the claimed transient failure and assert that a later
+iteration retries it while preserving the expected externally visible state. A
+simulator's default unsupported response does not prove transient recovery.
 
 For user-visible CLI table changes, exercise the public command in a test and
 assert the rendered headers plus populated and empty cell values. Helper-only
@@ -348,6 +355,8 @@ check before requesting review.
     - global versus subcommand position and required order
     - omission or fallback behavior
     - observable output, side effects, errors, and unsupported paths
+    - for repeated or list fields, membership, ordering, and whether omitted and
+      empty values have the same meaning
   - Exercise each changed CLI example at the PR revision on an authorized local
     or test target and compare it with real `--help` output. Verify changed API,
     configuration, environment-variable, and state contracts through schemas,

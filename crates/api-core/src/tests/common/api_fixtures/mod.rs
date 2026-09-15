@@ -48,16 +48,13 @@ use carbide_nvlink_manager::nvlink::test_support::NmxcSimClient;
 use carbide_nvlink_manager::{
     NvlPartitionMonitor, SwitchCertificateMonitor, SwitchCertificateMonitorIterationResult,
 };
-use carbide_power_shelf_controller::context::PowerShelfStateHandlerServices;
-use carbide_power_shelf_controller::handler::PowerShelfStateHandler;
-use carbide_power_shelf_controller::io::PowerShelfStateControllerIO;
-use carbide_rack::rms_client::test_support::RmsSim;
+use carbide_rack::test_support::RmsSim;
 use carbide_rack_controller::config::RackConfig;
 use carbide_rack_controller::context::RackStateHandlerServices;
 use carbide_rack_controller::firmware_object::FirmwareObjectFetcher;
 use carbide_rack_controller::handler::RackStateHandler;
 use carbide_rack_controller::io::RackStateControllerIO;
-use carbide_redfish::libredfish::test_support::{RedfishSim, RedfishSimTestOverrides};
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_secrets::credentials::{
     CompositeCredentialManager, CredentialKey, CredentialManager, CredentialReader, CredentialType,
     Credentials,
@@ -70,13 +67,12 @@ use carbide_site_explorer::test_support::MockEndpointExplorer;
 use carbide_spdm_controller::context::SpdmStateHandlerServices;
 use carbide_spdm_controller::handler::SpdmAttestationStateHandler;
 use carbide_spdm_controller::io::SpdmStateControllerIO;
-use carbide_switch_controller::context::SwitchStateHandlerServices;
-use carbide_switch_controller::handler::SwitchStateHandler;
-use carbide_switch_controller::io::SwitchStateControllerIO;
 use carbide_utils::test_support::test_meter::TestMeter;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::instance_type::InstanceTypeId;
-use carbide_uuid::machine::MachineId;
+use carbide_uuid::machine::{
+    AsMachineId, DpuMachineId, HostMachineId, MachineId, MachineIdSubtypeTrait,
+};
 use carbide_uuid::machine_validation::MachineValidationId;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::VpcId;
@@ -98,20 +94,17 @@ use model::hardware_info::{HardwareInfo, TpmEkCertificate};
 use model::instance_type::InstanceTypeMachineCapabilityFilter;
 use model::machine::capabilities::MachineCapabilityType;
 use model::machine::{
-    FailureDetails, Machine, MachineLastRebootRequested, MachineValidatingState, ManagedHostState,
-    ValidationState,
+    FailureDetails, HostMachine, Machine, MachineLastRebootRequested, MachineValidatingState,
+    ManagedHostState, ValidationState,
 };
 use model::metadata::Metadata;
 use model::network_security_group;
-use model::rack_type::{
-    RackCapabilitiesSet, RackCapabilityCompute, RackCapabilityPowerShelf, RackCapabilitySwitch,
-    RackHardwareTopology, RackProductFamily, RackProfile, RackProfileConfig,
-};
+use model::rack_type::{RackProfile, RackProfileConfig};
 use model::resource_pool::common::CommonPools;
 use model::resource_pool::{self};
 use model::tenant::TenantOrganizationId;
 use model::test_support::dpu::{DPU_BF3_INFO_JSON, DPU_BF4_INFO_JSON};
-use model::test_support::{DpuConfig, HardwareInfoTemplate, ManagedHostConfig};
+use model::test_support::{DpuConfig, HardwareInfoTemplate, ManagedHostConfig, rms_rack_profiles};
 use nras::{
     DeviceAttestationInfo, NrasError, ProcessedAttestationOutcome, RawAttestationOutcome,
     VerifierClient,
@@ -156,6 +149,25 @@ use crate::test_support::network_segment::{
 };
 use crate::tests::common::rpc_builder::VpcCreationRequest;
 
+fn test_nvos_update_manager(
+    rms_sim: &RmsSim,
+) -> Option<Arc<dyn component_manager::NvosUpdateManager>> {
+    rms_sim.as_rms_client().map(|client| {
+        Arc::new(component_manager::rms::rms_nvos_update_manager(client))
+            as Arc<dyn component_manager::NvosUpdateManager>
+    })
+}
+
+fn test_rack_firmware_update_manager(
+    rms_sim: &RmsSim,
+) -> Option<Arc<dyn component_manager::RackFirmwareUpdateManager>> {
+    rms_sim.as_rms_client().map(|client| {
+        Arc::new(component_manager::rms::rms_rack_firmware_update_manager(
+            client,
+        )) as Arc<dyn component_manager::RackFirmwareUpdateManager>
+    })
+}
+
 pub(in crate::tests) mod dpu;
 pub(in crate::tests) mod host;
 pub(in crate::tests) mod ib_partition;
@@ -169,7 +181,7 @@ pub(in crate::tests) mod test_managed_host;
 pub(in crate::tests) mod tpm_attestation;
 pub(in crate::tests) mod vpc;
 
-pub(in crate::tests) type TestMachine = test_machine::TestMachine;
+pub(in crate::tests) type TestMachine<ID> = test_machine::TestMachine<ID>;
 pub(in crate::tests) type TestManagedHost = test_managed_host::TestManagedHost;
 
 #[derive(Clone, Debug, Default)]
@@ -189,7 +201,6 @@ pub(in crate::tests) struct TestEnvOverrides {
     pub(in crate::tests) nmxc_fail_after_n_creates: Option<usize>,
     pub(in crate::tests) compute_allocation_enforcement: Option<ComputeAllocationEnforcement>,
     pub(in crate::tests) nmxc_simulator: Option<bool>,
-    pub(in crate::tests) redfish_overrides: Option<RedfishOverrides>,
 
     /// Optional compute-tray backend injected into the component manager.
     pub(in crate::tests) compute_tray_manager:
@@ -201,13 +212,6 @@ pub(in crate::tests) struct TestEnvOverrides {
     pub(in crate::tests) nras_should_fail_parsing: Option<Arc<AtomicBool>>,
     pub(in crate::tests) vpc_prefixes_drain_period: Option<chrono::Duration>,
     pub(in crate::tests) dhcp_lease_expiry_handling: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(in crate::tests) struct RedfishOverrides {
-    pub(in crate::tests) no_component_integrities: bool,
-    pub(in crate::tests) firmware_for_component_error: bool,
-    pub(in crate::tests) get_task_trigger_evidence_returns_interrupted: bool,
 }
 
 impl TestEnvOverrides {
@@ -287,9 +291,7 @@ pub(crate) struct TestEnv {
     vpc_prefix_controller: Arc<Mutex<StateController<VpcPrefixStateControllerIO>>>,
     extension_service_controller: Arc<Mutex<StateController<ExtensionServiceStateControllerIO>>>,
     ib_partition_controller: Arc<Mutex<StateController<IBPartitionStateControllerIO>>>,
-    power_shelf_controller: Arc<Mutex<StateController<PowerShelfStateControllerIO>>>,
     rack_controller: Arc<Mutex<StateController<RackStateControllerIO>>>,
-    switch_controller: Arc<Mutex<StateController<SwitchStateControllerIO>>>,
     pub(in crate::tests) reachability_params: ReachabilityParams,
     pub(in crate::tests) test_meter: TestMeter,
     pub(in crate::tests) attestation_enabled: bool,
@@ -340,6 +342,7 @@ impl TestEnv {
             db_pool: self.pool.clone(),
             db_reader: self.pool.clone().into(),
             redfish_client_pool: self.redfish_sim.clone(),
+            bmc_credential_ops: self.redfish_sim.clone(),
             ipmi_tool: self.ipmi_tool.clone(),
             site_config: self.config.machine_state_handler_site_config().into(),
             component_manager: self.test_component_manager.clone(),
@@ -357,6 +360,9 @@ impl TestEnv {
                 carbide_credential_rotation::RotationGate::new_for_family(
                     db::credential_rotation::CredentialRotationType::DpuBmcService,
                 ),
+            nic_lockdown_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
+                db::credential_rotation::CredentialRotationType::LockdownIkm,
+            ),
             per_object_metrics_registry: self.per_object_metrics_registry(),
             per_object_info: None,
         }
@@ -381,14 +387,14 @@ impl TestEnv {
     pub(in crate::tests) fn rack_state_handler_services(&self) -> RackStateHandlerServices {
         RackStateHandlerServices {
             db_pool: self.pool.clone(),
-            rms_client: self.rms_sim.as_rms_client(),
             site_config: RackConfig {
                 rms: self.config.rms.clone(),
                 rack_validation_config: self.config.rack_validation_config.clone(),
                 rack_profiles: self.config.rack_profiles.clone(),
             }
             .into(),
-            switch_system_image_rms_client: self.rms_sim.as_switch_system_image_rms_client(),
+            nvos_update_manager: test_nvos_update_manager(&self.rms_sim),
+            rack_firmware_update_manager: test_rack_firmware_update_manager(&self.rms_sim),
             credential_manager: self.test_credential_manager.clone(),
             component_manager: self.test_component_manager.clone(),
             nmx_cluster_switch_mtls_services:
@@ -416,7 +422,7 @@ impl TestEnv {
     fn fill_machine_information(
         &self,
         state: &ManagedHostState,
-        machine: &Machine,
+        machine: &HostMachine,
     ) -> ManagedHostState {
         //This block is to fill data that is populated within statemachine
         match state.clone() {
@@ -463,6 +469,7 @@ impl TestEnv {
                 retry_count,
             },
             ManagedHostState::DPUReprovision { .. } => state.clone(),
+            ManagedHostState::ConfigureAstra { .. } => state.clone(),
             ManagedHostState::Measuring { .. } => state.clone(),
             ManagedHostState::PostAssignedMeasuring { .. } => state.clone(),
             ManagedHostState::PreAssignedMeasuring { .. } => state.clone(),
@@ -472,6 +479,7 @@ impl TestEnv {
             ManagedHostState::RotatingHostUefi { .. } => state.clone(),
             ManagedHostState::Decommissioning { .. } => state.clone(),
             ManagedHostState::RotatingDpuUefi { .. } => state.clone(),
+            ManagedHostState::RotatingNicLockdown => state.clone(),
             ManagedHostState::BomValidating { .. } => state.clone(),
             ManagedHostState::Validation { validation_state } => match validation_state {
                 ValidationState::MachineValidation { machine_validation } => {
@@ -519,7 +527,7 @@ impl TestEnv {
 
     pub(in crate::tests) async fn run_machine_state_controller_iteration_until_state_matches(
         &self,
-        host_machine_id: &MachineId,
+        host_machine_id: &HostMachineId,
         max_iterations: u32,
         expected_state: ManagedHostState,
     ) {
@@ -537,12 +545,16 @@ impl TestEnv {
     /// Runs iterations of the machine state controller handler with the services
     /// in this test environment until the condition is met.  using a callback function
     /// allows the caller to use "matches!" to compare patterns instead of concrete values.
-    pub(in crate::tests) async fn run_machine_state_controller_iteration_until_state_condition(
+    pub(in crate::tests) async fn run_machine_state_controller_iteration_until_state_condition<ID>(
         &self,
-        host_machine_id: &MachineId,
+        host_machine_id: &ID,
         max_iterations: u32,
-        state_check: impl Fn(&Machine) -> bool,
-    ) -> ManagedHostState {
+        state_check: impl Fn(&Machine<ID>) -> bool,
+    ) -> ManagedHostState
+    where
+        ID: MachineIdSubtypeTrait,
+        db::DatabaseError: From<<ID as TryFrom<MachineId>>::Error>,
+    {
         for _ in 0..max_iterations {
             self.machine_state_controller
                 .lock()
@@ -659,28 +671,6 @@ impl TestEnv {
             .await;
     }
 
-    /// Runs one iteration of the power shelf state controller handler with the services
-    /// in this test environment
-    #[allow(clippy::await_holding_refcell_ref)]
-    pub(in crate::tests) async fn run_power_shelf_controller_iteration(&self) {
-        self.power_shelf_controller
-            .lock()
-            .await
-            .run_single_iteration()
-            .await;
-    }
-
-    /// Runs one iteration of the switch state controller handler with the services
-    /// in this test environment
-    #[allow(clippy::await_holding_refcell_ref)]
-    pub(in crate::tests) async fn run_switch_controller_iteration(&self) {
-        self.switch_controller
-            .lock()
-            .await
-            .run_single_iteration()
-            .await;
-    }
-
     /// Runs one iteration of the rack state controller handler with the services
     /// in this test environment
     #[allow(clippy::await_holding_refcell_ref)]
@@ -759,11 +749,11 @@ impl TestEnv {
     // Returns all machines using FindMachinesByIds call.
     pub(in crate::tests) async fn find_machine(
         &self,
-        id: carbide_uuid::machine::MachineId,
+        id: &carbide_uuid::machine::MachineId,
     ) -> Vec<rpc::forge::Machine> {
         self.api
             .find_machines_by_ids(tonic::Request::new(rpc::forge::MachinesByIdsRequest {
-                machine_ids: vec![id],
+                machine_ids: vec![*id],
                 include_history: true,
             }))
             .await
@@ -1061,41 +1051,12 @@ pub(in crate::tests) fn get_config() -> CarbideConfig {
     default_config::get()
 }
 
-/// Rack profile ID used by RMS-ready test fixtures.
-pub(in crate::tests) const TEST_RMS_RACK_PROFILE_ID: &str = "NVL72";
+pub(in crate::tests) use model::test_support::TEST_RMS_RACK_PROFILE_ID;
 
 /// Returns the default test config plus an RMS-ready NVL72 rack profile.
 pub(in crate::tests) fn get_config_with_rack_profiles() -> CarbideConfig {
     let mut config = get_config();
-    config.rack_profiles = RackProfileConfig {
-        rack_profiles: [(
-            TEST_RMS_RACK_PROFILE_ID.to_string(),
-            RackProfile {
-                product_family: Some(RackProductFamily::Gb200),
-                rack_hardware_topology: Some(RackHardwareTopology::Gb200Nvl72r1C2g4Topology),
-                rack_capabilities: RackCapabilitiesSet {
-                    compute: RackCapabilityCompute {
-                        count: 18,
-                        vendor: Some("NVIDIA".to_string()),
-                        ..Default::default()
-                    },
-                    switch: RackCapabilitySwitch {
-                        count: 9,
-                        vendor: Some("NVIDIA".to_string()),
-                        ..Default::default()
-                    },
-                    power_shelf: RackCapabilityPowerShelf {
-                        count: 8,
-                        vendor: Some("LiteOn".to_string()),
-                        ..Default::default()
-                    },
-                },
-                ..Default::default()
-            },
-        )]
-        .into_iter()
-        .collect(),
-    };
+    config.rack_profiles = rms_rack_profiles();
 
     config
 }
@@ -1285,16 +1246,7 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
         credential_manager.clone(),
     ));
 
-    let redfish_sim = if let Some(redfish_overrides) = overrides.redfish_overrides {
-        Arc::new(RedfishSim::with_test_overrides(RedfishSimTestOverrides {
-            no_component_integrities: redfish_overrides.no_component_integrities,
-            firmware_for_component_error: redfish_overrides.firmware_for_component_error,
-            get_task_trigger_evidence_returns_interrupted: redfish_overrides
-                .get_task_trigger_evidence_returns_interrupted,
-        }))
-    } else {
-        Arc::new(RedfishSim::default())
-    };
+    let redfish_sim = Arc::new(RedfishSim::default());
 
     // Seed the site-wide host and DPU UEFI site-default credentials (version 0).
     // These are written during site setup in production; tests don't run that.
@@ -1521,6 +1473,16 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
                     stale_run_timeout: config.machine_validation_config.stale_run_timeout,
                     tests: config.machine_validation_config.tests.clone(),
                     test_selection_mode: config.machine_validation_config.test_selection_mode,
+                    approved_plugin_registries: config
+                        .machine_validation_config
+                        .approved_plugin_registries
+                        .clone(),
+                    allow_privileged_plugins: config
+                        .machine_validation_config
+                        .allow_privileged_plugins,
+                    allow_full_host_plugins: config
+                        .machine_validation_config
+                        .allow_full_host_plugins,
                 })
                 .bom_validation(config.bom_validation)
                 .instance_autoreboot_period(
@@ -1564,6 +1526,7 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
                 db_pool: db_pool.clone(),
                 db_reader: db_pool.clone().into(),
                 redfish_client_pool: redfish_sim.clone(),
+                bmc_credential_ops: redfish_sim.clone(),
                 ipmi_tool: ipmi_tool.clone(),
                 site_config: config.machine_state_handler_site_config().into(),
                 component_manager: test_component_manager.clone(),
@@ -1580,6 +1543,10 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
                 dpu_bmc_service_rotation_gate:
                     carbide_credential_rotation::RotationGate::new_for_family(
                         db::credential_rotation::CredentialRotationType::DpuBmcService,
+                    ),
+                nic_lockdown_rotation_gate:
+                    carbide_credential_rotation::RotationGate::new_for_family(
+                        db::credential_rotation::CredentialRotationType::LockdownIkm,
                     ),
                 per_object_metrics_registry: per_object_metrics_registry.clone(),
                 per_object_info: None,
@@ -1693,54 +1660,6 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
         .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build ExtensionServiceStateController");
 
-    let power_shelf_controller = StateController::builder()
-        .database(db_pool.clone(), api.work_lock_manager_handle.clone())
-        .meter("carbide_power_shelves", test_meter.meter())
-        .processor_id(state_controller_id.clone())
-        .services(
-            PowerShelfStateHandlerServices {
-                db_pool: db_pool.clone(),
-                component_manager: test_component_manager.clone(),
-                credential_manager: credential_manager.clone(),
-                per_object_metrics_registry: per_object_metrics_registry.clone(),
-                rack_firmware_reprovisioning_enabled: false,
-                redfish_client_pool: redfish_sim.clone(),
-                bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
-                    db::credential_rotation::CredentialRotationType::Bmc,
-                ),
-                bmc_rotation_enabled: false,
-            }
-            .into(),
-        )
-        .state_handler(Arc::new(PowerShelfStateHandler::default()))
-        .build_for_manual_iterations(cancel_token.clone())
-        .expect("Unable to build PowerShelfStateController");
-
-    let switch_controller = StateController::builder()
-        .database(db_pool.clone(), api.work_lock_manager_handle.clone())
-        .meter("carbide_switches", test_meter.meter())
-        .processor_id(state_controller_id.clone())
-        .services(
-            SwitchStateHandlerServices {
-                db_pool: db_pool.clone(),
-                component_manager: test_component_manager.clone(),
-                credential_manager: credential_manager.clone(),
-                switch_mtls_services: component_manager::config::switch_mtls_services_as_i32(
-                    &component_manager::config::effective_switch_mtls_services(&[]),
-                ),
-                per_object_metrics_registry: per_object_metrics_registry.clone(),
-                redfish_client_pool: redfish_sim.clone(),
-                bmc_rotation_gate: carbide_credential_rotation::RotationGate::new_for_family(
-                    db::credential_rotation::CredentialRotationType::Bmc,
-                ),
-                bmc_rotation_enabled: false,
-            }
-            .into(),
-        )
-        .state_handler(Arc::new(SwitchStateHandler::default()))
-        .build_for_manual_iterations(cancel_token.clone())
-        .expect("Unable to build state controller");
-
     let rack_controller = StateController::builder()
         .database(db_pool.clone(), api.work_lock_manager_handle.clone())
         .meter("carbide_racks", test_meter.meter())
@@ -1748,14 +1667,14 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
         .services(
             RackStateHandlerServices {
                 db_pool: db_pool.clone(),
-                rms_client: rms_sim.as_rms_client(),
                 site_config: RackConfig {
                     rms: config.rms.clone(),
                     rack_validation_config: config.rack_validation_config.clone(),
                     rack_profiles: config.rack_profiles.clone(),
                 }
                 .into(),
-                switch_system_image_rms_client: rms_sim.as_switch_system_image_rms_client(),
+                nvos_update_manager: test_nvos_update_manager(&rms_sim),
+                rack_firmware_update_manager: test_rack_firmware_update_manager(&rms_sim),
                 credential_manager: credential_manager.clone(),
                 component_manager: test_component_manager.clone(),
                 nmx_cluster_switch_mtls_services:
@@ -1804,11 +1723,13 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
         },
         test_meter.meter(),
         api.endpoint_exploration_service.clone(),
+        api.bmc_client.clone(),
         common_pools.clone(),
         api.work_lock_manager_handle.clone(),
         site_explorer_rack_profiles,
         rms_sim.as_rms_client(),
         credential_manager.clone(),
+        api.runtime_config.dpf.enabled && api.dpf_sdk.is_some(),
     );
 
     // Create some instance types
@@ -1887,11 +1808,9 @@ pub(in crate::tests) async fn create_test_env_with_overrides(
         machine_state_handler: machine_swap,
         ib_fabric_monitor: Arc::new(ib_fabric_monitor),
         ib_partition_controller: Arc::new(Mutex::new(ib_controller)),
-        switch_controller: Arc::new(Mutex::new(switch_controller)),
         network_segment_controller: Arc::new(Mutex::new(network_controller)),
         vpc_prefix_controller: Arc::new(Mutex::new(vpc_prefix_controller)),
         extension_service_controller: Arc::new(Mutex::new(extension_service_controller)),
-        power_shelf_controller: Arc::new(Mutex::new(power_shelf_controller)),
         rack_controller: Arc::new(Mutex::new(rack_controller)),
         reachability_params,
         attestation_enabled,
@@ -2215,14 +2134,11 @@ fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> 
 }
 
 /// Emulates the `DiscoveryCompleted` request of a DPU/Host
-pub(in crate::tests) async fn discovery_completed(
-    env: &TestEnv,
-    machine_id: carbide_uuid::machine::MachineId,
-) {
+pub(in crate::tests) async fn discovery_completed(env: &TestEnv, machine_id: &MachineId) {
     let _response = env
         .api
         .discovery_completed(Request::new(rpc::forge::MachineDiscoveryCompletedRequest {
-            machine_id: Some(machine_id),
+            machine_id: Some(machine_id.to_machine_id()),
         }))
         .await
         .unwrap()
@@ -2230,7 +2146,10 @@ pub(in crate::tests) async fn discovery_completed(
 }
 
 /// Fake an iteration of forge-dpu-agent requesting network config, applying it, and reporting back
-pub(in crate::tests) async fn network_configured(env: &TestEnv, dpu_machine_ids: &Vec<MachineId>) {
+pub(in crate::tests) async fn network_configured(
+    env: &TestEnv,
+    dpu_machine_ids: &Vec<DpuMachineId>,
+) {
     for dpu_machine_id in dpu_machine_ids {
         network_configured_with_health(env, dpu_machine_id, None).await
     }
@@ -2240,7 +2159,7 @@ pub(in crate::tests) async fn network_configured(env: &TestEnv, dpu_machine_ids:
 /// When reporting back, the health reported by the DPU can be overrridden
 pub(in crate::tests) async fn network_configured_with_health(
     env: &TestEnv,
-    dpu_machine_id: &MachineId,
+    dpu_machine_id: &DpuMachineId,
     dpu_health: Option<rpc::health::HealthReport>,
 ) {
     network_configured_with_health_and_ext_services(env, dpu_machine_id, dpu_health, None).await
@@ -2252,7 +2171,7 @@ pub(in crate::tests) async fn network_configured_with_health(
 #[allow(deprecated)]
 pub(in crate::tests) async fn network_configured_with_health_and_ext_services(
     env: &TestEnv,
-    dpu_machine_id: &MachineId,
+    dpu_machine_id: &DpuMachineId,
     dpu_health: Option<rpc::health::HealthReport>,
     extension_services_state: Option<rpc::forge::DpuExtensionServiceDeploymentStatus>,
 ) {
@@ -2273,14 +2192,11 @@ pub(in crate::tests) async fn network_configured_with_health_and_ext_services(
         } else {
             Some(network_config.instance_network_config_version.clone())
         };
-    let instance: Option<rpc::Instance> = env
-        .api
-        .find_instance_by_machine_id(Request::new(*dpu_machine_id))
-        .await
-        .unwrap()
-        .into_inner()
-        .instances
-        .pop();
+    let instance: Option<rpc::Instance> = if let Some(instance_id) = network_config.instance_id {
+        env.find_instances(vec![instance_id]).await.instances.pop()
+    } else {
+        None
+    };
     let instance_config_version = if let Some(instance) = instance {
         // If an instance is reported via this API, the version should match what we
         // get via the GetManagedHostNetworkConfig API
@@ -2420,7 +2336,7 @@ pub(in crate::tests) async fn simulate_hardware_health_report(
     let _ = env
         .api
         .insert_machine_health_report(Request::new(InsertMachineHealthReportRequest {
-            machine_id: Some(*host_machine_id),
+            machine_id: Some(host_machine_id.to_machine_id()),
             health_report_entry: Some(HealthReportEntry {
                 report: Some(health_report.into()),
                 ..Default::default()
@@ -2441,7 +2357,7 @@ pub(in crate::tests) async fn send_health_report_entry(
     let _ = env
         .api
         .insert_machine_health_report(Request::new(InsertMachineHealthReportRequest {
-            machine_id: Some(*machine_id),
+            machine_id: Some(machine_id.to_machine_id()),
             health_report_entry: Some(HealthReportEntry {
                 report: Some(entry.0.into()),
                 mode: entry.1 as i32,
@@ -2462,7 +2378,7 @@ pub(in crate::tests) async fn remove_health_report_entry(
     let _ = env
         .api
         .remove_machine_health_report(Request::new(RemoveMachineHealthReportRequest {
-            machine_id: Some(*machine_id),
+            machine_id: Some(machine_id.to_machine_id()),
             source,
         }))
         .await
@@ -2471,13 +2387,13 @@ pub(in crate::tests) async fn remove_health_report_entry(
 
 pub(in crate::tests) async fn forge_agent_control(
     env: &TestEnv,
-    machine_id: carbide_uuid::machine::MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> rpc::forge::ForgeAgentControlResponse {
     let _ = reboot_completed(env, machine_id).await;
 
     env.api
         .forge_agent_control(Request::new(rpc::forge::ForgeAgentControlRequest {
-            machine_id: Some(machine_id),
+            machine_id: Some(machine_id.into()),
         }))
         .await
         .unwrap()
@@ -2527,7 +2443,11 @@ pub(in crate::tests) async fn create_managed_host_with_dpf_multi_hw(
         .await
         .expect("Failed to create a new host");
     TestManagedHost {
-        id: mh.host_snapshot.id,
+        id: mh
+            .host_snapshot
+            .id
+            .try_into()
+            .expect("managed host snapshot ID should be a valid HostMachineId"),
         dpu_ids: mh.dpu_snapshots.iter().map(|dpu| dpu.id).collect(),
         api: env.api.clone(),
     }
@@ -2571,7 +2491,11 @@ pub(in crate::tests) async fn create_managed_host_with_config(
         .collect();
 
     TestManagedHost {
-        id: mh.host_snapshot.id,
+        id: mh
+            .host_snapshot
+            .id
+            .try_into()
+            .expect("managed host snapshot ID should be a valid HostMachineId"),
         dpu_ids,
         api: env.api.clone(),
     }
@@ -2586,8 +2510,16 @@ pub(in crate::tests) async fn create_host_with_machine_validation(
         .await
         .unwrap();
     TestManagedHost {
-        id: mh.host_snapshot.id,
-        dpu_ids: mh.dpu_snapshots.into_iter().map(|s| s.id).collect(),
+        id: mh
+            .host_snapshot
+            .id
+            .try_into()
+            .expect("managed host ID should be valid HostMachineId"),
+        dpu_ids: mh
+            .dpu_snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.id)
+            .collect(),
         api: env.api.clone(),
     }
 }
@@ -2600,7 +2532,11 @@ pub(in crate::tests) async fn create_managed_host_with_hardware_info_template(
     let config = ManagedHostConfig::default().with_hardware_info_template(hardware_info_template);
     let mh = site_explorer::new_host(env, config).await.unwrap();
     TestManagedHost {
-        id: mh.host_snapshot.id,
+        id: mh
+            .host_snapshot
+            .id
+            .try_into()
+            .expect("managed host snapshot ID should be a valid HostMachineId"),
         dpu_ids: mh.dpu_snapshots.into_iter().map(|s| s.id).collect(),
         api: env.api.clone(),
     }
@@ -2713,7 +2649,7 @@ pub(in crate::tests) async fn set_nvlink_nmxc_endpoint(
 
 pub(in crate::tests) async fn update_time_params(
     pool: &sqlx::PgPool,
-    machine: &Machine,
+    machine: &Machine<impl MachineIdSubtypeTrait>,
     retry_count: i64,
     last_reboot_requested: Option<DateTime<Utc>>,
 ) {
@@ -2756,7 +2692,7 @@ pub(in crate::tests) async fn update_time_params(
 
 pub(in crate::tests) async fn reboot_completed(
     env: &TestEnv,
-    machine_id: carbide_uuid::machine::MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) -> rpc::forge::MachineRebootCompletedResponse {
     tracing::info!(
         machine_id = %machine_id,
@@ -2764,7 +2700,7 @@ pub(in crate::tests) async fn reboot_completed(
     );
     env.api
         .reboot_completed(Request::new(rpc::forge::MachineRebootCompletedRequest {
-            machine_id: Some(machine_id),
+            machine_id: Some(machine_id.into()),
         }))
         .await
         .unwrap()
@@ -2785,7 +2721,7 @@ pub(in crate::tests) async fn machine_validation_completed(
         .api
         .machine_validation_completed(Request::new(
             rpc::forge::MachineValidationCompletedRequest {
-                machine_id: Some(*machine_id),
+                machine_id: Some(machine_id.to_machine_id()),
                 machine_validation_error,
                 validation_id: Some(validation_id),
             },
@@ -2800,7 +2736,7 @@ pub(in crate::tests) async fn machine_validation_completed(
 /// if needed, as part of the auto-approval process.
 pub(in crate::tests) async fn inject_machine_measurements(
     env: &TestEnv,
-    machine_id: carbide_uuid::machine::MachineId,
+    machine_id: impl MachineIdSubtypeTrait,
 ) {
     let _response = env
         .api

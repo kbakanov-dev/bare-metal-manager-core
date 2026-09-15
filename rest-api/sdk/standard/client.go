@@ -63,6 +63,8 @@ type APIClient struct {
 
 	DPUExtensionServiceAPI *DPUExtensionServiceAPIService
 
+	DPUMachineAPI *DPUMachineAPIService
+
 	DPUReprovisionAPI *DPUReprovisionAPIService
 
 	ExpectedMachineAPI *ExpectedMachineAPIService
@@ -123,6 +125,8 @@ type APIClient struct {
 
 	SiteExplorerAPI *SiteExplorerAPIService
 
+	SpectrumXPartitionAPI *SpectrumXPartitionAPIService
+
 	SubnetAPI *SubnetAPIService
 
 	TaskAPI *TaskAPIService
@@ -170,6 +174,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.BMCResetAPI = (*BMCResetAPIService)(&c.common)
 	c.CredentialRotationAPI = (*CredentialRotationAPIService)(&c.common)
 	c.DPUExtensionServiceAPI = (*DPUExtensionServiceAPIService)(&c.common)
+	c.DPUMachineAPI = (*DPUMachineAPIService)(&c.common)
 	c.DPUReprovisionAPI = (*DPUReprovisionAPIService)(&c.common)
 	c.ExpectedMachineAPI = (*ExpectedMachineAPIService)(&c.common)
 	c.ExpectedPowerShelfAPI = (*ExpectedPowerShelfAPIService)(&c.common)
@@ -200,6 +205,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.ServiceAccountAPI = (*ServiceAccountAPIService)(&c.common)
 	c.SiteAPI = (*SiteAPIService)(&c.common)
 	c.SiteExplorerAPI = (*SiteExplorerAPIService)(&c.common)
+	c.SpectrumXPartitionAPI = (*SpectrumXPartitionAPIService)(&c.common)
 	c.SubnetAPI = (*SubnetAPIService)(&c.common)
 	c.TaskAPI = (*TaskAPIService)(&c.common)
 	c.TaskRunAPI = (*TaskRunAPIService)(&c.common)

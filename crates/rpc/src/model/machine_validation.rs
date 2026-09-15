@@ -21,9 +21,10 @@ use chrono::{DateTime, Utc};
 use config_version::ConfigVersion;
 use model::machine_validation::{
     MachineValidation, MachineValidationAttempt, MachineValidationExternalConfig,
-    MachineValidationResult, MachineValidationRunItem, MachineValidationState,
-    MachineValidationTest, MachineValidationTestAddRequest, MachineValidationTestUpdatePayload,
-    MachineValidationTestUpdateRequest, MachineValidationTestsGetRequest,
+    MachineValidationPlugin, MachineValidationResult, MachineValidationRunItem,
+    MachineValidationState, MachineValidationTest, MachineValidationTestAddRequest,
+    MachineValidationTestUpdatePayload, MachineValidationTestUpdateRequest,
+    MachineValidationTestsGetRequest,
 };
 
 use crate as rpc;
@@ -50,6 +51,7 @@ impl From<rpc::forge::MachineValidationTestAddRequest> for MachineValidationTest
             custom_tags: req.custom_tags,
             components: req.components,
             is_enabled: req.is_enabled,
+            plugin: req.plugin.map(Into::into),
         }
     }
 }
@@ -77,6 +79,7 @@ impl From<rpc::forge::machine_validation_test_update_request::Payload>
             custom_tags: p.custom_tags,
             components: p.components,
             is_enabled: p.is_enabled,
+            plugin: p.plugin.map(Into::into),
         }
     }
 }
@@ -194,6 +197,8 @@ impl From<MachineValidationRunItem> for rpc::forge::MachineValidationRunItem {
             last_heartbeat_at: value.last_heartbeat_at.map(Into::into),
             skip_reason: value.skip_reason,
             failure_reason: value.failure_reason,
+            plugin: value.plugin.map(Into::into),
+            plugin_full_host_approved: value.plugin_full_host_approved,
         }
     }
 }
@@ -275,6 +280,8 @@ impl From<MachineValidationTest> for rpc::forge::MachineValidationTest {
             components: value.components,
             last_modified_at: value.last_modified_at.to_string(),
             is_enabled: value.is_enabled,
+            plugin: value.plugin.map(Into::into),
+            full_host_approved: value.full_host_approved,
         }
     }
 }
@@ -307,7 +314,33 @@ impl TryFrom<rpc::forge::MachineValidationTest> for MachineValidationTest {
             components: value.components,
             last_modified_at: Utc::now(),
             is_enabled: value.is_enabled,
+            plugin: value.plugin.map(Into::into),
+            full_host_approved: value.full_host_approved,
         })
+    }
+}
+
+impl From<rpc::forge::MachineValidationPlugin> for MachineValidationPlugin {
+    fn from(value: rpc::forge::MachineValidationPlugin) -> Self {
+        Self {
+            image: value.image,
+            entrypoint: value.entrypoint,
+            parameters_json: value.parameters_json,
+            privileged: value.privileged,
+            host_access_full: value.host_access_full,
+        }
+    }
+}
+
+impl From<MachineValidationPlugin> for rpc::forge::MachineValidationPlugin {
+    fn from(value: MachineValidationPlugin) -> Self {
+        Self {
+            image: value.image,
+            entrypoint: value.entrypoint,
+            parameters_json: value.parameters_json,
+            privileged: value.privileged,
+            host_access_full: value.host_access_full,
+        }
     }
 }
 

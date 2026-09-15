@@ -30,6 +30,7 @@ import (
 	csm "github.com/NVIDIA/infra-controller/rest-api/site-manager/pkg/sitemgr"
 
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/internal/config"
+	cwm "github.com/NVIDIA/infra-controller/rest-api/workflow/internal/metrics"
 	sc "github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/client/site"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/queue"
 	"github.com/NVIDIA/infra-controller/rest-api/workflow/pkg/util"
@@ -52,32 +53,21 @@ const (
 	siteFabricIPBlockReadyMsg = "IP Block is ready for use"
 )
 
-// siteFabricIPBlocksLockID derives the advisory lock that serializes Site
-// fabric IP Block creation for a Site. It is shared with the activity's tests,
-// which acquire the same lock to exercise contention handling.
-func getSiteFabricIPBlockLockID(dbSite *cdbm.Site) uint64 {
-	return cdb.GetAdvisoryLockIDFromString(fmt.Sprintf(
-		"site-fabric-ip-blocks:%s:%s:%s",
-		dbSite.InfrastructureProviderID.String(),
-		dbSite.ID.String(),
-		cdbm.IPBlockRoutingTypeDatacenterOnly,
-	))
-}
-
 // ManageSite is an activity wrapper for managing Site lifecycle that allows
 // injecting DB access
 type ManageSite struct {
-	dbSession      *cdb.Session
-	siteClientPool *sc.ClientPool
-	tc             client.Client
-	cfg            *config.Config
+	dbSession         *cdb.Session
+	siteClientPool    *sc.ClientPool
+	tc                client.Client
+	cfg               *config.Config
+	siteHealthMetrics *cwm.SiteHealthMetrics
 }
 
 // Activity functions
 
 // UpdateSiteInDB is a Temporal activity that updates the Site metadata in the DB. A nil
-// siteAgentBuildInfo, which is what an older Site Agent reports, leaves the stored Site Agent
-// values alone rather than erasing what an earlier report established.
+// siteAgentBuildInfo, which is what the legacy workflow reports, leaves the stored Site Agent
+// values alone rather than erasing what a newer report established.
 func (mst ManageSite) UpdateSiteInDB(ctx context.Context, siteID uuid.UUID, coreBuildInfo *corev1.BuildInfo,
 	siteAgentBuildInfo *corev1.SiteAgentBuildInfo) error {
 	logger := log.With().Str("Activity", "UpdateSiteInDB").Str("Site ID", siteID.String()).Logger()
@@ -109,6 +99,16 @@ func (mst ManageSite) UpdateSiteInDB(ctx context.Context, siteID uuid.UUID, core
 		updateInput.Config = &cdbm.SiteConfigUpdateInput{
 			VpcSlaac: &vpcSlaac,
 		}
+	}
+
+	// Site Agent inventory owns the Flow enabled flag once it reports the field. An omitted field
+	// preserves the stored value when an inventory queued before an upgrade is processed later.
+	if siteAgentBuildInfo != nil && siteAgentBuildInfo.FlowEnabled != nil &&
+		(site.Config == nil || site.Config.Flow != siteAgentBuildInfo.GetFlowEnabled()) {
+		if updateInput.Config == nil {
+			updateInput.Config = &cdbm.SiteConfigUpdateInput{}
+		}
+		updateInput.Config.Flow = siteAgentBuildInfo.FlowEnabled
 	}
 
 	// Update build version for Site when Core reports a changed, non-empty value.
@@ -180,6 +180,8 @@ func (mst ManageSite) DeleteSiteComponentsFromDB(ctx context.Context, siteID uui
 	ifcDAO := cdbm.NewInterfaceDAO(mst.dbSession)
 	nvliDAO := cdbm.NewNVLinkInterfaceDAO(mst.dbSession)
 	ibiDAO := cdbm.NewInfiniBandInterfaceDAO(mst.dbSession)
+	sxpDAO := cdbm.NewSpectrumXPartitionDAO(mst.dbSession)
+	sxaDAO := cdbm.NewSpectrumXAttachmentDAO(mst.dbSession)
 	skgsaDAO := cdbm.NewSSHKeyGroupSiteAssociationDAO(mst.dbSession)
 	skgiaDAO := cdbm.NewSSHKeyGroupInstanceAssociationDAO(mst.dbSession)
 	nsgDAO := cdbm.NewNetworkSecurityGroupDAO(mst.dbSession)
@@ -240,6 +242,32 @@ func (mst ManageSite) DeleteSiteComponentsFromDB(ctx context.Context, siteID uui
 		}
 	}
 
+	// The provider-root pass above removes active tenant-less rows, including
+	// roots linked to OperatorManaged SitePrefixes. Remove the remaining linked
+	// TenantManaged rows too; they have no legacy IPAM state to clean up.
+	linkedIPBlocks, _, err := ipbDAO.GetAll(
+		ctx,
+		nil,
+		cdbm.IPBlockFilterInput{
+			SiteIDs:        []uuid.UUID{siteID},
+			CoreLinkedOnly: true,
+		},
+		cdbp.PageInput{Limit: ccu.GetPtr(cdbp.TotalLimit)},
+		nil,
+	)
+	if err != nil {
+		logger.Error().Err(err).Msg("error retrieving Core-linked IP Blocks for Site from DB")
+		return err
+	}
+
+	for _, ipb := range linkedIPBlocks {
+		err = ipbDAO.Delete(ctx, nil, ipb.ID)
+		if err != nil && err != cdb.ErrDoesNotExist {
+			logger.Error().Err(err).Str("IP Block ID", ipb.ID.String()).Msg("error deleting Core-linked IP Block in db")
+			return err
+		}
+	}
+
 	// Delete Instances
 	// Check that Instance exists
 	instances, _, err := instanceDAO.GetAll(ctx, nil, cdbm.InstanceFilterInput{SiteIDs: []uuid.UUID{siteID}}, cdbp.PageInput{Limit: ccu.GetPtr(cdbp.TotalLimit)}, nil)
@@ -283,6 +311,13 @@ func (mst ManageSite) DeleteSiteComponentsFromDB(ctx context.Context, siteID uui
 	err = ibiDAO.DeleteAllBySiteID(ctx, nil, siteID)
 	if err != nil {
 		logger.Error().Err(err).Msg("error deleting InfiniBand Interfaces for Site from DB")
+		return err
+	}
+
+	// Delete SpectrumX attachments for site
+	err = sxaDAO.DeleteAllBySiteID(ctx, nil, siteID)
+	if err != nil {
+		logger.Error().Err(err).Msg("error deleting SpectrumX Attachments for Site from DB")
 		return err
 	}
 
@@ -436,6 +471,13 @@ func (mst ManageSite) DeleteSiteComponentsFromDB(ctx context.Context, siteID uui
 			logger.Error().Err(serr).Str("IB Partition ID", ibp.ID.String()).Msg("error deleting IB Partition record in DB")
 			return serr
 		}
+	}
+
+	// Delete SpectrumX Partitions for site
+	err = sxpDAO.DeleteAllBySiteID(ctx, nil, siteID)
+	if err != nil {
+		logger.Error().Err(err).Msg("error deleting SpectrumX Partition records in DB for Site")
+		return err
 	}
 
 	// Delete NVLink Logical Partitions
@@ -613,14 +655,44 @@ func (mst ManageSite) MonitorInventoryReceiptForAllSites(ctx context.Context) er
 	// Get all Sites
 	siteDAO := cdbm.NewSiteDAO(mst.dbSession)
 
-	sites, _, err := siteDAO.GetAll(ctx, nil, cdbm.SiteFilterInput{Statuses: []string{string(cdbm.SiteStatusRegistered)}}, cdbp.PageInput{Limit: ccu.GetPtr(cdbp.TotalLimit)}, nil)
+	// Error Sites are included alongside Registered ones because the check below
+	// moves a disconnected Site to Error. Querying Registered alone would drop it
+	// from the gauges on the very next cycle, resolving the alert three minutes
+	// into an outage that is still going.
+	sites, _, err := siteDAO.GetAll(
+		ctx,
+		nil,
+		cdbm.SiteFilterInput{Statuses: []string{cdbm.SiteStatusRegistered, cdbm.SiteStatusError}},
+		cdbp.PageInput{Limit: ccu.GetPtr(cdbp.TotalLimit)},
+		nil,
+	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to retrieve Sites from DB")
 		return err
 	}
 
+	// Publish health before the checks below, so the gauges reflect every
+	// monitored Site even when a later status update fails.
+	reports := make([]cwm.SiteHealthReport, 0, len(sites))
+	for _, site := range sites {
+		reports = append(reports, cwm.SiteHealthReport{
+			SiteID:            site.ID,
+			SiteName:          site.Name,
+			InventoryReceived: site.InventoryReceived,
+			AgentCertExpiry:   site.AgentCertExpiry,
+		})
+	}
+	mst.siteHealthMetrics.SetSiteHealth(reports)
+
 	// Loop through Sites
 	for _, site := range sites {
+		// Only a Registered Site can trip into Error. An Error Site is already
+		// reported, so re-running this would repeat the Slack message and add a
+		// StatusDetail row on every cycle for as long as the outage lasts.
+		if site.Status != cdbm.SiteStatusRegistered {
+			continue
+		}
+
 		// Get Site's last inventory receipt
 		if site.InventoryReceived == nil {
 			logger.Warn().Str("Site ID", site.ID.String()).Msg("Site has Registered status but hasn't received inventory yet")
@@ -640,29 +712,6 @@ func (mst ManageSite) MonitorInventoryReceiptForAllSites(ctx context.Context) er
 				err := sc.SendSlackNotification(sm)
 				if err != nil {
 					logger.Error().Err(err).Msg("failed to send Slack notification for Site down event")
-				}
-			}
-
-			if mst.cfg.GetNotificationsPagerDutyEnabled() {
-				// Send PagerDuty notification
-				pc := util.NewPagerDutyClient(mst.cfg.GetNotificationsPagerDutyIntegrationKey())
-				customDetails := map[string]string{
-					"site_id":             site.ID.String(),
-					"site_name":           site.Name,
-					"threshold_minutes":   fmt.Sprintf("%.0f", SiteInventoryReceiptThreshold.Minutes()),
-					"last_inventory_time": site.InventoryReceived.Format(time.RFC3339),
-					"time_since_last":     time.Since(*site.InventoryReceived).String(),
-					"description":         fmt.Sprintf("Site hasn't received Machine inventory for longer than threshold period of: %v minutes", SiteInventoryReceiptThreshold.Minutes()),
-				}
-				err := pc.SendPagerDutyAlertWithDedupeKey(
-					ctx,
-					fmt.Sprintf("Site Disconnection Detected: %s", site.Name),
-					"cloud-workflow-monitor",
-					fmt.Sprintf("site-disconnection-%s", site.ID.String()),
-					customDetails,
-				)
-				if err != nil {
-					logger.Error().Err(err).Msg("failed to send PagerDuty notification for Site down event")
 				}
 			}
 
@@ -969,7 +1018,11 @@ func (mst ManageSite) UpdateIPBlocksInDBFromFabricPrefixes(ctx context.Context, 
 	statusDetailDAO := cdbm.NewStatusDetailDAO(mst.dbSession)
 
 	err = cdb.WithTx(ctx, mst.dbSession, func(tx *cdb.Tx) error {
-		derr := tx.AcquireAdvisoryLock(ctx, getSiteFabricIPBlockLockID(dbSite), false)
+		derr := tx.AcquireAdvisoryLock(
+			ctx,
+			cdbm.SiteFabricIPBlockLockID(dbSite.InfrastructureProviderID, dbSite.ID),
+			false,
+		)
 		if derr != nil {
 			logger.Error().Err(derr).Msg("failed to acquire advisory lock for Site fabric IP Blocks")
 			return derr
@@ -1076,11 +1129,12 @@ func (mst ManageSite) UpdateIPBlocksInDBFromFabricPrefixes(ctx context.Context, 
 }
 
 // NewManageSite returns a new ManageSite activity
-func NewManageSite(dbSession *cdb.Session, siteClientPool *sc.ClientPool, tc client.Client, cfg *config.Config) ManageSite {
+func NewManageSite(dbSession *cdb.Session, siteClientPool *sc.ClientPool, tc client.Client, cfg *config.Config, siteHealthMetrics *cwm.SiteHealthMetrics) ManageSite {
 	return ManageSite{
-		dbSession:      dbSession,
-		siteClientPool: siteClientPool,
-		tc:             tc,
-		cfg:            cfg,
+		dbSession:         dbSession,
+		siteClientPool:    siteClientPool,
+		tc:                tc,
+		cfg:               cfg,
+		siteHealthMetrics: siteHealthMetrics,
 	}
 }

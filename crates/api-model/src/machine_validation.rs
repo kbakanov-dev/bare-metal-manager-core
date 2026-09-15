@@ -49,6 +49,8 @@ pub struct MachineValidationTestAddRequest {
     pub custom_tags: Vec<String>,
     pub components: Vec<String>,
     pub is_enabled: Option<bool>,
+    /// Optional OCI plugin configuration; absent retains legacy test execution.
+    pub plugin: Option<MachineValidationPlugin>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -71,6 +73,24 @@ pub struct MachineValidationTestUpdatePayload {
     pub custom_tags: Vec<String>,
     pub components: Vec<String>,
     pub is_enabled: Option<bool>,
+    /// Must be unset. Plugin revisions are immutable and cannot be updated.
+    pub plugin: Option<MachineValidationPlugin>,
+}
+
+/// Immutable executable settings for an OCI Machine Validation plugin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MachineValidationPlugin {
+    /// OCI image reference pinned to a digest.
+    pub image: String,
+    /// Executable and arguments invoked without a shell.
+    pub entrypoint: Vec<String>,
+    /// Non-secret JSON object copied to the plugin input contract.
+    pub parameters_json: String,
+    /// Requests a privileged container; it is allowed only when site policy permits it.
+    pub privileged: bool,
+    /// Requests a writable host-root mount; it additionally needs separate approval
+    /// for this verified plugin revision before it can be enabled.
+    pub host_access_full: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +240,10 @@ pub struct MachineValidationRunItem {
     pub attempt: i32,
     pub max_attempts: i32,
     pub timeout_seconds: i64,
+    /// The selected plugin configuration, frozen when the run plan is created.
+    pub plugin: Option<MachineValidationPlugin>,
+    /// Full-host approval as it existed when this run plan was created.
+    pub plugin_full_host_approved: bool,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
@@ -251,6 +275,10 @@ impl<'r> FromRow<'r, PgRow> for MachineValidationRunItem {
             attempt: row.try_get("attempt")?,
             max_attempts: row.try_get("max_attempts")?,
             timeout_seconds: row.try_get("timeout_seconds")?,
+            plugin: row
+                .try_get::<Option<sqlx::types::Json<MachineValidationPlugin>>, _>("plugin")?
+                .map(|plugin| plugin.0),
+            plugin_full_host_approved: row.try_get("plugin_full_host_approved")?,
             started_at: row.try_get("started_at")?,
             ended_at: row.try_get("ended_at")?,
             last_heartbeat_at: row.try_get("last_heartbeat_at")?,
@@ -347,6 +375,10 @@ pub struct MachineValidationTest {
     pub components: Vec<String>,
     pub last_modified_at: DateTime<Utc>,
     pub is_enabled: bool,
+    /// Plugin configuration for this revision, if it is plugin-backed.
+    pub plugin: Option<MachineValidationPlugin>,
+    /// Revision-scoped approval for a plugin's writable host-root mount.
+    pub full_host_approved: bool,
 }
 
 impl<'r> FromRow<'r, PgRow> for MachineValidationTest {
@@ -375,6 +407,10 @@ impl<'r> FromRow<'r, PgRow> for MachineValidationTest {
             components: row.try_get("components")?,
             last_modified_at: row.try_get("last_modified_at")?,
             is_enabled: row.try_get("is_enabled")?,
+            plugin: row
+                .try_get::<Option<sqlx::types::Json<MachineValidationPlugin>>, _>("plugin")?
+                .map(|plugin| plugin.0),
+            full_host_approved: row.try_get("full_host_approved")?,
         })
     }
 }

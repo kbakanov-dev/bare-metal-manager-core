@@ -26,7 +26,7 @@ use model::machine_boot_interface::{
 use sqlx::PgConnection;
 
 use crate::db_read::DbReader;
-use crate::{DatabaseError, DatabaseResult};
+use crate::{ConditionalWrite, DatabaseError, DatabaseResult};
 
 #[derive(Debug, sqlx::FromRow)]
 struct DesiredBootInterfaceRow {
@@ -903,31 +903,49 @@ pub async fn enrich_interface_id(
     }))
 }
 
-/// Tries to reopen an inspected target as a new pending generation after
-/// Redfish drift.
+/// `BootInterfaceObservationNotApplicable` means the desired target is unset
+/// or does not match the observation, or a Redfish observation of changed
+/// host boot settings refers to a generation already pending.
+/// These cases share one rejection; callers decide whether to follow new
+/// intent or discard the observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootInterfaceObservationNotApplicable;
+
+/// `try_reopen_after_observed_drift` opens a new pending generation when
+/// Redfish reports host BIOS settings or boot order that no longer match
+/// NICo's desired boot configuration.
 ///
 /// The parent machine lock and exact desired generation check make this an
 /// observation result, not a blind `force_set`: newer operator intent wins.
 /// The verified-version check also makes replay a no-op once a generation is
-/// already pending. `None` means either condition changed before this result
-/// could be persisted.
+/// already pending. `NotApplied` means the desired target is unset, its exact
+/// target/version no longer matches, or it is already pending. `Applied`
+/// returns the same target with its new version. A missing parent machine is
+/// a `DatabaseError::NotFoundError`.
 pub async fn try_reopen_after_observed_drift(
     txn: &mut PgConnection,
     machine_id: &HostMachineId,
     inspected_boot_interface: &Versioned<MachineBootInterfaceTarget>,
-) -> Result<Option<Versioned<MachineBootInterfaceTarget>>, DatabaseError> {
+) -> Result<
+    ConditionalWrite<Versioned<MachineBootInterfaceTarget>, BootInterfaceObservationNotApplicable>,
+    DatabaseError,
+> {
     validate_target(&inspected_boot_interface.value)?;
 
     let desired_boot_interface_row = load_for_update(txn, machine_id).await?;
     let current_machine_version = desired_boot_interface_row.machine_version;
     let Some(current_desired_boot_interface) = desired_boot_interface_row.decode(machine_id)?
     else {
-        return Ok(None);
+        return Ok(ConditionalWrite::NotApplied(
+            BootInterfaceObservationNotApplicable,
+        ));
     };
     if current_desired_boot_interface.desired.version != inspected_boot_interface.version
         || current_desired_boot_interface.desired.value != inspected_boot_interface.value
     {
-        return Ok(None);
+        return Ok(ConditionalWrite::NotApplied(
+            BootInterfaceObservationNotApplicable,
+        ));
     }
 
     // Read and lock the child status only after `load_for_update` has acquired
@@ -945,7 +963,9 @@ pub async fn try_reopen_after_observed_drift(
         .await
         .map_err(|error| DatabaseError::query(verified_version_query, error))?;
     if verified_version != Some(current_desired_boot_interface.desired.version) {
-        return Ok(None);
+        return Ok(ConditionalWrite::NotApplied(
+            BootInterfaceObservationNotApplicable,
+        ));
     }
 
     let Some(reopened_version) = write_desired_generation(
@@ -959,27 +979,29 @@ pub async fn try_reopen_after_observed_drift(
     )
     .await?
     else {
-        return Ok(None);
+        return Ok(ConditionalWrite::NotApplied(
+            BootInterfaceObservationNotApplicable,
+        ));
     };
 
-    Ok(Some(Versioned {
+    Ok(ConditionalWrite::Applied(Versioned {
         value: current_desired_boot_interface.desired.value,
         version: reopened_version,
     }))
 }
 
-/// Records a Redfish observation only if the desired boot-interface version
-/// still matches the version the caller observed.
+/// `mark_verified` records a Redfish observation only if the desired
+/// boot-interface version still matches the version the caller observed.
 ///
-/// A `false` return means the desired target was removed or replaced before
-/// the observation could be committed. The caller must not treat that newer
-/// target as verified.
+/// `NotApplied` means the desired target is unset or its version does not match
+/// the observation. The caller must not treat a newer target as verified.
+/// A missing parent machine is a `DatabaseError::NotFoundError`.
 pub async fn mark_verified(
     txn: &mut PgConnection,
     machine_id: &HostMachineId,
     expected_desired_version: ConfigVersion,
     observed_at: DateTime<Utc>,
-) -> Result<bool, DatabaseError> {
+) -> Result<ConditionalWrite<(), BootInterfaceObservationNotApplicable>, DatabaseError> {
     // Desired-target writers lock the parent machine row before touching this
     // child row. Preserve that order so a concurrent operator write cannot
     // deadlock verification against the state-controller transition, which
@@ -1003,7 +1025,10 @@ pub async fn mark_verified(
         .await
         .map_err(|error| DatabaseError::query(query, error))?;
 
-    Ok(updated.is_some())
+    Ok(match updated {
+        Some(_) => ConditionalWrite::Applied(()),
+        None => ConditionalWrite::NotApplied(BootInterfaceObservationNotApplicable),
+    })
 }
 
 #[cfg(test)]
@@ -1166,7 +1191,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(1);
-        let initial_machine_version = seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        let initial_machine_version = seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 0, 1]);
         let initial_target = MachineBootInterfaceTarget::MacOnly(mac_address);
 
@@ -1233,7 +1258,7 @@ mod tests {
         ];
 
         for (index, (machine_id, state, expect_assumed)) in cases.into_iter().enumerate() {
-            seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+            seed_machine(txn.as_mut(), &machine_id).await?;
             set_controller_state(txn.as_mut(), &machine_id, state).await?;
             let target =
                 MachineBootInterfaceTarget::MacOnly(MacAddress::new([2, 0, 0, 0, 3, index as u8]));
@@ -1272,7 +1297,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(34);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let target = MachineBootInterfaceTarget::MacOnly(MacAddress::new([2, 0, 0, 0, 3, 4]));
         let initialized =
             initialize_if_unset(txn.as_mut(), &machine_id, &target, RedfishUefiPci).await?;
@@ -1282,33 +1307,34 @@ mod tests {
         let observed_at =
             DateTime::from_timestamp(1_722_000_000, 123_000_000).expect("fixture timestamp");
 
-        assert!(
-            !mark_verified(
+        assert_eq!(
+            mark_verified(
                 txn.as_mut(),
                 &machine_id,
                 ConfigVersion::invalid(),
                 observed_at,
             )
-            .await?
+            .await?,
+            ConditionalWrite::NotApplied(BootInterfaceObservationNotApplicable)
         );
         assert_eq!(
             status_observation(txn.as_mut(), &machine_id).await?,
             (None, None, false)
         );
 
-        assert!(mark_verified(txn.as_mut(), &machine_id, initialized.version, observed_at,).await?);
+        assert_eq!(
+            mark_verified(txn.as_mut(), &machine_id, initialized.version, observed_at).await?,
+            ConditionalWrite::Applied(())
+        );
         assert_eq!(
             status_observation(txn.as_mut(), &machine_id).await?,
             (Some(initialized.version), Some(observed_at), false)
         );
 
-        let machine = crate::machine::find_one(
-            txn.as_mut(),
-            machine_id.as_ref(),
-            MachineSearchConfig::default(),
-        )
-        .await?
-        .expect("machine snapshot");
+        let machine =
+            crate::machine::find_one(txn.as_mut(), &machine_id, MachineSearchConfig::default())
+                .await?
+                .expect("machine snapshot");
         let observation = machine
             .status
             .boot_interface_status_observation
@@ -1329,7 +1355,10 @@ mod tests {
             .await?
             .desired;
         assert_ne!(updated.version, initialized.version);
-        assert!(!mark_verified(txn.as_mut(), &machine_id, initialized.version, Utc::now(),).await?);
+        assert_eq!(
+            mark_verified(txn.as_mut(), &machine_id, initialized.version, Utc::now()).await?,
+            ConditionalWrite::NotApplied(BootInterfaceObservationNotApplicable)
+        );
         assert_eq!(
             status_observation(txn.as_mut(), &machine_id).await?,
             (Some(initialized.version), Some(observed_at), false),
@@ -1346,7 +1375,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(44);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let inspected_target = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address: MacAddress::new([2, 0, 0, 0, 4, 4]),
             interface_id: "NIC.Slot.4-1-1".to_string(),
@@ -1356,14 +1385,15 @@ mod tests {
             .desired;
         let observed_at =
             DateTime::from_timestamp(1_722_000_300, 123_000_000).expect("fixture timestamp");
-        assert!(
+        assert_eq!(
             mark_verified(
                 txn.as_mut(),
                 &machine_id,
                 inspected_desired.version,
                 observed_at,
             )
-            .await?
+            .await?,
+            ConditionalWrite::Applied(())
         );
 
         let operator_target =
@@ -1371,11 +1401,10 @@ mod tests {
         let operator_desired = set(txn.as_mut(), &machine_id, &operator_target, Operator)
             .await?
             .desired;
-        assert!(
-            try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &inspected_desired)
-                .await?
-                .is_none()
-        );
+        assert!(matches!(
+            try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &inspected_desired).await?,
+            ConditionalWrite::NotApplied(BootInterfaceObservationNotApplicable)
+        ));
         let persisted_desired = get(txn.as_mut(), &machine_id)
             .await?
             .expect("operator-selected target");
@@ -1396,7 +1425,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(45);
-        let initial_machine_version = seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        let initial_machine_version = seed_machine(txn.as_mut(), &machine_id).await?;
         let inspected_target = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address: MacAddress::new([2, 0, 0, 0, 4, 6]),
             interface_id: "NIC.Slot.4-1-2".to_string(),
@@ -1409,20 +1438,22 @@ mod tests {
         overwrite_selection_updated_at(txn.as_mut(), &machine_id, selection_time).await?;
         let observed_at =
             DateTime::from_timestamp(1_722_000_400, 123_000_000).expect("fixture timestamp");
-        assert!(
+        assert_eq!(
             mark_verified(
                 txn.as_mut(),
                 &machine_id,
                 inspected_desired.version,
                 observed_at,
             )
-            .await?
+            .await?,
+            ConditionalWrite::Applied(())
         );
 
-        let pending_desired =
-            try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &inspected_desired)
-                .await?
-                .expect("fresh pending generation");
+        let ConditionalWrite::Applied(pending_desired) =
+            try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &inspected_desired).await?
+        else {
+            panic!("drift should reopen a pending generation");
+        };
         assert_target(&pending_desired, &inspected_target);
         assert_eq!(
             pending_desired.version.version_nr(),
@@ -1450,9 +1481,11 @@ mod tests {
         assert_eq!(desired_version_after_reopen, Some(pending_desired.version));
 
         assert!(
-            try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &pending_desired)
-                .await?
-                .is_none(),
+            matches!(
+                try_reopen_after_observed_drift(txn.as_mut(), &machine_id, &pending_desired)
+                    .await?,
+                ConditionalWrite::NotApplied(BootInterfaceObservationNotApplicable)
+            ),
             "an already-pending generation must not be reopened",
         );
         assert_eq!(
@@ -1469,7 +1502,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = predicted_host_machine_id(2);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 0, 3]);
         let pair = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address,
@@ -1581,7 +1614,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(5);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 0, 8]);
         let pair = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address,
@@ -1671,7 +1704,7 @@ mod tests {
 
         for (index, case) in cases.into_iter().enumerate() {
             let machine_id = predicted_host_machine_id(70 + index as u8);
-            seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+            seed_machine(txn.as_mut(), &machine_id).await?;
             let target =
                 MachineBootInterfaceTarget::MacOnly(MacAddress::new([2, 0, 0, 0, 7, index as u8]));
             initialize_if_unset(txn.as_mut(), &machine_id, &target, case.source).await?;
@@ -1719,7 +1752,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(37);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 3, 10]);
         let pair = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address,
@@ -1730,7 +1763,10 @@ mod tests {
             .desired;
         let observed_at =
             DateTime::from_timestamp(1_722_000_200, 123_000_000).expect("fixture timestamp");
-        assert!(mark_verified(txn.as_mut(), &machine_id, paired.version, observed_at).await?);
+        assert_eq!(
+            mark_verified(txn.as_mut(), &machine_id, paired.version, observed_at).await?,
+            ConditionalWrite::Applied(())
+        );
         let versions_before = versions(txn.as_mut(), &machine_id).await?;
 
         let forced = force_reconcile(
@@ -1774,7 +1810,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let attributed_machine_id = host_machine_id(61);
-        seed_machine(txn.as_mut(), attributed_machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &attributed_machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 6, 1]);
         let pair = MachineBootInterfaceTarget::Pair(MachineBootInterface {
             mac_address,
@@ -1793,14 +1829,15 @@ mod tests {
             .await?;
         let observed_at =
             DateTime::from_timestamp(1_700_003_100, 123_000_000).expect("fixture timestamp");
-        assert!(
+        assert_eq!(
             mark_verified(
                 txn.as_mut(),
                 &attributed_machine_id,
                 initial.version,
                 observed_at,
             )
-            .await?
+            .await?,
+            ConditionalWrite::Applied(())
         );
 
         let reconciled = force_reconcile(
@@ -1841,7 +1878,7 @@ mod tests {
         );
 
         let uninitialized_machine_id = host_machine_id(62);
-        seed_machine(txn.as_mut(), uninitialized_machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &uninitialized_machine_id).await?;
         let unknown = force_reconcile(
             txn.as_mut(),
             &uninitialized_machine_id,
@@ -1870,7 +1907,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(63);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 6, 4]);
         let initial = initialize_if_unset(
             txn.as_mut(),
@@ -1933,7 +1970,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(3);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 0, 5]);
         let target = MachineBootInterfaceTarget::MacOnly(mac_address);
         let initialized =
@@ -2008,7 +2045,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = pool.begin().await?;
         let machine_id = host_machine_id(36);
-        seed_machine(txn.as_mut(), machine_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &machine_id).await?;
         let mac_address = MacAddress::new([2, 0, 0, 0, 3, 8]);
         let initialized = initialize_if_unset(
             txn.as_mut(),
@@ -2019,7 +2056,10 @@ mod tests {
         .await?;
         let observed_at =
             DateTime::from_timestamp(1_722_000_100, 123_000_000).expect("fixture timestamp");
-        assert!(mark_verified(txn.as_mut(), &machine_id, initialized.version, observed_at,).await?);
+        assert_eq!(
+            mark_verified(txn.as_mut(), &machine_id, initialized.version, observed_at).await?,
+            ConditionalWrite::Applied(())
+        );
 
         let enriched =
             enrich_interface_id(txn.as_mut(), &machine_id, mac_address, "NIC.Slot.8-1-1")
@@ -2061,10 +2101,10 @@ mod tests {
         let complete_host = host_machine_id(13);
         let dpu = dpu_machine_id(14);
         for machine_id in [
-            unset_host.as_machine_id(),
-            mac_only_host.as_machine_id(),
-            unset_prediction.as_machine_id(),
-            complete_host.as_machine_id(),
+            &unset_host,
+            &mac_only_host,
+            &unset_prediction,
+            &complete_host,
             &dpu,
         ] {
             seed_machine(txn.as_mut(), machine_id).await?;
@@ -2118,7 +2158,7 @@ mod tests {
         let mut txn = pool.begin().await?;
         let predicted_id = predicted_host_machine_id(20);
         let dpu_id = dpu_machine_id(21);
-        seed_machine(txn.as_mut(), predicted_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &predicted_id).await?;
         seed_machine(txn.as_mut(), &dpu_id).await?;
         txn.commit().await?;
 
@@ -2205,8 +2245,8 @@ mod tests {
         let preexisting_id = predicted_host_machine_id(60);
         let defaulted_insert_id = host_machine_id(61);
         let mut txn = pool.begin().await?;
-        seed_machine(txn.as_mut(), preexisting_id.as_ref()).await?;
-        seed_machine(txn.as_mut(), defaulted_insert_id.as_ref()).await?;
+        seed_machine(txn.as_mut(), &preexisting_id).await?;
+        seed_machine(txn.as_mut(), &defaulted_insert_id).await?;
         txn.commit().await?;
 
         sqlx::raw_sql(MIGRATION).execute(&pool).await?;
@@ -2310,8 +2350,8 @@ mod tests {
         let mut txn = pool.begin().await?;
         let existing_host = host_machine_id(40);
         let in_flight_host = host_machine_id(42);
-        seed_machine(txn.as_mut(), existing_host.as_ref()).await?;
-        seed_machine(txn.as_mut(), in_flight_host.as_ref()).await?;
+        seed_machine(txn.as_mut(), &existing_host).await?;
+        seed_machine(txn.as_mut(), &in_flight_host).await?;
         set_controller_state(txn.as_mut(), &existing_host, ManagedHostState::Ready).await?;
         set_controller_state(
             txn.as_mut(),

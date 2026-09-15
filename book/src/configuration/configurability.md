@@ -68,7 +68,7 @@ See [`helm/README.md`](../../../helm/README.md#configuration) for the full list.
 | `nico-dhcp` | on | DHCP for PXE boot — DPUs need it to come up. |
 | `nico-dns` | on | Authoritative DNS for managed machines and VPCs. |
 | `nico-dsx-exchange-consumer` | off | Optional MQTT event consumer; requires a broker. |
-| `nico-flow` | off | Workflow orchestrator; deployed separately when needed. |
+| `nico-flow` | off | Umbrella dependency only; `setup.sh` installs Flow as a separate release by default. |
 | `nico-hardware-health` | on | Hardware health collector. |
 | `nico-ntp` | on | chrony NTP servers; DPU pre-ingestion needs synced clocks. |
 | `nico-pxe` | on | HTTP PXE boot server. |
@@ -157,10 +157,14 @@ The API allocates from these pools when creating instances, VPCs, etc.
 
 ### Networks
 
-`[networks.<name>]` — one block per L3 segment. Fields: `type` (`admin` |
-`underlay`), `prefix`, `gateway`, `mtu`, `reserve_first`. The `admin` network
-is mandatory and must have a non-empty `prefix` and `gateway` — `nico-api`
-crashes at startup if either is missing.
+Each `[networks.<name>]` block defines one L3 segment to create at startup, with
+`type` (`admin`, `underlay`, or `hostinband`), `prefix`, `mtu`, and `reserve_first`.
+Definitions support IPv4-only, IPv6-only, or both address families (dual-stack).
+A gateway is required whenever an IPv4 prefix is present. DPU provisioning
+requires an admin segment with an IPv4 prefix and gateway. Editing the
+configuration does not update an existing segment. Refer to
+[Initial Network Configuration](../../../docs/provisioning/ip-and-network-configuration.md#initial-network-configuration)
+for `prefix_v6`, `dhcpv6_link_address`, examples, and compatibility requirements.
 
 ### Tenant traffic policy
 
@@ -194,7 +198,6 @@ explicitly enabled in the TOML.
 | `[vmaas_config]` | VM system integration / VM-aware traffic intercept | Requires `public_prefixes`. |
 | `[rms]` | Rack Manager Service (mTLS connectivity to external RMS) | |
 | `[dpf]` | DPU Platform Framework — Kubernetes DPU workload deployment | Requires the DPF operator deployed in-cluster (`helm-prereqs/setup.sh` installs it by default; `--skip-dpf` to opt out). |
-| `rack_management_enabled` | Standalone infrastructure manager mode (GB200/GB300/VR144) | Top-level boolean, not a sub-section. |
 
 For RMS component-manager backends, NICo builds RMS node descriptors from rack
 profiles. Each descriptor contains three attributes:
@@ -248,6 +251,8 @@ use non-RMS backends.
 
 The examples below only show the component-manager and rack-profile fields.
 Configure `[rms]` separately when NICo needs to call RMS.
+The `nsm` and `psm` backend values require externally managed services; the
+NICo deployment charts do not install NSM or PSM.
 
 Example: GB200 rack where all component-manager roles use RMS:
 
@@ -713,6 +718,7 @@ These don't fit any sub-section but show up in production tuning:
 | `compute_allocation_enforcement` | `WarnOnly` | Switch to `Enforce` once tenant compute pools are sized correctly — flips over-allocation from a warning to a refusal. |
 | `bmc_session_lockout_threshold` | `3` | Number of consecutive 401/403s from a BMC before NICo stops session-token logins for that BMC. Raise on environments with flaky BMC firmware. |
 | `bmc_max_sessions_per_caller` | `4` | Cap on outstanding Redfish sessions per calling service identity per BMC; a `GetBmcCredentials` mint past the cap revokes that caller's oldest sessions. Size to the caller's replica count plus headroom; values below 1 are treated as 1. |
+| `bmc_proxy` | unset | Configure this when your deployment must route eligible `nico-api` Redfish requests through `nico-bmc-proxy`. Review the [routing contract](../../../crates/api-core/src/cfg/README.md#bmcproxyconfig--bmc_proxy) for direct-path exceptions, TLS credentials, precedence, and port requirements. |
 | `min_dpu_functioning_links` | unset (effective value `2`) | Controls DPU ToR BGP health checks. Refer to [DPU ToR Uplink Health](../../../docs/dpu-management/dpu_configuration.md#dpu-tor-uplink-health) for values and lifecycle effects. |
 | `set_http_boot_uri_for_vendors` | `[]` | Vendors for which the state controller pins UEFI HTTP Boot URL on the BMC via Redfish. Empty = rely on DHCP option 67. |
 | `x86_pxe_boot_url_override` / `arm_pxe_boot_url_override` | unset | Override the default `nico-pxe` boot URL by architecture. Useful when chaining through an external HTTP boot artifact server. |
@@ -1044,12 +1050,22 @@ images when a machine in the model joins. See
 
 ### Rack profile firmware object: `[rack_profiles.<name>]`
 
-A rack profile can define a `firmware_object` block for one firmware-object JSON
-document. NICo uses the document as the default firmware input during rack
-ingestion. The block contains a `url` and an optional `fetch_timeout`, which
-accepts duration strings such as `30s` and `60s` and defaults to `30s`. Use
-seconds for this request timeout, although the parser accepts other duration
-units such as milliseconds (`ms`), minutes (`m`), and hours (`h`).
+A rack profile can define a `firmware_object` block that references one
+firmware-object JSON document. NICo uses the document as the default input for
+rack firmware and switch NVOS image updates during rack maintenance. For a
+profile with switches, the document must include an NVOS image whose firmware
+type matches `rack_hardware_class`. NICo requests `prod` when
+`rack_hardware_class` is omitted. RMS records an asynchronous update failure
+when the document does not contain the required image.
+
+The block contains a `url` and an optional `fetch_timeout`, which accepts
+duration strings such as `30s` and `60s` and defaults to `30s`. Use seconds for
+this request timeout, although the parser accepts other duration units such as
+milliseconds (`ms`), minutes (`m`), and hours (`h`). Without the block, NICo
+skips both automatic update phases. An explicit maintenance request can supply
+a firmware object instead. If no firmware object is available while a switch in
+the maintenance scope is already waiting for an NVOS update, the rack
+transitions to `Error` instead of skipping the NVOS phase.
 
 ---
 
@@ -1101,7 +1117,7 @@ The NICo REST stack (separate helm release named `nico-rest`, in the
 `nico-rest` namespace) sits on top of NICo Core and provides the public
 REST API, workflow orchestration, optional Keycloak IdP, and the
 per-site agent. Its source lives in the
-[`rest-api/`](https://github.com/NVIDIA/infra-controller/tree/main/rest-api) tree;
+[`rest-api/`](https://github.com/dsx-ai-factory/infra-controller/tree/main/rest-api) tree;
 this guide covers only the *site-side* configuration knobs.
 
 ### nico-rest helm release — `helm-prereqs/values/nico-rest.yaml`
@@ -1143,7 +1159,7 @@ Temporal is deployed by `setup.sh` Phase 7f using the upstream Temporal
 helm chart with mTLS enabled. The mTLS issuer (`nico-rest-ca-issuer`) is
 installed in Phase 7b. Operators usually don't touch Temporal config
 directly; see the temporal subchart values in
-[`rest-api/temporal-helm/temporal/values.yaml`](https://github.com/NVIDIA/infra-controller/tree/main/rest-api/temporal-helm/temporal)
+[`rest-api/temporal-helm/temporal/values.yaml`](https://github.com/dsx-ai-factory/infra-controller/tree/main/rest-api/temporal-helm/temporal)
 if you need to tune retention or task queue counts.
 
 ### Keycloak (dev IdP)
@@ -1329,7 +1345,6 @@ and upgrade — knowing they exist helps when debugging stuck rollouts:
 | `gen-site-ca` | helm-prereqs pre-install | Before `nico-prereqs` install | Generates the self-signed site-root certificate that bootstraps Vault TLS. |
 | `vault-pki-config` | helm-prereqs post-install | After Vault is unsealed | Configures the Vault PKI secrets engine, creates the `nico-issuer` role, sets up the AppRole auth used by `nico-api`. |
 | `ssh-host-key` | helm-prereqs pre-install | Before `nico-ssh-console-rs` install | Generates an Ed25519 SSH host key and writes it to the `ssh-host-key` Secret. |
-| `flow-vault-tokens` | helm-prereqs post-install | After `nico-api` install | Issues per-namespace Vault tokens consumed by the flow service when enabled. |
 | `nico-api-migrate` | NICo Core pre-upgrade | Before every `nico-api` upgrade | Runs `nico-api migrate` against the Postgres datastore. Failures abort the upgrade. |
 | `nico-rest cert-manager` ClusterIssuer apply | Phase 7b | Before nico-rest pods come up | Installs the `nico-rest-ca-issuer` ClusterIssuer for REST-side TLS. |
 
@@ -1453,7 +1468,7 @@ on or off.
 |-----------|-------|------|---------|----------------|
 | `nico-ntp` | Helm | `nico-ntp.enabled` | on | Leave on unless upstream NTP is reachable from the provisioning network. |
 | `nico-dsx-exchange-consumer` | Helm | `nico-dsx-exchange-consumer.enabled` | off | Enable when the site has an MQTT broker and you want BMS metadata + managed-host events. |
-| `nico-flow` | Helm | `nico-flow.enabled` | off | Workflow orchestrator; enable when running Temporal-backed workflows. |
+| `nico-flow` | Helm | `nico-flow.enabled` | off | Leave off in the umbrella; `setup.sh` installs Flow as a separate release by default. |
 | `unbound` | Helm | `unbound.enabled` | off | Enable when DPUs need the `.forge` compatibility zone and no external DNS serves it. |
 | SSH-console Loki sidecar | Helm | `nico-ssh-console-rs.lokiLogCollector.enabled` | off | Enable when shipping SSH session logs to Loki. |
 | ServiceMonitor (per chart) | Helm | `<chart>.serviceMonitor.enabled` | off | Enable when the Prometheus Operator is installed. |
@@ -1468,7 +1483,6 @@ on or off.
 | Machine Identity (SPIFFE JWT-SVID) | siteConfig | `[machine_identity].enabled` | off | Per-org JWT signing for machine identity tokens. See [Day 0](../../../docs/getting-started/installation-options/day0-machine-identity.md) and [Day 1](../../../docs/configuration/machine_identity.md) docs. |
 | Machine Validation | siteConfig | `[machine_validation_config].enabled` | off | Pre-ingestion validation tests. |
 | SPDM | siteConfig | `[spdm].enabled` | off | Hardware attestation via NRAS. |
-| Rack Management | siteConfig | `rack_management_enabled = true` | off | Standalone infrastructure manager mode (GB200/GB300/VR144). |
 | Site Explorer machine auto-creation | siteConfig | `[site_explorer].create_machines` | on | Disable for manual-onboarding environments. |
 | Site Explorer switch / power shelf auto-creation | siteConfig | `[site_explorer].create_switches` / `[site_explorer].create_power_shelves` | on | Ingests only declared hardware (`expected_switches` / `expected_power_shelves` records). Disable to pause switch or power shelf ingestion site-wide. |
 | Firmware autoupdate | siteConfig | `[firmware_global].autoupdate` | off | Enable once the fleet's firmware baseline is stable. |

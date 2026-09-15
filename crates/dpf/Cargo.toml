@@ -41,12 +41,14 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 uuid = { features = ["v4"], workspace = true }
 async-trait = { workspace = true }
+derive_builder = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
+carbide-api-model = { path = "../api-model", default-features = false }
 carbide-libmlx-model = { path = "../libmlx-model" }
 carbide-utils = { path = "../utils" }
 carbide-uuid = { path = "../uuid", features = ["sqlx"] }
