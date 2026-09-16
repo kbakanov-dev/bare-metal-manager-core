@@ -257,6 +257,21 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Method:  http.MethodPatch,
 			Handler: apiHandler.NewUpdateVPCVirtualizationHandler(dbSession, tc, scp, cfg),
 		},
+		{
+			Path:    apiPathPrefix + "/vpc/:id/routing-profile",
+			Method:  http.MethodGet,
+			Handler: apiHandler.NewGetVPCRoutingProfileHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/vpc/:id/routing-profile",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewUpdateVPCRoutingProfileHandler(dbSession, scp),
+		},
+		{
+			Path:    apiPathPrefix + "/vpc/:id/routing-profile/release-inactive-vni",
+			Method:  http.MethodPost,
+			Handler: apiHandler.NewReleaseVPCInactiveVniHandler(dbSession, scp),
+		},
 
 		// VpcPrefix endpoints
 		{
@@ -700,6 +715,11 @@ func NewAPIRoutes(dbSession *cdb.Session, tc tClient.Client, tnc tClient.Namespa
 			Path:    apiPathPrefix + "/machine/:id/bmc/reset",
 			Method:  http.MethodPatch,
 			Handler: apiHandler.NewResetMachineBMCHandler(dbSession, scp, cfg),
+		},
+		{
+			Path:    apiPathPrefix + "/machine/:id/chassis/:chassisId/reset",
+			Method:  http.MethodPatch,
+			Handler: apiHandler.NewResetMachineChassisHandler(dbSession, scp),
 		},
 		{
 			Path:    apiPathPrefix + "/machine/:id/health-report",

@@ -2325,6 +2325,7 @@ dependencies = [
  "async-trait",
  "carbide-instrument",
  "carbide-secrets",
+ "carbide-test-support",
  "carbide-utils",
  "carbide-uuid",
  "eyre",
@@ -2710,6 +2711,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -6760,6 +6762,7 @@ name = "libnmxc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "carbide-test-support",
  "clap",
  "http",
  "prost",
@@ -6798,7 +6801,7 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.5#569bc602d2aa03b3f2ea4c9e006d593a05c7b1dc"
+source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.47.6#f2ebed4d9ba048da3a8a959d8be5104e205abc03"
 dependencies = [
  "chrono",
  "clap",
