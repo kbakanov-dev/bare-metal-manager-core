@@ -49,33 +49,16 @@ LL --> UC3
 ```
 
 # Workflows
-## Attestation of SPDM Devices
+## SPDM State Controller
 ```plantuml
 boundary "Launch Layer" as LL
 queue "MQTT Message Bus" as MBUS
 
-actor SRE as SRE
-actor Timer as TIMER
-actor "State Transition Trigger" as STATE_TRIGGER
-
-boundary NICo as CARBIDE
+control "SPDM State Controller" as CARBIDE
 participant "Redfish Server (BMC)" as DEVICE
 participant RMS as RMS
 participant NRAS as NRAS
 
-alt
-  group OR
-    SRE -> CARBIDE: Trigger Attestation
-  end
-else
-  group OR
-    TIMER -> CARBIDE: Trigger Attestation
-  end
-else
-  group OR
-    STATE_TRIGGER -> CARBIDE: Trigger Attestation
-  end
-end
 
 alt 
 alt SPDM attestation
@@ -88,33 +71,108 @@ alt SPDM attestation
   CARBIDE -> DEVICE : Collect Evidence from Device
   DEVICE -> CARBIDE: Evidence
 
+  CARBIDE -> CARBIDE: <color:red>Check Firmware and Serial Numbers against inventory</color>
+
   CARBIDE -> NRAS : Submit Evidence, Certificate and Firmware Version for verification
   NRAS -> CARBIDE: Attestation Results
 end
 
 alt RMS attestation
-  CARBIDE <-> RMS: TBD
-  CARBIDE <-> NRAS: TBD
+  CARBIDE <-> RMS: <color:red>TBD</color>
+  CARBIDE <-> NRAS: <color:red>TBD</color>
 end
+
 
 end
 
 alt Attestation Successful
-  CARBIDE -> CARBIDE : Apply labels
+  CARBIDE -> CARBIDE : Move to next state
 else Attestation Failed
-  CARBIDE -> CARBIDE: Apply labels and prevent allocation if possible
+  CARBIDE -> CARBIDE: <color:red>Apply labels and move to Wait state</color>
 end
 
 note left
   Starting to Apply Appraisal Policy
 end note
 
-CARBIDE -> MBUS: Publish labels
+CARBIDE -> MBUS: <color:red>Publish labels</color>
 
 group 
   note over LL, MBUS: Read labels from message bus \n and execure business logic
   LL <- MBUS: 
   LL -> CARBIDE:
+end
+```
+
+## External Management
+```plantuml
+actor "Operator" as OP
+
+boundary NICo as NC
+
+queue "SPDM State Controller Queue" as Q
+
+database "NICo DB" as DB
+
+== Trigger Attestation ==
+
+OP -> NC: Trigger Attestation (MachineId/<color:red>AttesterId</color>/<color:red>RMS Id</color>)
+
+NC -> NC: Apply Profile Filter (TBC)
+
+alt Attestation Filter Disallow
+  NC -> OP: Attestation Declined
+else Attestation Filter Allow
+  NC -> Q: Submit <Machine,Device,Job> Attestation Work Item
+  NC -> OP: Job Id
+end
+
+== Get Attestation Job Details ==
+
+OP -> NC: Get JobId Details
+NC -> DB: Get Job Details
+NC -> OP: Job Details
+
+== Cancel Job ==
+
+OP -> NC: Cancel JobId
+NC -> DB: Cancel JobId
+
+== List Jobs ==
+
+OP -> NC: List (in-progress/cancelled/failed/passed) Jobs
+NC -> DB: List Jobs
+NC -> OP: Jobs
+```
+
+## Machine State Controller
+```plantuml
+control "Machine State Controller" as MC
+
+boundary NICo as NC
+
+entity "Health Alerts" as HA
+
+queue "Launch Layer" as LL
+
+== Ingestion Cycle ==
+
+MC -> NC: Trigger Attestation
+
+NC -> MC: JobId
+
+MC -> NC: Poll JobId
+
+alt Attestation Failed
+  MC -> HA: <color:red>Apply labels</color>
+
+  MC -> LL: <color:red>Stream labels info</color>
+
+  MC -> MC: <color:red>Move into Wait state</color>
+
+  NC -> NC: <color:red>Wait for commands from Maestro</color>
+else Attestation Suceeded
+  MC -> MC: Move to next state
 end
 ```
 
